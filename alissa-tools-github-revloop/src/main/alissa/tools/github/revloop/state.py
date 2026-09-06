@@ -853,10 +853,22 @@ class State:
 
     def record_derived_repos(
         self, rows: "Iterable[tuple[str, str, str]]"
-    ) -> None:
+    ) -> bool:
         """Replace the derived-repos table with `(repo, bow id, bow title)`
-        rows -- the whole set at once, in one transaction, so a console read
-        never sees half a refresh."""
+        rows. Best-effort, like every telemetry write: the console's window
+        onto the derived set is not the allowlist itself, and a refresh that
+        cannot persist it still rebinds the allowlist correctly."""
+        rows = list(rows)
+        return self._write_telemetry(
+            lambda: self._replace_derived_repos(rows),
+            "recording the derived allowlist",
+        )
+
+    def _replace_derived_repos(
+        self, rows: "list[tuple[str, str, str]]"
+    ) -> None:
+        """The whole set at once, in one transaction, so a console read never
+        sees half a refresh."""
         now = int(time.time())
         with self._db:
             self._db.execute("DELETE FROM derived_repos")

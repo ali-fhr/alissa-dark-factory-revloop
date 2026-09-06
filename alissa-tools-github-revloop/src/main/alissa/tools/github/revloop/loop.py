@@ -1681,6 +1681,12 @@ class ReviewWatcher:
         self._session_census: int | None = None
         self._census_probed = False
         self._census_warned = False
+        # The sweep's POST-REAP roster, kept for the rest of the pass so the
+        # feed refresh that follows it (never-drop-mid-round) reads the same
+        # list instead of paying a second `alissa tmux ls`. None = no sweep
+        # has listed this pass (the preflight refresh, or a sweep whose list
+        # failed), and the refresh lists for itself.
+        self._pass_roster: list[ManagedSession] | None = None
         # (repo full name, PR number) -> where that round sits in the spawn
         # queue, from the first pass that deferred it. Cross-pass and
         # in-memory: it is a FAIRNESS ORDER, not a decision the daemon must
@@ -1744,27 +1750,34 @@ class ReviewWatcher:
         long-running session as absent, which is the direction the rule
         must never err in.
         """
-        try:
-            sessions = self.alissa.list_review_sessions()
-        except CommandError as exc:
-            log.warning(
-                "repos_source=bows: could not list reviewer sessions (%s) — "
-                "no repo leaves the allowlist this refresh",
-                exc,
-            )
-            return None
+        sessions = self._pass_roster
+        if sessions is None:
+            try:
+                sessions = self.alissa.list_review_sessions()
+            except CommandError as exc:
+                log.warning(
+                    "repos_source=bows: could not list reviewer sessions (%s) — "
+                    "no repo leaves the allowlist this refresh",
+                    exc,
+                )
+                return None
         busy = set(self.state.in_flight_repos(STALE_ROUND_SECONDS))
-        slugs = {
-            session_repo_slug(full_name.partition("/")[2]): full_name.casefold()
-            for full_name in self.config.repos
-            if full_name.partition("/")[1]
-        }
+        # One slug to MANY repos, exactly as `_name_candidates` models it: a
+        # session name carries the repo half alone, so `orgA/web` and
+        # `orgB/web` both answer to `web`, and a name-borne session must pin
+        # EVERY watched repo it could be about. A one-to-one dict here kept
+        # only the last of them, and dropped the one with the live round.
+        slugs: dict[str, set[str]] = {}
+        for full_name in self.config.repos:
+            if full_name.partition("/")[1]:
+                slug = session_repo_slug(full_name.partition("/")[2])
+                slugs.setdefault(slug, set()).add(full_name.casefold())
         for ses in sessions:
             ref = ses.ref
             if ref is None:
                 continue
             if ref.repo is not None and ref.repo in slugs:
-                busy.add(slugs[ref.repo])
+                busy |= slugs[ref.repo]
                 continue
             # The skill's bare `review-pr-<n>` shape carries no repo; the
             # ledger row it was recorded under (if any) does.
@@ -1799,11 +1812,8 @@ class ReviewWatcher:
         self._apply_repos(source.repos())
         if listed:
             # Telemetry-class: the console's window onto the derived set.
-            rows = source.sources()
-            self.state._write_telemetry(
-                lambda: self.state.record_derived_repos(rows),
-                "recording the derived allowlist",
-            )
+            # Best-effort inside State, like every other telemetry write.
+            self.state.record_derived_repos(source.sources())
 
     def _search_allowlist(self) -> "tuple[str, ...] | None":
         """The allowlist the review-requested search runs over, or None when
@@ -4143,6 +4153,12 @@ class ReviewWatcher:
             log.info("reaped reviewer session %s (%s)", ses.name, evidence)
 
         self._check_session_cap(sessions, reaped, holdouts, would_reap)
+        # What is still live after this sweep, for the feed refresh that
+        # follows it in the same pass. Minus the kills only: a dry-run sweep
+        # kills nothing, so its `would_reap` names are still live, and a kill
+        # that raised left its session running.
+        killed = set(reaped)
+        self._pass_roster = [ses for ses in sessions if ses.name not in killed]
         return len(reaped)
 
     def _hold(self, holdouts: dict[str, str], ses: ManagedSession, why: str) -> None:
@@ -4885,6 +4901,7 @@ class ReviewWatcher:
         # longest ACROSS passes.
         self._session_census = None
         self._census_probed = self._census_warned = False
+        self._pass_roster = None
 
         # THE LEDGER GATE (issue #62, PR #63 round-1 blocker). Nothing below
         # may run when the ledger cannot record what it does.

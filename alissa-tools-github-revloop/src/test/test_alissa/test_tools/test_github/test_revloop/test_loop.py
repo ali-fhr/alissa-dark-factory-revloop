@@ -9171,6 +9171,72 @@ def test_a_live_daemon_session_keeps_a_disappeared_repo(config):
     assert gh.searched[-1] == ("acme/widgets",)
 
 
+def test_a_live_session_pins_every_watched_repo_sharing_its_name(config):
+    """A session name carries the repo half alone, so `orgA/web` and
+    `orgB/web` both answer to `web`. A one-to-one slug map kept only the
+    LAST of them and dropped the one with the live round (round-1 [major])."""
+    client = _BowClient(["autodev: orgA/web", "autodev: orgB/web"])
+    w, gh, al = _bows_watcher(config, client)
+    w.poll_once()
+    assert gh.searched[-1] == ("orgA/web", "orgB/web")
+    _live(al, "review-web-pr12-r1-abcdef")  # which of the two? cannot tell
+
+    client.titles = ["autodev: orgB/web"]  # orgA/web's feed completed
+    w.poll_once()
+    assert set(gh.searched[-1]) == {"orgA/web", "orgB/web"}, (
+        "a name-borne session must hold EVERY watched repo it could be about"
+    )
+
+    al.sessions.clear()
+    w.poll_once()
+    assert gh.searched[-1] == ("orgB/web",)
+
+
+def test_a_refresh_with_drop_candidates_costs_no_second_session_listing(config):
+    """The sweep already listed the roster this pass (round-1 [nit]): the
+    refresh reads the post-reap list instead of shelling out again."""
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, al = _bows_watcher(config, client)
+    w.poll_once()
+    _live(al, "review-gadgets-pr7-r1-abcdef")
+    calls = []
+    inner = al.list_review_sessions
+    al.list_review_sessions = lambda: (calls.append(1), inner())[1]
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+
+    assert len(calls) == 1
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets"), (
+        "and the roster it read still pins the live round's repo"
+    )
+
+
+def test_a_session_the_sweep_reaped_no_longer_pins_its_repo(config):
+    """The roster the refresh reads is the sweep's MINUS what it killed: a
+    session reaped this pass must not hold its repo for one more refresh."""
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, al = _bows_watcher(
+        config, client, pr=make_pr(state="closed", merged=True),
+    )
+    w.poll_once()
+    session = "review-gadgets-pr7-r1-abcdef"
+    w.state.record_spawn(
+        repo="acme/gadgets", number=NUMBER, round_=1, head_sha="sha",
+        session=session, task_ref=None,
+    )
+    old = int(time.time()) - 10 * STALE_ROUND_SECONDS
+    w.state._db.execute("UPDATE spawns SET spawned_at = ?", (old,))
+    w.state._db.commit()
+    _live(al, session)
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+
+    assert al.killed == [session], "the sweep reaped the merged PR's session"
+    assert gh.searched[-1] == ("acme/widgets",)
+
+
 def test_an_owed_verdict_in_the_ledger_keeps_a_disappeared_repo(config):
     client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
     w, gh, _ = _bows_watcher(config, client)
