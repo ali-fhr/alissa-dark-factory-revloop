@@ -9005,3 +9005,252 @@ def test_a_grace_round_bought_by_a_fresh_ack_reports_the_raised_cap(
         "the ack was discovered inside the stability gate, below where "
         "`cap` was computed"
     )
+
+
+# -- the derived allowlist (repos_source: bows, issue #119) -----------------
+#
+# `review_requests`, the per-request `watches` gate, `_name_candidates` and
+# `_ensure_hub` all read `config.repos`; in bows mode the loop rebinds that to
+# derived∪static on every refresh. What is pinned here is the SEMANTICS the
+# search sees: under static an empty list still means "every repo" (no
+# change), under bows an empty derived∪static set searches NOTHING and warns
+# once per refresh, and a derived repo reaches the search's `repo:` qualifiers.
+
+from alissa.tools.github.revloop.alissa_client import AlissaTransient, BodyOfWork  # noqa: E402
+from alissa.tools.github.revloop.bows import EMPTY_SET_WARNING  # noqa: E402
+from alissa.tools.github.revloop.config import REPOS_BOWS  # noqa: E402
+
+_OWN_ACTOR = "j5706fv7xe5jy1k5wdwzacab9s8axcd2"
+
+
+class RecordingGitHub(FakeGitHub):
+    """FakeGitHub that records the allowlist each search was handed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.searched: list[tuple[str, ...]] = []
+
+    def review_requests(self, repos=()):
+        self.searched.append(tuple(repos))
+        return super().review_requests(repos)
+
+
+class _BowClient:
+    def __init__(self, titles=(), error=None):
+        self.titles = list(titles)
+        self.error = error
+
+    def list_bodies_of_work(self):
+        if self.error is not None:
+            raise self.error
+        return [
+            BodyOfWork(id=f"bow-{i}", title=t, status="active", owner_id=_OWN_ACTOR)
+            for i, t in enumerate(self.titles)
+        ]
+
+
+def _bows_watcher(config, client, *, repos=(), polls=1, reviews=(), pr=None):
+    cfg = dataclasses.replace(
+        config,
+        repos_source=REPOS_BOWS,
+        bow_owners=(_OWN_ACTOR,),
+        bows_refresh_polls=polls,
+        repos=tuple(repos),
+    )
+    gh = RecordingGitHub(pr or make_pr(), list(reviews))
+    al = FakeAlissa(FakeTask())
+    w = ReviewWatcher(cfg, github=gh, alissa=al, state=State(cfg.state_db), bow_client=client)
+    return w, gh, al
+
+
+def test_static_mode_never_constructs_a_source_and_empty_still_means_all(config):
+    gh = RecordingGitHub(make_pr(), [])
+    w = ReviewWatcher(config, github=gh, alissa=FakeAlissa(FakeTask()), state=State(config.state_db))
+    assert w.repo_source is None
+
+    w.poll_once()
+    assert gh.searched == [()], "an empty static allowlist searches every repo, unchanged"
+
+
+def test_bows_search_receives_the_derived_union_static_set(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: Acme/Gadgets"])
+    w, gh, _ = _bows_watcher(config, client, repos=("acme/static",))
+
+    w.poll_once()
+
+    assert gh.searched == [("acme/static", "acme/widgets", "Acme/Gadgets")]
+    assert w.config.repos == ("acme/static", "acme/widgets", "Acme/Gadgets")
+    assert w.config.watches("acme/gadgets"), "the rebound config casefolds"
+
+
+def test_bows_empty_set_searches_nothing_and_warns_once_per_refresh(config, caplog):
+    w, gh, _ = _bows_watcher(config, _BowClient([]), polls=3)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            w.poll_once()
+    assert gh.searched == [], "no search/issues call at all"
+    warned = [r for r in caplog.records if EMPTY_SET_WARNING in r.getMessage()]
+    assert len(warned) == 1, "one WARN per refresh, not per pass"
+
+    # The next refresh (pass 4 with polls=3) re-arms the warning.
+    with caplog.at_level(logging.WARNING):
+        w.poll_once()
+    warned = [r for r in caplog.records if EMPTY_SET_WARNING in r.getMessage()]
+    assert len(warned) == 2
+
+
+def test_bows_static_seed_alone_is_searched_when_the_feed_is_empty(config):
+    w, gh, _ = _bows_watcher(config, _BowClient([]), repos=("acme/static",))
+    w.poll_once()
+    assert gh.searched == [("acme/static",)]
+
+
+def test_refresh_cadence_is_honoured_by_the_poll_loop(config):
+    client = _BowClient(["autodev: acme/widgets"])
+    w, gh, _ = _bows_watcher(config, client, polls=2)
+    w.poll_once()  # first pass always refreshes
+    client.titles.append("autodev: acme/gadgets")
+    w.poll_once()  # not due yet
+    w.poll_once()  # due
+    assert gh.searched == [
+        ("acme/widgets",), ("acme/widgets",), ("acme/widgets", "acme/gadgets"),
+    ]
+
+
+def test_a_refresh_failure_never_shrinks_the_search(config):
+    client = _BowClient(["autodev: acme/widgets"])
+    w, gh, _ = _bows_watcher(config, client)
+    w.poll_once()
+    client.error = AlissaTransient(503, "down")
+    w.poll_once()
+    assert gh.searched == [("acme/widgets",), ("acme/widgets",)]
+
+
+def test_preflight_runs_the_first_refresh_and_logs_the_authority(config, caplog):
+    w, gh, _ = _bows_watcher(config, _BowClient(["autodev: acme/widgets"]))
+    gh.verify_identity = lambda: "alissa-app"
+    with caplog.at_level(logging.INFO):
+        w.preflight()
+    assert w.config.repos == ("acme/widgets",)
+    assert any(
+        f"feed authority {_OWN_ACTOR}" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_preflight_warns_when_bows_derives_nothing(config):
+    w, gh, _ = _bows_watcher(config, _BowClient([]))
+    gh.verify_identity = lambda: "alissa-app"
+    assert any(EMPTY_SET_WARNING in warning for warning in w.preflight())
+
+
+def test_the_derived_set_is_recorded_for_the_console(config):
+    w, _, _ = _bows_watcher(config, _BowClient(["autodev: acme/widgets"]))
+    w.poll_once()
+    rows = w.state.read_derived_repos()
+    assert [(r["repo"], r["bow_title"]) for r in rows] == [
+        ("acme/widgets", "autodev: acme/widgets")
+    ]
+
+
+# -- never drop mid-round, as the LOOP answers it -----------------------------
+
+
+def test_a_live_daemon_session_keeps_a_disappeared_repo(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, al = _bows_watcher(config, client)
+    w.poll_once()
+    _live(al, "review-gadgets-pr7-r1-abcdef")  # this daemon's own grammar
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets")
+
+    al.sessions.clear()
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets",)
+
+
+def test_an_owed_verdict_in_the_ledger_keeps_a_disappeared_repo(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, _ = _bows_watcher(config, client)
+    w.poll_once()
+    w.state.note_verdict_post_owed("acme/gadgets", 9, 1, "sha")
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets")
+
+
+def test_a_fresh_unreaped_spawn_keeps_a_disappeared_repo(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, _ = _bows_watcher(config, client)
+    w.poll_once()
+    w.state.record_spawn(
+        repo="acme/gadgets", number=9, round_=1, head_sha="sha",
+        session="review-gadgets-pr9-r1-000001", task_ref=None,
+    )
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets")
+
+    w.state.record_reap("review-gadgets-pr9-r1-000001")
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets",)
+
+
+def test_a_bare_skill_session_is_attributed_through_its_ledger_row(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, al = _bows_watcher(config, client)
+    w.poll_once()
+    old = int(time.time()) - 10 * STALE_ROUND_SECONDS
+    w.state._db.execute(
+        "INSERT INTO spawns (repo, number, round, head_sha, session, task_ref, spawned_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("acme/gadgets", 9, 1, "sha", "review-pr-9", None, old),
+    )
+    w.state._db.commit()
+    _live(al, "review-pr-9")  # the skill's shape: no repo in the name
+
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets"), (
+        "an old ledger row is not in flight by age, but its LIVE session is"
+    )
+
+
+def test_an_unlistable_roster_drops_nothing(config):
+    client = _BowClient(["autodev: acme/widgets", "autodev: acme/gadgets"])
+    w, gh, al = _bows_watcher(config, client)
+    w.poll_once()
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no tmux server")
+
+    al.list_review_sessions = boom
+    client.titles = ["autodev: acme/widgets"]
+    w.poll_once()
+    assert gh.searched[-1] == ("acme/widgets", "acme/gadgets")
+
+
+def test_a_derived_repo_is_hub_ified_on_its_first_request(tmp_path):
+    """The container's `add` default + a derived repo = self-hub on demand."""
+    cfg = dataclasses.replace(
+        hub_add_config(tmp_path),
+        repos=(),
+        repos_source=REPOS_BOWS,
+        bow_owners=(_OWN_ACTOR,),
+    )
+    gh = RecordingGitHub(make_pr(), [])
+    al = FakeAlissa(FakeTask())
+    al.on_add = lambda o, r: (tmp_path / r / "main").mkdir(parents=True)
+    w = ReviewWatcher(
+        cfg, github=gh, alissa=al, state=State(cfg.state_db),
+        bow_client=_BowClient([f"autodev: {SLUG}"]),
+    )
+
+    results = w.poll_once()
+
+    assert al.added == [(OWNER, REPO, tmp_path)]
+    assert [d.action for _, d in results] == [Action.SPAWNED]
