@@ -198,15 +198,16 @@ class BowRepoSource:
         self._since += 1
 
     def refresh(
-        self, mid_round: "Callable[[], frozenset[str]] | None" = None
+        self, mid_round: "Callable[[], frozenset[str] | None] | None" = None
     ) -> bool:
         """List the feeds and re-derive. Returns whether the listing worked.
 
         `mid_round` is called at most once, and only when a repo is actually
         a drop candidate: it answers "which repos (casefolded `owner/repo`)
-        does this daemon have a round in flight on?". None means the caller
-        has no way to tell — which is not the same as "none", so the drop
-        half is skipped entirely rather than run on absent evidence.
+        does this daemon have a round in flight on?". A None PROBE, or a
+        probe that ANSWERS None, means the caller has no way to tell this
+        refresh — which is not the same as "none", so the drop half is
+        skipped entirely rather than run on absent evidence.
 
         Never raises. Every failure mode ends in a log line and the previously
         derived set, because the caller is a poll pass and the allowlist is
@@ -349,22 +350,25 @@ class BowRepoSource:
     def _retained(
         self,
         fresh: "Sequence[str]",
-        mid_round: "Callable[[], frozenset[str]] | None",
+        mid_round: "Callable[[], frozenset[str] | None] | None",
     ) -> "tuple[str, ...]":
         """Previously derived repos this refresh would drop but must not.
 
         Drop candidates are computed first and `mid_round` is only consulted
         when there is at least one, so the steady state (nothing changed)
-        costs no session listing and no ledger read. A None `mid_round` means
-        the caller cannot answer, so nothing is dropped this refresh — absent
-        evidence is not evidence of an idle repo, and the direction that errs
-        here should be the one that keeps watching.
+        costs no session listing and no ledger read. A None `mid_round`, or
+        one that answers None (the loop's probe does when the session list
+        cannot be read), means the caller cannot answer, so nothing is
+        dropped this refresh — absent evidence is not evidence of an idle
+        repo, and the direction that errs here should be the one that keeps
+        watching.
         """
         fresh_fold = {r.casefold() for r in fresh}
         candidates = [r for r in self.derived if r.casefold() not in fresh_fold]
         if not candidates:
             return ()
-        if mid_round is None:
+        busy = None if mid_round is None else mid_round()
+        if busy is None:
             log.debug(
                 "repos_source=bows: %d repo(s) left the feed but in-flight "
                 "rounds cannot be checked this refresh — none dropped",
@@ -372,7 +376,6 @@ class BowRepoSource:
             )
             return tuple(candidates)
 
-        busy = mid_round()
         held = tuple(r for r in candidates if r.casefold() in busy)
         dropped = [r for r in candidates if r.casefold() not in busy]
         if held:

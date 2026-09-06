@@ -321,6 +321,10 @@ def test_an_unanswerable_probe_drops_nothing(tmp_path):
     client.bows = []
     src.refresh(None)
     assert src.derived == ("acme/widgets", "acme/gadgets")
+    # ...and a probe that ANSWERS None (the loop's, when `alissa tmux ls`
+    # fails) is the same "cannot tell", not "nothing in flight".
+    src.refresh(lambda: None)
+    assert src.derived == ("acme/widgets", "acme/gadgets")
 
 
 def test_a_completed_feed_is_treated_like_a_disappeared_one(tmp_path):
