@@ -752,13 +752,29 @@ REPOS_SOURCE="$(printf '%s' "${ALISSA_REVIEW_REPOS_SOURCE:-}" | sed 's/^[[:space
 # whenever ALISSA_REVIEW_REPOS is set and dies with its own named reason
 # otherwise. Asked once, through the renderer's own probe (idempotent), and
 # only when the mode is requested — a static deployment pays nothing.
+#
+# The DOWNGRADE case is the one the fall-through cannot hand on: a boot on
+# >= 0.29.0 with an empty seed wrote a STAMPED config (repos: [] plus the
+# three keys) and an empty-list manifest, both persisting on the volume; on
+# the old pin with the seed still empty, the mounted-mode arm below would
+# respect both, and the old daemon then refuses the file's keys in a crash
+# loop under a WARN that named a different failure. Re-rendering the file
+# through the probe is no answer either: an EMPTY static allowlist under the
+# old library is "every PR that requests this reviewer" unless the `add`
+# guard happens to catch it (ALISSA_ON_MISSING_HUB=skip and it does not), so
+# a rollback would silently WIDEN the watch. The file is positively ours, so
+# this boot stops here, by name, before any worker starts. With the seed set,
+# branch 1 below re-renders unconditionally and the rollback self-heals.
 BOWS_MODE=0
 if [ "${REPOS_SOURCE}" = "bows" ]; then
   if revloop_dist_supports repos_source; then
     BOWS_MODE=1
   else
     log "WARN: ALISSA_REVIEW_REPOS_SOURCE=bows, but the INSTALLED alissa-tools-github-revloop $(revloop_dist_version) does NOT support the 'repos_source' config key — NOT taking the bows path. bows mode landed in revloop 0.29.0 — re-pin ARG REVLOOP_VERSION."
-    log "      Falling through to the static path: with ALISSA_REVIEW_REPOS set this boot continues on the static allowlist; without it (and without a mounted alissa-workspace.yaml) it FAILS below with the static path's own reason."
+    log "      Falling through to the static path: with ALISSA_REVIEW_REPOS set this boot continues on the static allowlist; without it (and without a mounted alissa-workspace.yaml) it FAILS below with the static path's own reason — or right here, by name, when the config on the volume is this container's own earlier bows-path output (a downgrade)."
+    if [ "${CONTAINER_ROLE}" != "executor" ] && [ -z "$(repos_lines)" ] && config_is_generated "${CONFIG}"; then
+      die "downgrade: ${CONFIG} is this container's OWN bows-path output (it carries the ${CONFIG_PROVENANCE_KEY} stamp, so an earlier boot on revloop >= 0.29.0 wrote it with an empty static seed), and the INSTALLED alissa-tools-github-revloop $(revloop_dist_version) can neither derive an allowlist from it nor load its keys. Handing it an EMPTY static allowlist instead could widen the watch to every PR that requests this reviewer, so this boot stops before any worker starts. Re-pin ARG REVLOOP_VERSION >= 0.29.0, or set ALISSA_REVIEW_REPOS to continue on a static allowlist."
+    fi
   fi
 fi
 
@@ -775,6 +791,14 @@ if [ -n "$(repos_lines)" ]; then
   # worktree hubs a reviewer does, so the manifest is what makes those hubs
   # exist. It skips only revloop.config.json, which configures a daemon this
   # service never starts.
+  #
+  # This branch is taken under repos_source=bows too whenever the static SEED
+  # is non-empty, and it keeps the static contract bit for bit: the config is
+  # regenerated UNCONDITIONALLY and UNSTAMPED, with no provenance check. The
+  # bows arm's never-overwrite-the-operator's-config rule applies to the
+  # empty-seed path only, so a hand-written bow_owners belongs in
+  # ALISSA_REVIEW_BOW_OWNERS (the environment outranks the file anyway), not
+  # in a mounted file that a set ALISSA_REVIEW_REPOS will rewrite next boot.
   if [ "${CONTAINER_ROLE}" = "executor" ]; then
     log "generating ${MANIFEST} from ALISSA_REVIEW_REPOS (executor role: no revloop.config.json — no daemon here)"
   else

@@ -672,7 +672,11 @@ Three things the entrypoint does on this path, each logged by name:
   A file the bows path cannot positively identify as its own is treated as the
   operator's and left alone; the daemon still takes its mode and authority from
   the environment, which outranks the file. Delete the file and redeploy to
-  have it regenerated.
+  have it regenerated. **This rule applies to the empty-seed path only**: with
+  `ALISSA_REVIEW_REPOS` set, `bows` rides the static contract below and the
+  config is regenerated unconditionally and unstamped on every boot, with no
+  provenance check — so a hand-written `bow_owners` belongs in
+  `ALISSA_REVIEW_BOW_OWNERS`, never in a mounted file a set seed will rewrite.
 - **Version-skew guard**: the mode is honoured only when the *installed*
   `alissa-tools-github-revloop` understands `repos_source`. On an older pin the
   entrypoint WARNs (`bows mode landed in revloop 0.29.0 — re-pin ARG
@@ -680,7 +684,14 @@ Three things the entrypoint does on this path, each logged by name:
   still load its config, and the boot falls through to the static path: with
   `ALISSA_REVIEW_REPOS` set it continues on the static allowlist; without it
   (and without a mounted manifest) it dies with the static path's own named
-  reason. Non-fatal where it can be, never silent.
+  reason. Non-fatal where it can be, never silent. One case dies at the guard
+  itself, by name: a **downgrade** — the seed still empty and the config on
+  the volume this container's own stamped bows-path output from an earlier
+  `>= 0.29.0` boot. The old library can neither derive from that file nor
+  load its keys, and an empty *static* allowlist in its place could widen the
+  watch to every PR that requests this reviewer, so the boot stops before any
+  worker starts; re-pin, or set `ALISSA_REVIEW_REPOS`. A mounted (unstamped)
+  config is respected as before.
 
 `ALISSA_REVIEW_BOW_OWNERS` is optional: unset, the daemon trusts feeds owned by
 its **own** token's actor, resolved at boot. Set it (actor ids, `|`/`,`
@@ -703,7 +714,10 @@ regenerates both files from it on **every boot**, so changing the allowlist (or
 `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`, `ALISSA_STABILITY_ROUNDS`, …) and
 redeploying just applies — the
 files persist on the volume, so a "generate only if absent" rule would otherwise
-pin them to the first boot's values forever. Leave `ALISSA_REVIEW_REPOS` **unset**
+pin them to the first boot's values forever. This holds under
+`ALISSA_REVIEW_REPOS_SOURCE=bows` too: a non-empty seed opts back into this
+regenerate-every-boot rule, and the bows path's never-overwrite promise covers
+only the empty-seed case. Leave `ALISSA_REVIEW_REPOS` **unset**
 to instead run against a workspace you've mounted at `/workspace` as-is.
 
 ## Run

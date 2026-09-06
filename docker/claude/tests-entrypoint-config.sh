@@ -491,5 +491,40 @@ set +e; wait "${PID4}"; rc4=$?; set -e
 assert_log "${LOG4}" "re-pin ARG REVLOOP_VERSION" "...after the skew WARN named the fix"
 assert_log "${LOG4}" "ALISSA_REVIEW_REPOS is empty — nothing to work on" "...and the static die names its own reason"
 
+# --- 3c. DOWNGRADE: our own stamped bows config on the volume, old pin, empty seed
+# (PR #120 round-1 [minor]): an earlier >= 0.29.0 boot wrote the stamped
+# config + empty manifest; the old pin must die by name at the guard, not
+# crash-loop the daemon on the file's unknown keys.
+WS5="${TMPROOT}/ws-downgrade"; LOG5="${TMPROOT}/downgrade.log"; mkdir -p "${WS5}"
+env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE=bows ALISSA_REVIEW_BOWS_REFRESH_POLLS=3 ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}" \
+  PYTHONPATH="${SRC_TREE}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config_bows "[]" "[]"' > "${WS5}/revloop.config.json"
+assert_eq "$(cat "${WS5}/revloop.config.json")" '.repos_source' '"bows"' "seeded: a >= 0.29.0 boot's stamped config carries the keys"
+printf 'name: ws\ndescription: d\nrepos: []\nreviewers: []\nskills: []\nattributes: {}\n' > "${WS5}/alissa-workspace.yaml"
+rm -f "${MARKERS}"/*
+boot "${WS5}" "${LOG5}" "${STUB_OLD}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows; PID5="${EP_PID}"
+set +e; wait "${PID5}"; rc5=$?; set -e
+[ "${rc5}" -ne 0 ] && pass "a downgrade over our own stamped config exits non-zero (${rc5})" || bad "a downgrade over our own stamped config booted (the old daemon would crash-loop on its keys)"
+assert_log "${LOG5}" "re-pin ARG REVLOOP_VERSION" "...after the skew WARN named the fix"
+assert_log "${LOG5}" "downgrade: ${WS5}/revloop.config.json is this container's OWN bows-path output" "...and the die names the stamped file and the downgrade"
+assert_log "${LOG5}" "could widen the watch to every PR" "...and why an empty static allowlist is not handed on"
+assert_no_log "${LOG5}" "using mounted workspace" "the mounted-mode arm is NOT reached"
+[ -f "${MARKERS}/worker-started" ] && bad "downgrade died AFTER starting the worker" || pass "downgrade dies before any worker starts"
+assert_eq "$(cat "${WS5}/revloop.config.json")" '.repos_source' '"bows"' "the stamped config is left intact for the re-pin"
+
+# --- 3d. ...but an UNSTAMPED (operator) config on the same boot is respected
+printf '{"repos": ["mounted/repo"]}\n' > "${WS5}/revloop.config.json"
+LOG5B="${TMPROOT}/downgrade-mounted.log"
+rm -f "${MARKERS}"/*
+boot "${WS5}" "${LOG5B}" "${STUB_OLD}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows; PID5B="${EP_PID}"
+if wait_for_log "${LOG5B}" "alissa worker is running" 45; then
+  pass "an old pin over an unstamped config with a mounted manifest still boots"
+else
+  bad "old pin over an unstamped config did not boot (see ${LOG5B})"; sed 's/^/      | /' "${LOG5B}" | tail -20 >&2
+fi
+assert_log "${LOG5B}" "using mounted workspace" "...through the mounted-mode arm"
+assert_no_log "${LOG5B}" "downgrade:" "...without the downgrade die (the file is not ours)"
+assert_eq "$(cat "${WS5}/revloop.config.json")" '.repos' '["mounted/repo"]' "the operator's config is untouched"
+stop_boot "${PID5B}"
+
 echo
 [ "${fail}" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
