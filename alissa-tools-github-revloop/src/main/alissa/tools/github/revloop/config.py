@@ -15,6 +15,12 @@ site. `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`, see
 `env_loop_events_enabled`) has it because a container deployment toggles
 telemetry with one variable and no config-file edit (issue #112); the env wins
 over both other layers so the two env-backed keys share one precedence story.
+The three `repos_source: bows` keys (issue #119) ride the same rail for the
+same container reason: `repos_source` (`ALISSA_REVIEW_REPOS_SOURCE`),
+`bows_refresh_polls` (`ALISSA_REVIEW_BOWS_REFRESH_POLLS`) and `bow_owners`
+(`ALISSA_REVIEW_BOW_OWNERS`). A **blank** env value falls through on every one
+of them — an unset platform variable reference renders as `""`, and that must
+not fail boot on a mode of `''`.
 
 `workspace_root` is deliberately **not** a config key — it is a property of the
 running process, not of the settings. That lets one config file drive several
@@ -28,7 +34,7 @@ import fnmatch
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -125,6 +131,36 @@ HUB_ADD = "add"  # `alissa code workspace add <org>/<repo>`
 
 _HUB_MODES = {HUB_SKIP, HUB_ADD}
 
+# Where the repos allowlist comes from (issue #119). `static` is the `repos` key
+# alone -- today's behaviour bit for bit, and no Alissa HTTP call exists to
+# fail. `bows` unions that list with the repos named by the operator's active
+# `autodev: <owner>/<repo>` feed Bodies of Work (see bows.py), so enrolling a
+# repo is creating the feed, not redeploying the reviewer.
+REPOS_STATIC = "static"
+REPOS_BOWS = "bows"
+
+_REPOS_SOURCES = {REPOS_STATIC, REPOS_BOWS}
+
+# What an Alissa actor id looks like: a 32-character opaque handle of
+# lower-case letters and digits (`j5706fv7xe5jy1k5wdwzacab9s8axcd2`). Every id
+# the API mints has this shape, and `bow_owners` is checked against it so a
+# username or display name cannot be mistaken for one. SHAPE only: it says
+# "this could be an id", never "this actor exists" -- a wrong-but-well-formed
+# id already fails loudly as a feed nobody owns. Mirrors devloop's and
+# orcloop's constant of the same name, so the three daemons refuse the same
+# entries.
+ACTOR_ID_LENGTH = 32
+_ACTOR_ID_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+# `\Z`, not `$`: `$` also matches just before a trailing newline, so
+# `"<id>\n"` would pass. Callers strip, but a gate that only holds because
+# its caller normalised is not a gate.
+_ACTOR_ID_RE = re.compile(rf"^[a-z0-9]{{{ACTOR_ID_LENGTH}}}\Z")
+
+# Separators a single `bow_owners` entry may itself carry: `|` is the
+# daemon-family convention (shared with ALISSA_REVIEW_REPOS, so one platform
+# variable can feed several services) and `,` is accepted alongside it.
+_OWNER_SEPARATORS = re.compile(r"[|,]")
+
 CONFIG_FILENAME = "revloop.config.json"
 
 # Keys accepted in the config file. workspace_root is excluded on purpose.
@@ -135,6 +171,9 @@ CONFIG_KEYS = (
     "stability_rounds",
     "stability_nonshipped_globs",
     "repos",
+    "repos_source",
+    "bows_refresh_polls",
+    "bow_owners",
     "authors",
     "operators",
     "agent_profile",
@@ -166,6 +205,13 @@ TASK_LIST_BOW_ENV = "ALISSA_REVIEW_TASK_BOW"
 # TASK_LIST_BOW_ENV it outranks both the config file and the CLI flag — see the
 # module docstring for the shared precedence story.
 LOOP_EVENTS_ENV = "ALISSA_REV_LOOP_EVENTS_ENABLED"
+
+# The three `repos_source: bows` rails (issue #119). Same precedence as the two
+# above -- env > file > flag -- and the same blank-falls-through rule, because
+# the container bakes every knob as an ENV that renders `""` when unset.
+REPOS_SOURCE_ENV = "ALISSA_REVIEW_REPOS_SOURCE"
+BOWS_REFRESH_POLLS_ENV = "ALISSA_REVIEW_BOWS_REFRESH_POLLS"
+BOW_OWNERS_ENV = "ALISSA_REVIEW_BOW_OWNERS"
 
 # The default Studio API base the loop-events client posts to. Mirrors
 # alissa_client.DEFAULT_ENDPOINT (a test pins the two together); defined here
@@ -249,6 +295,132 @@ def env_task_list_bow_id(environ: "Mapping[str, str] | None" = None) -> "str | N
     """
     raw = (os.environ if environ is None else environ).get(TASK_LIST_BOW_ENV)
     return (raw or "").strip() or None
+
+
+def _env_text(name: str, environ: "Mapping[str, str] | None") -> "str | None":
+    """One env rail's raw value, or None when unset OR blank.
+
+    Blank and unset are the same answer on every rail here: an exported-but-
+    empty variable is how a container renders "unset", and it must fall
+    through to the file / CLI layers rather than be validated as a value.
+    """
+    raw = (os.environ if environ is None else environ).get(name)
+    return (raw or "").strip() or None
+
+
+def env_repos_source(environ: "Mapping[str, str] | None" = None) -> "str | None":
+    """`ALISSA_REVIEW_REPOS_SOURCE`, or None when unset/blank. NOT validated
+    here: `Config.build` refuses an unknown mode by name, and says which layer
+    it came from."""
+    return _env_text(REPOS_SOURCE_ENV, environ)
+
+
+def env_bows_refresh_polls(
+    environ: "Mapping[str, str] | None" = None,
+) -> "int | None":
+    """`ALISSA_REVIEW_BOWS_REFRESH_POLLS` as an int, or None when unset/blank.
+    A non-integer raises -- the startup phase turns that into `config error`,
+    which is where a typo belongs."""
+    raw = _env_text(BOWS_REFRESH_POLLS_ENV, environ)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{BOWS_REFRESH_POLLS_ENV} must be an integer number of poll "
+            f"passes, got {raw!r}"
+        ) from None
+
+
+def env_bow_owners(environ: "Mapping[str, str] | None" = None) -> "str | None":
+    """`ALISSA_REVIEW_BOW_OWNERS` verbatim, or None when unset/blank. The
+    `|`/`,` splitting and the actor-id check happen in `normalize_bow_owners`,
+    so the env, the file and the flag are validated by exactly one rule."""
+    return _env_text(BOW_OWNERS_ENV, environ)
+
+
+def normalize_bow_owners(values: "Any") -> "tuple[str, ...]":
+    """Validate the `bow_owners` layer value into the authority list.
+
+    Accepts a list of strings OR one string (a platform variable, or one
+    `--bow-owner` flag, arrives as a single string); each element may itself
+    carry a `|`- and/or `,`-separated list. Whitespace is stripped and
+    empties dropped, so a trailing separator is harmless. Duplicates collapse
+    EXACTLY, with no casefolding: unlike `repos`, actor ids are opaque, and
+    folding two spellings together could only widen a trust gate.
+
+    Emptiness is fine and means "not overridden" -- boot resolves the
+    authority to this token's own actor. It is not a fail-open state either
+    way: `trusts_feed_owner` refuses every owner on an empty list.
+    """
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(
+            f"bow_owners must be a list of Alissa actor ids (or one `|`/`,`-"
+            f"separated string), got a {type(values).__name__}"
+        )
+    out: "list[str]" = []
+    seen: "set[str]" = set()
+    for value in values:
+        for part in _OWNER_SEPARATORS.split(str(value)):
+            entry = part.strip()
+            if not entry:
+                continue
+            _validate_actor_id(entry)
+            if entry not in seen:
+                seen.add(entry)
+                out.append(entry)
+    return tuple(out)
+
+
+def _validate_actor_id(entry: str) -> None:
+    """Reject anything that is not an Alissa actor id, naming the entry.
+
+    Ownership is checked against a container's `ownerActorId`, which is opaque
+    and immutable. A username or display name is neither: it is operator-facing
+    text the owning account can CHANGE, so an allowlist written in those terms
+    grants authority to whoever holds the name when the check runs rather than
+    to the actor the operator meant.
+
+    Worse, getting it wrong would not be loud. Nothing on the wire ever equals
+    a name, so a name in this list matches no container and the symptom is an
+    allowlist that derives nothing -- indistinguishable from "no feed created
+    yet". Failing here, at load time, with the offending entry named, is the
+    only point where the mistake is visible.
+    """
+    if _ACTOR_ID_RE.match(entry):
+        return
+    lowered = entry.lower()
+    if _ACTOR_ID_RE.match(lowered):
+        # The one near-miss with a mechanical fix, so it gets its own message.
+        # NOT lowered silently: ids are opaque, and quietly rewriting one makes
+        # a config stop meaning what it says.
+        hint = f" — actor ids are lower-case; did you mean {lowered!r}?"
+    else:
+        # LENGTH FIRST: a short name is a length problem before it is an
+        # alphabet one, and telling someone their 8-character username
+        # "contains 'ADHMORTZ'" buries the useful observation.
+        problems = []
+        if len(entry) != ACTOR_ID_LENGTH:
+            problems.append(f"it is {len(entry)} characters, not {ACTOR_ID_LENGTH}")
+        offending = "".join(sorted(set(entry) - _ACTOR_ID_ALPHABET))
+        if offending:
+            problems.append(f"it contains {offending!r}, which no actor id does")
+        hint = (
+            " — " + " and ".join(problems)
+            + "; that looks like a username or a display name"
+        )
+    raise ValueError(
+        f"bow_owners entry {entry!r} is not an Alissa actor id{hint}. Use the "
+        f"opaque id — the `ownerActorId` on the container's row in "
+        f"GET /v1/bodies-of-work, or `actorId` from GET /v1/ping — never a "
+        f"username or display name: names are renameable, so an ownership "
+        f"check against one is a spoof surface. Several ids are separated by "
+        f"`|` or `,`. Leave bow_owners unset to trust this token's own actor, "
+        f"which needs no id at all."
+    )
 
 
 MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
@@ -481,8 +653,36 @@ class Config:
     # diff; see DEFAULT_STABILITY_NONSHIPPED_GLOBS and `glob_matches`.
     stability_nonshipped_globs: tuple[str, ...] = DEFAULT_STABILITY_NONSHIPPED_GLOBS
 
-    # Empty tuple means "every repo that requests a review from me".
+    # Under `static` (the default) an empty tuple means "every repo that
+    # requests a review from me". Under `bows` this is the EFFECTIVE allowlist
+    # -- the static seed unioned with what the last feed refresh derived, which
+    # the loop writes back here -- and empty means NOTHING (see `watches`).
     repos: tuple[str, ...] = ()
+
+    # Where `repos` comes from: REPOS_STATIC (the key alone, unchanged) or
+    # REPOS_BOWS (unioned with the operator's active `autodev: <owner>/<repo>`
+    # feed Bodies of Work every `bows_refresh_polls` passes; see bows.py).
+    repos_source: str = REPOS_STATIC
+
+    # bows mode: re-derive the allowlist every N poll passes. The enrollment-
+    # latency knob -- at the default pair (60s poll, 5) a new feed enrolls its
+    # repo within ~5 minutes for one API call per five passes. Floor 1.
+    bows_refresh_polls: int = 5
+
+    # bows mode: the actor id(s) whose Bodies of Work may act as feeds. An
+    # EMPTY tuple here is resolved AT BOOT to the token's own actor
+    # (`__main__.resolve_feed_authority`), which is what an operator running
+    # their own fleet wants; set it explicitly when the feed containers belong
+    # to an actor this token is not. Ids only: a display name is refused at
+    # load, because names are renameable and this list is a trust gate.
+    bow_owners: tuple[str, ...] = ()
+
+    # `repos`, casefolded, for the bows-mode membership test. Derived in
+    # __post_init__ so a `dataclasses.replace(config, repos=...)` re-derives
+    # it -- the loop rebinds the allowlist that way on every refresh.
+    _repo_match: frozenset[str] = field(
+        default=frozenset(), init=False, repr=False, compare=False
+    )
 
     # GitHub logins whose PRs this loop will spend rounds on. A SCOPE FILTER,
     # not a capability grant -- so, like `repos` and unlike `operators`, empty
@@ -597,6 +797,9 @@ class Config:
         object.__setattr__(
             self, "workspace_root", Path(self.workspace_root).expanduser().resolve()
         )
+        object.__setattr__(
+            self, "_repo_match", frozenset(r.casefold() for r in self.repos)
+        )
 
     @property
     def state_db(self) -> Path:
@@ -618,7 +821,39 @@ class Config:
         ).expanduser()
 
     def watches(self, full_name: str) -> bool:
+        """Whether a PR in this repo is in scope.
+
+        Two rules, deliberately different, and the difference is documented
+        in the README because it is the one place the two modes disagree:
+
+        * `static`: empty means EVERY repo that requests this reviewer, and a
+          non-empty list matches exactly as it always has (unchanged, bit for
+          bit -- this is the pre-#119 body).
+        * `bows`: empty means NOTHING. The effective set is derived∪static,
+          and an empty feed set must not widen to "every PR that requests
+          me" -- for a self-run fleet the correct bound is the lanes. Matched
+          case-insensitively, because a derived name is operator-typed feed
+          text while GitHub's `repository_url` is canonical, and an exact
+          compare would silently skip a repo whose feed title differs from
+          the API by case alone.
+        """
+        if self.repos_source == REPOS_BOWS:
+            return full_name.casefold() in self._repo_match
         return not self.repos or full_name in self.repos
+
+    def trusts_feed_owner(self, actor_id: "str | None") -> bool:
+        """May a Body of Work owned by this actor act as a repo feed?
+
+        Fail-closed on a MISSING owner: a container whose provenance the
+        payload does not state cannot be attributed, and an unattributable
+        feed is exactly what the gate exists to refuse. Fail-closed on an
+        EMPTY authority too, which is what makes the boot-time default safe to
+        resolve outside this class -- before boot fills the list in (or when
+        something skipped that step) every owner is untrusted and nothing is a
+        feed, so a missing authority makes the mode INERT rather than open.
+        Comparison is EXACT: actor ids are opaque, so normalising them could
+        only ever widen the match."""
+        return bool(actor_id) and actor_id in self.bow_owners
 
     def serves_author(self, login: str) -> bool:
         """Whether a PR by this login is in scope for the loop.
@@ -648,9 +883,11 @@ class Config:
         """Merge the layers and validate. `overrides` entries that are None mean
         "not specified on the CLI" and fall through to the file / defaults.
 
-        `environ` is the fourth layer and applies to `task_list_bow_id` alone;
-        it wins over both of the others (see the module docstring). Defaults to
-        the real environment, so callers that do not care pass nothing.
+        `environ` is the fourth layer and applies to the env-backed keys
+        (`task_list_bow_id`, `loop_events_enabled`, `repos_source`,
+        `bows_refresh_polls`, `bow_owners`); it wins over both of the others
+        (see the module docstring). Defaults to the real environment, so
+        callers that do not care pass nothing.
         """
         raw: dict[str, Any] = dict(file_data or {})
 
@@ -705,6 +942,37 @@ class Config:
         if env_events is not None:
             raw["loop_events_enabled"] = env_events
 
+        # The three bows rails (issue #119), same layer and same reason: the
+        # container hands the daemon its mode with one variable. Each is
+        # applied only when NON-BLANK, so an unset platform variable reference
+        # (which renders as "") leaves the file / CLI value standing.
+        env_source = env_repos_source(environ)
+        if env_source is not None:
+            raw["repos_source"] = env_source
+        env_polls = env_bows_refresh_polls(environ)
+        if env_polls is not None:
+            raw["bows_refresh_polls"] = env_polls
+        env_owners = env_bow_owners(environ)
+        if env_owners is not None:
+            raw["bow_owners"] = env_owners
+
+        source = raw.get("repos_source", cls.repos_source)
+        if source not in _REPOS_SOURCES:
+            raise ValueError(
+                f"repos_source must be one of {sorted(_REPOS_SOURCES)}, got "
+                f"{source!r}"
+                + (f" (from {REPOS_SOURCE_ENV})" if env_source is not None else "")
+            )
+
+        refresh_polls = int(raw.get("bows_refresh_polls", cls.bows_refresh_polls))
+        if refresh_polls < 1:
+            raise ValueError(
+                f"bows_refresh_polls must be >= 1 (1 = refresh every poll), "
+                f"got {refresh_polls}"
+            )
+
+        bow_owners = normalize_bow_owners(raw.get("bow_owners", cls.bow_owners))
+
         endpoint = raw.get("alissa_endpoint", cls.alissa_endpoint)
         if not isinstance(endpoint, str):
             raise ValueError(
@@ -737,13 +1005,20 @@ class Config:
         operators = _string_list(
             raw.get("operators", ()), "operators", "GitHub logins"
         )
-        if hub_mode == HUB_ADD and not repos:
+        if hub_mode == HUB_ADD and not repos and source == REPOS_STATIC:
             # Anyone who can request a review could otherwise cause an arbitrary
             # repo to be cloned onto this machine and opened as an agent's cwd.
+            # Under `bows` an empty static list is the ORDINARY setup (the
+            # whole point is that enrollment is not a config edit), and the
+            # blast radius is bounded by the feed-authority gate instead: only
+            # an allowlisted actor's container can enroll a repo at all, and
+            # `watches` reads an empty derived∪static set as NOTHING.
             raise ValueError(
                 "on_missing_hub='add' requires a non-empty repos allowlist "
                 "(config `repos`, or one or more --repo flags) — auto-cloning "
-                "whatever repo requests a review is unbounded"
+                "whatever repo requests a review is unbounded. Under "
+                "repos_source='bows' the feed-authority gate bounds it "
+                "instead, and an empty static list is fine"
             )
 
         cap = int(raw.get("round_cap", cls.round_cap))
@@ -880,6 +1155,9 @@ class Config:
             stability_rounds=stability,
             stability_nonshipped_globs=nonshipped,
             repos=repos,
+            repos_source=source,
+            bows_refresh_polls=refresh_polls,
+            bow_owners=bow_owners,
             authors=authors,
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
