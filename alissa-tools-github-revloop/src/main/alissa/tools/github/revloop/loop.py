@@ -16,7 +16,7 @@ import secrets
 import sqlite3
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -31,8 +31,11 @@ from .alissa import (
     is_review_task_for,
     session_repo_slug,
 )
+from .alissa_client import AlissaClient
+from .bows import EMPTY_SET_WARNING, FEED_PREFIX, BowRepoSource
 from .config import (
     HUB_ADD,
+    REPOS_BOWS,
     ON_MISSING_SKIP,
     STALE_ROUND_SECONDS,
     Config,
@@ -1595,8 +1598,22 @@ class ReviewWatcher:
         github: GitHub | None = None,
         alissa: Alissa | None = None,
         state: State | None = None,
+        bow_client: "AlissaClient | None" = None,
     ):
         self.config = config
+        # The BOW-derived allowlist (`repos_source: "bows"`, issue #119), or
+        # None in static mode -- which then costs nothing: no client, no
+        # refresh, no log line, and every read of `config.repos` below is the
+        # static list exactly as before. `bow_client` is the seam a test uses
+        # to feed it a fake listing.
+        self.repo_source: "BowRepoSource | None" = (
+            BowRepoSource(config, bow_client)
+            if config.repos_source == REPOS_BOWS
+            else None
+        )
+        # Whether the empty-set WARN has been logged since the last refresh
+        # attempt -- see poll_once. Reset by refresh_repos.
+        self._warned_empty_allowlist = False
         self.github = github or GitHub(
             config.reviewer_login, token_env=config.reviewer_token_env
         )
@@ -1695,6 +1712,122 @@ class ReviewWatcher:
         # state, and because the only durable place to put it is the ledger
         # that cannot be written.
         self._ledger_streak = Streak()
+
+    # -- the derived allowlist (repos_source: "bows") ----------------------
+
+    def _apply_repos(self, repos: "tuple[str, ...]") -> None:
+        """Re-bind the effective allowlist.
+
+        The union is written back onto `self.config` rather than threaded
+        through every caller that reads `config.repos` / `config.watches`:
+        the search's `repo:` qualifiers, the per-request `watches` gate, the
+        hub guard and the sweep's name resolution all ask the allowlist the
+        same question they always did, so a repo enrolled by a feed is seen
+        by every edge at once. `Config` is frozen, so this is a `replace`
+        onto a NEW instance, which also re-derives its casefolded match set.
+        """
+        if repos == self.config.repos:
+            return
+        self.config = replace(self.config, repos=repos)
+
+    def _mid_round_repos(self) -> "frozenset[str] | None":
+        """Casefolded `owner/repo` of every repo with a round in flight, or
+        None when the answer cannot be trusted.
+
+        Two sources, unioned, because either alone has a hole. The LEDGER
+        answers for an enqueued round whose session the worker has not yet
+        created, and for a verdict still owed. The live ROSTER answers for a
+        session that outlived the stale window -- a healthy round runs for
+        a while, and dropping its repo at the window's edge would strand the
+        exact round the rule protects. An unlistable roster makes the whole
+        answer None: handing over the ledger half alone would read a live
+        long-running session as absent, which is the direction the rule
+        must never err in.
+        """
+        try:
+            sessions = self.alissa.list_review_sessions()
+        except CommandError as exc:
+            log.warning(
+                "repos_source=bows: could not list reviewer sessions (%s) — "
+                "no repo leaves the allowlist this refresh",
+                exc,
+            )
+            return None
+        busy = set(self.state.in_flight_repos(STALE_ROUND_SECONDS))
+        slugs = {
+            session_repo_slug(full_name.partition("/")[2]): full_name.casefold()
+            for full_name in self.config.repos
+            if full_name.partition("/")[1]
+        }
+        for ses in sessions:
+            ref = ses.ref
+            if ref is None:
+                continue
+            if ref.repo is not None and ref.repo in slugs:
+                busy.add(slugs[ref.repo])
+                continue
+            # The skill's bare `review-pr-<n>` shape carries no repo; the
+            # ledger row it was recorded under (if any) does.
+            row = self.state.find_spawn_by_session(ses.name)
+            if row is not None:
+                busy.add(str(row["repo"]).casefold())
+        return frozenset(busy)
+
+    def refresh_repos(self, *, force: bool = False) -> None:
+        """Re-derive the allowlist if a refresh is due (a no-op in static
+        mode). Never raises: a feed the daemon cannot read must cost it a
+        warning, never a poll pass -- everything below the allowlist still
+        has work to do on the repos already in it."""
+        source = self.repo_source
+        if source is None:
+            return
+        source.tick()  # one poll pass observed, refreshed or not
+        if not (force or source.due()):
+            return
+        self._warned_empty_allowlist = False
+        try:
+            listed = source.refresh(self._mid_round_repos)
+        except Exception:  # pragma: no cover - defence in depth
+            # `refresh` catches AlissaError itself; this catches the ledger
+            # read and anything a future feed reader grows. The allowlist
+            # simply does not move this pass.
+            log.exception(
+                "repos_source=bows: refresh failed unexpectedly — keeping the "
+                "current allowlist"
+            )
+            return
+        self._apply_repos(source.repos())
+        if listed:
+            # Telemetry-class: the console's window onto the derived set.
+            rows = source.sources()
+            self.state._write_telemetry(
+                lambda: self.state.record_derived_repos(rows),
+                "recording the derived allowlist",
+            )
+
+    def _search_allowlist(self) -> "tuple[str, ...] | None":
+        """The allowlist the review-requested search runs over, or None when
+        the pass must search NOTHING.
+
+        Under `static` this is `config.repos` verbatim (empty = every repo,
+        unchanged). Under `bows` an empty derived∪static set watches nothing
+        -- an empty feed set must not widen to "every PR that requests me" --
+        so the search is skipped outright, with one WARN per refresh rather
+        than one per pass.
+        """
+        if self.repo_source is None or self.config.repos:
+            return self.config.repos
+        if not self._warned_empty_allowlist:
+            self._warned_empty_allowlist = True
+            log.warning(
+                "%s — nothing is watched: create an `autodev: <owner>/<repo>` "
+                "body of work owned by the feed authority (%s), or set "
+                "`repos`. Unlike static mode, an empty allowlist under bows "
+                "never widens to every PR that requests this reviewer",
+                EMPTY_SET_WARNING,
+                ", ".join(self.config.bow_owners) or "unresolved",
+            )
+        return None
 
     # -- the PR -> review-task mapping ---------------------------------------
 
@@ -4495,6 +4628,31 @@ class ReviewWatcher:
         """Startup checks. Returns warnings; raises on anything fatal."""
         warnings: list[str] = []
 
+        # The first feed refresh runs HERE, not on the first poll, so the
+        # effective config the CLI logs right after this names the derived
+        # allowlist rather than the static list the operator did not
+        # configure (bows mode only; a no-op under static).
+        self.refresh_repos(force=True)
+        if self.repo_source is not None:
+            log.info(
+                "repos_source=bows: watching %s (static %s + derived %s), "
+                "refreshed every %d poll(s) from `%s` bodies of work; feed "
+                "authority %s",
+                ", ".join(self.config.repos) or "NO repos",
+                list(self.repo_source.config.repos) or "[]",
+                list(self.repo_source.derived) or "[]",
+                self.config.bows_refresh_polls,
+                FEED_PREFIX.strip(),
+                ", ".join(self.config.bow_owners) or "UNRESOLVED",
+            )
+            if not self.config.repos:
+                warnings.append(
+                    f"{EMPTY_SET_WARNING} and the static `repos` list is "
+                    f"empty, so nothing is watched — create an "
+                    f"`autodev: <owner>/<repo>` body of work owned by the "
+                    f"feed authority, or set `repos`"
+                )
+
         # Fatal: a mismatched identity silently breaks round counting -- and
         # this is also the once-per-process identity assertion every later
         # review post is held to (see GitHub.assert_review_identity), so the
@@ -4782,7 +4940,16 @@ class ReviewWatcher:
         started = time.monotonic()
         reaped = self.sweep_sessions()
 
-        requests = self.github.review_requests(self.config.repos)
+        # Re-derive the allowlist when due (bows mode only; a no-op under
+        # static). AFTER the sweep, so a session the sweep just reaped no
+        # longer holds its repo in the allowlist, and BEFORE the search, so
+        # a repo enrolled this pass is searched this pass.
+        self.refresh_repos()
+        allowlist = self._search_allowlist()
+        if allowlist is None:
+            requests = []
+        else:
+            requests = self.github.review_requests(allowlist)
         log.info("%d PR(s) with a review pending from %s", len(requests), self.github.login)
 
         # Forget queue places belonging to PRs this pass cannot act on at all

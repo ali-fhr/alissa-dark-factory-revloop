@@ -490,11 +490,25 @@ class Sources:
 
     # -- config echo + log tail --------------------------------------------
 
+    def derived_repos(self) -> "list[dict]":
+        """The feed-derived half of the allowlist as the daemon's LAST
+        successful refresh recorded it (`repos_source: bows`, issue #119) --
+        read from state.db, never re-derived here: the console makes no
+        Alissa call. Empty under static mode, or before the first refresh."""
+        return self._read_state([], lambda st: st.read_derived_repos())
+
     def config_echo(self) -> dict:
         c = self.config
         return {
             "workspace_root": str(c.workspace_root),
             "repos": list(c.repos),
+            # Where `repos` comes from, and -- under bows -- the derived half
+            # the daemon unions with it, read off the daemon's own state.
+            "repos_source": c.repos_source,
+            "derived_repos": [
+                {"repo": r["repo"], "bow_id": r["bow_id"], "bow_title": r["bow_title"]}
+                for r in self.derived_repos()
+            ],
             # Who may re-open a capped PR with a re-entry ack. Part of the
             # operator's own picture: the escalation inbox below is where that
             # lever gets used.
