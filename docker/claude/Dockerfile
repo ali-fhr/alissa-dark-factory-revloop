@@ -289,6 +289,22 @@ ARG ALISSA_TASK_LIST_SELF_SCOPE=""
 # and it REQUIRES REVLOOP_VERSION >= 0.28.0 for the same reason the keys above
 # do: an older library rejects the unknown config key at load.
 ARG ALISSA_REV_LOOP_EVENTS_ENABLED=""
+# Where the review allowlist comes from (issue #119). `static` (unset) is the
+# ALISSA_REVIEW_REPOS list alone, today's behaviour bit for bit. `bows` derives
+# it from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work
+# (unioned with ALISSA_REVIEW_REPOS, which may then be EMPTY -- the entrypoint
+# no longer dies on an empty allowlist under bows), re-derived every
+# ALISSA_REVIEW_BOWS_REFRESH_POLLS passes (int, library default 5), and only
+# from containers owned by ALISSA_REVIEW_BOW_OWNERS ("|"/","-separated actor
+# IDS, never names; unset = the token's own actor, resolved at boot). The
+# daemon library reads all three variables directly (env > file > flag, blank
+# falls through), so the render is belt to that brace. All three are
+# pass-through and REQUIRE REVLOOP_VERSION >= 0.29.0: on an older pin the
+# entrypoint's skew guard WARNs by name and boots the static path instead
+# (see docker/claude/README.md, "Enrolling by creating the lane").
+ARG ALISSA_REVIEW_REPOS_SOURCE=""
+ARG ALISSA_REVIEW_BOWS_REFRESH_POLLS=""
+ARG ALISSA_REVIEW_BOW_OWNERS=""
 # STRUCTURAL container constants (not pass-through): agent_profile must name a
 # profile the baked agents.yaml ships (`claude`); on_missing_hub must be `add`
 # for the self-contained hub-ify-on-demand model (the library default `skip`
@@ -332,6 +348,9 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REVIEW_TASK_MISS_TTL_POLLS=${ALISSA_REVIEW_TASK_MISS_TTL_POLLS} \
     ALISSA_TASK_LIST_SELF_SCOPE=${ALISSA_TASK_LIST_SELF_SCOPE} \
     ALISSA_REV_LOOP_EVENTS_ENABLED=${ALISSA_REV_LOOP_EVENTS_ENABLED} \
+    ALISSA_REVIEW_REPOS_SOURCE=${ALISSA_REVIEW_REPOS_SOURCE} \
+    ALISSA_REVIEW_BOWS_REFRESH_POLLS=${ALISSA_REVIEW_BOWS_REFRESH_POLLS} \
+    ALISSA_REVIEW_BOW_OWNERS=${ALISSA_REVIEW_BOW_OWNERS} \
     ALISSA_REVIEWER_LOGIN=${ALISSA_REVIEWER_LOGIN} \
     ALISSA_REVIEWER_TOKEN_ENV=${ALISSA_REVIEWER_TOKEN_ENV} \
     ALISSA_AGENT_PROFILE=${ALISSA_AGENT_PROFILE} \

@@ -13,6 +13,16 @@
 # value equals the library default — the acceptance criterion's "effective
 # daemon config equals library defaults", verified against the actual library.
 #
+# The `repos_source: bows` keys (issue #119) get two more layers: the three
+# ALISSA_REVIEW_REPOS_SOURCE / _BOWS_REFRESH_POLLS / _BOW_OWNERS variables are
+# pass-through like the others (typed as string / int / JSON array) but SKEW-
+# GATED on the installed library, and the entrypoint's bows arm is exercised by
+# booting the REAL entrypoint against stubbed CLIs (the tests-entrypoint-ui.sh
+# shape): bows + empty ALISSA_REVIEW_REPOS boots and renders the three keys,
+# static + empty still dies, and an old pin falls through with the named WARN.
+# The library on the probe's PYTHONPATH is what decides "old" vs "new", so both
+# sides are replayed without installing a second wheel.
+#
 # Usage: bash docker/claude/tests-entrypoint-config.sh
 # =============================================================================
 set -euo pipefail
@@ -213,6 +223,273 @@ PY
 else
   echo "  skip (revloop package not importable — structural checks above still ran)"
 fi
+
+# =============================================================================
+# repos_source: bows (issue #119)
+# =============================================================================
+REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
+SRC_TREE="${REPO_ROOT}/alissa-tools-github-revloop/src/main"
+OWN_ID="j5706fv7xe5jy1k5wdwzacab9s8axcd2"
+OTHER_ID="k7706fv7xe5jy1k5wdwzacab9s8axcd2"
+BOWS_VARS=(-u ALISSA_REVIEW_REPOS_SOURCE -u ALISSA_REVIEW_BOWS_REFRESH_POLLS -u ALISSA_REVIEW_BOW_OWNERS)
+
+TMPROOT="$(mktemp -d)"
+cleanup() { rm -rf "${TMPROOT}"; }
+trap cleanup EXIT
+
+# A stub of the INSTALLED library as it looks on a pin that PREDATES the keys:
+# the renderer's probe imports `alissa.tools.github.revloop.config.CONFIG_KEYS`
+# and `.version.version.value`, nothing else, so a two-module package on
+# PYTHONPATH replays the skew exactly.
+STUB_OLD="${TMPROOT}/old-lib"
+mkdir -p "${STUB_OLD}/alissa/tools/github/revloop"
+for d in alissa alissa/tools alissa/tools/github alissa/tools/github/revloop; do
+  : > "${STUB_OLD}/${d}/__init__.py"
+done
+cat > "${STUB_OLD}/alissa/tools/github/revloop/config.py" <<'STUB'
+CONFIG_KEYS = ("hub_template", "poll_interval", "round_cap", "repos", "operators",
+               "agent_profile", "reviewer_login", "reviewer_token_env", "state_path",
+               "on_missing_review_task", "on_missing_hub", "dry_run")
+STUB
+cat > "${STUB_OLD}/alissa/tools/github/revloop/version.py" <<'STUB'
+class _V:
+    value = "0.16.14"
+version = _V()
+STUB
+
+# render_with <pythonpath> <repos-json> [operators-json] — a fresh shell per
+# render, because the probe memoises per process.
+render_with() {
+  local pp="$1" repos="$2" ops="${3:-[]}"
+  PYTHONPATH="${pp}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config "$1" "$2"' _ "${repos}" "${ops}"
+}
+render_bows_with() {
+  local pp="$1" repos="$2" ops="${3:-[]}"
+  PYTHONPATH="${pp}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config_bows "$1" "$2"' _ "${repos}" "${ops}"
+}
+
+echo "== bows keys: omitted when unset (static render byte-identical) =="
+base="$(env "${BOWS_VARS[@]}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+assert_key_absent "${base}" repos_source       "repos_source omitted when ALISSA_REVIEW_REPOS_SOURCE unset"
+assert_key_absent "${base}" bows_refresh_polls "bows_refresh_polls omitted when ALISSA_REVIEW_BOWS_REFRESH_POLLS unset"
+assert_key_absent "${base}" bow_owners         "bow_owners omitted when ALISSA_REVIEW_BOW_OWNERS unset"
+assert_key_absent "${base}" _generated_by      "the static render carries NO provenance stamp"
+blank="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE="" ALISSA_REVIEW_BOWS_REFRESH_POLLS=" " ALISSA_REVIEW_BOW_OWNERS="|," \
+  bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+if [ "${blank}" = "${base}" ]; then
+  pass "blank / separator-only values render byte-identically to unset"
+else
+  bad "blank values changed the render (Dockerfile bakes empty ENV)"
+fi
+
+echo "== bows keys: set -> rendered with their types (library that knows them) =="
+out="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE=bows ALISSA_REVIEW_BOWS_REFRESH_POLLS=3 \
+      ALISSA_REVIEW_BOW_OWNERS=" ${OWN_ID} | ${OTHER_ID},${OWN_ID}, " \
+      PYTHONPATH="${SRC_TREE}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/render.err")"
+assert_eq "${out}" '.repos_source'       '"bows"' "repos_source rendered as a string"
+assert_eq "${out}" '.bows_refresh_polls' '3'      "bows_refresh_polls rendered as a JSON number"
+assert_eq "${out}" '.bow_owners' "[\"${OWN_ID}\",\"${OTHER_ID}\"]" \
+  "bow_owners rendered as a JSON array: |/, split, whitespace stripped, exact dedupe"
+assert_eq "${out}" '.repos' "${REPOS}" "the static seed still rides along under bows"
+if [ -s "${TMPROOT}/render.err" ]; then bad "no WARN when the library supports the keys ($(cat "${TMPROOT}/render.err"))"; else pass "no WARN when the library supports the keys"; fi
+out="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}" PYTHONPATH="${SRC_TREE}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+assert_eq "${out}" '.bow_owners' "[\"${OWN_ID}\"]" "a single owner needs no separator"
+assert_key_absent "${out}" repos_source "owners alone do not imply the mode (the library decides)"
+if env "${BOWS_VARS[@]}" ALISSA_REVIEW_BOWS_REFRESH_POLLS=five PYTHONPATH="${SRC_TREE}" \
+     bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' >/dev/null 2>&1; then
+  bad "a non-numeric ALISSA_REVIEW_BOWS_REFRESH_POLLS is refused"
+else
+  pass "a non-numeric ALISSA_REVIEW_BOWS_REFRESH_POLLS is refused"
+fi
+out="$(render_bows_with "${SRC_TREE}" '[]' '["ops-bot"]')"
+assert_eq "${out}" '.repos'         '[]'         "the bows render takes an empty seed"
+assert_eq "${out}" '._generated_by' '"docker/claude/revloop-config.sh"' "the bows render is stamped with its provenance"
+assert_eq "${out}" '.operators'     '["ops-bot"]' "operators pass through the bows render"
+assert_eq "${out}" '.on_missing_hub' '"add"'     "on_missing_hub stays structural under bows (self-hub on demand)"
+
+echo "== bows keys: skew guard — an old pin drops them with a WARN naming the re-pin =="
+out="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE=bows ALISSA_REVIEW_BOWS_REFRESH_POLLS=3 ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}" \
+      PYTHONPATH="${STUB_OLD}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/skew.err")"
+assert_key_absent "${out}" repos_source       "repos_source dropped on an old pin"
+assert_key_absent "${out}" bows_refresh_polls "bows_refresh_polls dropped on an old pin"
+assert_key_absent "${out}" bow_owners         "bow_owners dropped on an old pin"
+assert_eq "${out}" '.repos' "${REPOS}" "the static allowlist still renders on an old pin"
+if grep -qF "bows mode landed in revloop 0.29.0 — re-pin ARG REVLOOP_VERSION" "${TMPROOT}/skew.err" \
+   && grep -qF "0.16.14" "${TMPROOT}/skew.err" && grep -qF "ALISSA_REVIEW_REPOS_SOURCE=bows" "${TMPROOT}/skew.err"; then
+  pass "the drop is WARNed by variable, installed version and re-pin"
+else
+  bad "skew WARN missing or unnamed: $(cat "${TMPROOT}/skew.err")"
+fi
+out="$(env "${BOWS_VARS[@]}" PYTHONPATH="${STUB_OLD}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/quiet.err")"
+if [ -s "${TMPROOT}/quiet.err" ]; then bad "an old pin with the keys UNSET warns about nothing"; else pass "an old pin with the keys UNSET warns about nothing"; fi
+# Fail-open: no library at all -> keys pass through, after saying so.
+out="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE=bows PYTHONPATH="${TMPROOT}/nowhere" \
+      bash -c 'unset PYTHONHOME; . "'"${HERE}"'/revloop-config.sh"; revloop_installed_dist_facts() { return 1; }; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/open.err")"
+assert_eq "${out}" '.repos_source' '"bows"' "an unprobeable library FAILS OPEN (key emitted)"
+if grep -qF "emitting every set key UNFILTERED" "${TMPROOT}/open.err"; then pass "...and says so"; else bad "fail-open was silent"; fi
+
+# -----------------------------------------------------------------------------
+# Booting the REAL entrypoint against stubbed CLIs (tests-entrypoint-ui.sh's
+# sandbox), so the bows arm, the static die and the skew fall-through are
+# exercised as the container would run them.
+# -----------------------------------------------------------------------------
+echo "== entrypoint: the bows arm, the static die, the skew fall-through =="
+ENTRYPOINT="${HERE}/entrypoint.sh"
+BIN="${TMPROOT}/bin"; mkdir -p "${BIN}"
+FAKE_HOME="${TMPROOT}/home"; mkdir -p "${FAKE_HOME}/.config/alissa"
+MARKERS="${TMPROOT}/markers"; mkdir -p "${MARKERS}"
+cp "${HERE}/agents.yaml" "${FAKE_HOME}/.config/alissa/agents.yaml"
+cat > "${BIN}/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  "api user -q .login") echo alissa-app ;;
+esac
+exit 0
+STUB
+cat > "${BIN}/alissa" <<STUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "auth login")     ;;
+  "worker start")   : > "${MARKERS}/worker-started" ;;
+  "worker status")  [ -f "${MARKERS}/worker-started" ] && echo "worker is running" || echo "worker not running" ;;
+  "worker stop")    : > "${MARKERS}/worker-stopped" ;;
+  "code workspace") ;;
+esac
+exit 0
+STUB
+cat > "${BIN}/alissa-revloop" <<'STUB'
+#!/usr/bin/env bash
+trap 'exit 0' TERM INT
+sleep 600 &
+wait $!
+STUB
+chmod 0755 "${BIN}/gh" "${BIN}/alissa" "${BIN}/alissa-revloop"
+
+EP_PID=""
+# boot <workspace> <logfile> <pythonpath> [env assignments...]
+boot() {
+  local ws="$1" log="$2" pp="$3"; shift 3
+  mkdir -p "${ws}"
+  env -i \
+    PATH="${BIN}:/usr/local/bin:/usr/bin:/bin" \
+    HOME="${FAKE_HOME}" \
+    TMUX_TMPDIR="${TMPROOT}/tmux" \
+    ALISSA_WORKSPACE_ROOT="${ws}" \
+    GH_TOKEN=stub-gh-token \
+    ALISSA_API_TOKEN=stub-alissa-token \
+    PYTHONPATH="${pp}" \
+    "$@" \
+    bash "${ENTRYPOINT}" > "${log}" 2>&1 &
+  EP_PID=$!
+}
+wait_for_log() {
+  local i
+  for i in $(seq 1 "$3"); do
+    grep -qF -- "$2" "$1" && return 0
+    sleep 1
+  done
+  return 1
+}
+stop_boot() {
+  local pid="$1" i
+  kill -TERM "${pid}" 2>/dev/null || true
+  for i in $(seq 1 15); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+}
+assert_log() { if grep -qF -- "$2" "$1"; then pass "$3"; else bad "$3 (not in log: $2)"; fi; }
+assert_no_log() { if grep -qF -- "$2" "$1"; then bad "$3 (unexpected in log: $2)"; else pass "$3"; fi; }
+
+# --- 1. bows + EMPTY ALISSA_REVIEW_REPOS boots and renders the three keys ----
+WS1="${TMPROOT}/ws-bows"; LOG1="${TMPROOT}/bows.log"
+rm -f "${MARKERS}"/*
+boot "${WS1}" "${LOG1}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows \
+  ALISSA_REVIEW_BOWS_REFRESH_POLLS=3 ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}|${OTHER_ID}"; PID1="${EP_PID}"
+if wait_for_log "${LOG1}" "alissa worker is running" 45; then
+  pass "bows + empty ALISSA_REVIEW_REPOS boots to the worker-up milestone"
+else
+  bad "bows + empty ALISSA_REVIEW_REPOS did not boot (see ${LOG1})"; sed 's/^/      | /' "${LOG1}" | tail -20 >&2
+fi
+assert_log "${LOG1}" "repos_source=bows with no static repos" "the bows arm is taken and named"
+assert_no_log "${LOG1}" "ALISSA_REVIEW_REPOS is empty — nothing to work on" "the static die does NOT fire"
+CFG1="${WS1}/revloop.config.json"
+if [ -f "${CFG1}" ]; then
+  assert_eq "$(cat "${CFG1}")" '.repos' '[]' "generated config has an empty static seed"
+  assert_eq "$(cat "${CFG1}")" '.repos_source' '"bows"' "generated config renders repos_source"
+  assert_eq "$(cat "${CFG1}")" '.bows_refresh_polls' '3' "generated config renders bows_refresh_polls as a number"
+  assert_eq "$(cat "${CFG1}")" '.bow_owners' "[\"${OWN_ID}\",\"${OTHER_ID}\"]" "generated config renders bow_owners as an array"
+  assert_eq "$(cat "${CFG1}")" '.on_missing_hub' '"add"' "on_missing_hub=add rides along (self-hub on the first request)"
+  assert_eq "$(cat "${CFG1}")" '._generated_by' '"docker/claude/revloop-config.sh"' "the bows-path config is stamped"
+else
+  bad "no revloop.config.json generated on the bows path"
+fi
+if [ -f "${WS1}/alissa-workspace.yaml" ] && grep -qF 'repos: []' "${WS1}/alissa-workspace.yaml"; then
+  pass "manifest written with an empty repo list"
+else
+  bad "manifest missing or not empty on the bows path"
+fi
+stop_boot "${PID1}"
+
+# --- 1b. a second boot REFRESHES our own stamped config, RESPECTS a foreign one
+LOG1B="${TMPROOT}/bows-refresh.log"
+rm -f "${MARKERS}"/*
+boot "${WS1}" "${LOG1B}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows \
+  ALISSA_REVIEW_BOWS_REFRESH_POLLS=7 ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}"; PID1B="${EP_PID}"
+wait_for_log "${LOG1B}" "alissa worker is running" 45 || bad "second bows boot did not come up"
+assert_eq "$(cat "${CFG1}")" '.bows_refresh_polls' '7' "our own stamped config is regenerated from the changed env"
+assert_log "${LOG1B}" "respecting the existing ${WS1}/alissa-workspace.yaml" "a manifest already on the volume is left alone"
+stop_boot "${PID1B}"
+printf '{"repos": ["mounted/repo"], "bow_owners": ["%s"]}\n' "${OTHER_ID}" > "${CFG1}"
+LOG1C="${TMPROOT}/bows-mounted.log"
+rm -f "${MARKERS}"/*
+boot "${WS1}" "${LOG1C}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows; PID1C="${EP_PID}"
+wait_for_log "${LOG1C}" "alissa worker is running" 45 || bad "bows boot over a mounted config did not come up"
+assert_log "${LOG1C}" "respecting the existing ${CFG1}" "an unstamped (operator) config is NOT overwritten, and the decision is logged by name"
+assert_eq "$(cat "${CFG1}")" '.repos' '["mounted/repo"]' "the operator's config is byte-for-byte untouched"
+stop_boot "${PID1C}"
+
+# --- 2. static + EMPTY ALISSA_REVIEW_REPOS still dies -------------------------
+WS2="${TMPROOT}/ws-static"; LOG2="${TMPROOT}/static.log"
+rm -f "${MARKERS}"/*
+boot "${WS2}" "${LOG2}" "${SRC_TREE}" ALISSA_REVIEW_REPOS=""; PID2="${EP_PID}"
+set +e; wait "${PID2}"; rc2=$?; set -e
+[ "${rc2}" -ne 0 ] && pass "static + empty ALISSA_REVIEW_REPOS exits non-zero (${rc2})" || bad "static + empty booted (must die)"
+assert_log "${LOG2}" "ALISSA_REVIEW_REPOS is empty — nothing to work on" "...with the static path's own reason"
+assert_log "${LOG2}" "required under repos_source=static" "...which now names the static requirement"
+[ -f "${MARKERS}/worker-started" ] && bad "died AFTER starting the worker" || pass "dies before any worker starts"
+[ -f "${WS2}/revloop.config.json" ] && bad "static + empty wrote a config" || pass "static + empty writes no config"
+
+# --- 3. skew: bows requested on an OLD pin, ALISSA_REVIEW_REPOS set -> static, WARN
+WS3="${TMPROOT}/ws-skew"; LOG3="${TMPROOT}/skew.log"
+rm -f "${MARKERS}"/*
+boot "${WS3}" "${LOG3}" "${STUB_OLD}" ALISSA_REVIEW_REPOS="fahera-mx/example-repo" ALISSA_REVIEW_REPOS_SOURCE=bows \
+  ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}"; PID3="${EP_PID}"
+if wait_for_log "${LOG3}" "alissa worker is running" 45; then
+  pass "an old pin with bows requested still boots (non-fatal)"
+else
+  bad "skew boot did not come up (see ${LOG3})"; sed 's/^/      | /' "${LOG3}" | tail -20 >&2
+fi
+assert_log "${LOG3}" "bows mode landed in revloop 0.29.0 — re-pin ARG REVLOOP_VERSION" "the skew guard WARNs by name (non-silent)"
+assert_log "${LOG3}" "INSTALLED alissa-tools-github-revloop 0.16.14 does NOT support the 'repos_source' config key" "...naming the installed version"
+assert_no_log "${LOG3}" "repos_source=bows with no static repos" "the bows arm is NOT taken"
+CFG3="${WS3}/revloop.config.json"
+assert_eq "$(cat "${CFG3}")" '.repos' '["fahera-mx/example-repo"]' "falls through to the static allowlist"
+assert_key_absent "$(cat "${CFG3}")" repos_source "...and the old library is handed no key it cannot load"
+assert_key_absent "$(cat "${CFG3}")" bow_owners   "...bow_owners included"
+assert_key_absent "$(cat "${CFG3}")" _generated_by "...on the unstamped static render"
+stop_boot "${PID3}"
+
+# --- 3b. skew with NOTHING static: the WARN precedes the static die -----------
+WS4="${TMPROOT}/ws-skew-empty"; LOG4="${TMPROOT}/skew-empty.log"
+rm -f "${MARKERS}"/*
+boot "${WS4}" "${LOG4}" "${STUB_OLD}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows; PID4="${EP_PID}"
+set +e; wait "${PID4}"; rc4=$?; set -e
+[ "${rc4}" -ne 0 ] && pass "an old pin with bows and no static list exits non-zero (${rc4})" || bad "expected the static die on an old pin with no allowlist"
+assert_log "${LOG4}" "re-pin ARG REVLOOP_VERSION" "...after the skew WARN named the fix"
+assert_log "${LOG4}" "ALISSA_REVIEW_REPOS is empty — nothing to work on" "...and the static die names its own reason"
 
 echo
 [ "${fail}" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

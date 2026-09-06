@@ -162,7 +162,9 @@ needs to change for it.
 Set the config values (`ALISSA_REVIEW_REPOS`, `ALISSA_POLL_INTERVAL`, …) as
 **service variables** — Railway passes any variable matching a declared `ARG`
 into the Dockerfile build, which is why these are ARGs and not plain runtime
-ENV. Set the three **secrets** (`GH_TOKEN`, `ALISSA_API_TOKEN`,
+ENV. With `ALISSA_REVIEW_REPOS_SOURCE=bows` you **enroll a repo by creating its
+lane** in Studio instead of editing `ALISSA_REVIEW_REPOS` and redeploying — see
+[Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Set the three **secrets** (`GH_TOKEN`, `ALISSA_API_TOKEN`,
 `ANTHROPIC_API_KEY`) as service variables too; those are read at runtime and
 must NOT be baked in.
 
@@ -353,7 +355,10 @@ automatically; locally pass `--build-arg`):
 
 | ARG / env | default | meaning |
 | --- | --- | --- |
-| `ALISSA_REVIEW_REPOS` | *(required if no manifest mounted)* | allowlist as one `\|`-separated string (see below) |
+| `ALISSA_REVIEW_REPOS` | *(required under `static` if no manifest mounted)* | allowlist as one `\|`-separated string (see below). Under `ALISSA_REVIEW_REPOS_SOURCE=bows` it is the optional static *seed* and may be empty — the allowlist then derives from the operator's feed Bodies of Work |
+| `ALISSA_REVIEW_REPOS_SOURCE` | *(unset ⇒ library default `static`)* | `bows` derives the allowlist from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (unioned with `ALISSA_REVIEW_REPOS`), so **enrolling a repo is creating the lane** — see [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Under `bows` an *empty* allowlist watches **nothing** (unlike `static`, where empty means every PR that requests this reviewer). The daemon library also reads this exact variable directly and it wins over the rendered config and the CLI flags; a blank value falls through. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` — on an older pin the entrypoint WARNs by name and boots the static path |
+| `ALISSA_REVIEW_BOWS_REFRESH_POLLS` | *daemon default* (currently 5) | `bows` only: re-derive the allowlist every N poll passes (≥1), rendered as a JSON number. The enrollment-latency knob. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
+| `ALISSA_REVIEW_BOW_OWNERS` | *(unset ⇒ the token's own actor)* | `bows` only: the Alissa actor **id(s)** whose Bodies of Work may enroll a repo, one `\|`- or `,`-separated string, rendered as a JSON array. Unset, the daemon resolves the authority to its own token's actor at boot (`GET /v1/ping`) and refuses to start if it cannot. Ids only — a username or display name is refused by the daemon at load. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through** |
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
 | `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
@@ -388,8 +393,9 @@ The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
 `ALISSA_REAP_GRACE_SECONDS`, `ALISSA_REAP_SESSION_CAP`,
 `ALISSA_MAX_CONCURRENT_SESSIONS`, `ALISSA_CHECKS_WAIT_SECONDS`,
 `ALISSA_CHECKS_SPAWN_WAIT_SECONDS`, `ALISSA_REVIEW_TASK_MISS_TTL_POLLS`,
-`ALISSA_TASK_LIST_SELF_SCOPE`, `ALISSA_REV_LOOP_EVENTS_ENABLED` and
-`ALISSA_REVIEW_OPERATORS` are
+`ALISSA_TASK_LIST_SELF_SCOPE`, `ALISSA_REV_LOOP_EVENTS_ENABLED`,
+`ALISSA_REVIEW_REPOS_SOURCE`, `ALISSA_REVIEW_BOWS_REFRESH_POLLS`,
+`ALISSA_REVIEW_BOW_OWNERS` and `ALISSA_REVIEW_OPERATORS` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
 entrypoint **omits the key entirely** from the generated `revloop.config.json`
 so the daemon library applies its own current default. There is no hidden
@@ -636,8 +642,53 @@ ALISSA_REVIEW_REPOS=fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app
 ALISSA_REVIEW_REPOS=fahera-mx/studio.alissa.app          # one repo
 ```
 
-A non-empty allowlist is required whenever `on_missing_hub` is `add` — the daemon
-refuses to hub-ify unattended without one.
+A non-empty allowlist is required whenever `on_missing_hub` is `add` **and**
+`repos_source` is `static` — the daemon refuses to hub-ify unattended without
+one. Under `ALISSA_REVIEW_REPOS_SOURCE=bows` the feed-authority gate bounds
+hub-ifying instead, and the string may be empty (see the next section).
+
+### Enrolling by creating the lane (`ALISSA_REVIEW_REPOS_SOURCE=bows`)
+
+On Railway, a self-run fleet onboards a repo by creating its lane in Studio,
+which mints the `autodev: <owner>/<repo>` feed Body of Work. orcloop and devloop
+already derive their allowlists from those feeds; set
+`ALISSA_REVIEW_REPOS_SOURCE=bows` on **this** service too and the reviewer
+derives its allowlist the same way — so a new lane needs **no
+`ALISSA_REVIEW_REPOS` edit and no redeploy** here either. `ALISSA_REVIEW_REPOS`
+becomes an optional static seed (unioned with the derived set, never dropped)
+and may be left empty: the entrypoint no longer dies on an empty allowlist under
+`bows`. With the baked `on_missing_hub=add`, each derived repo is hub-ified on
+its first review request. The bound is the operator's lanes ∩ review-requested —
+an empty feed set watches **nothing**, deliberately unlike `static`.
+
+Three things the entrypoint does on this path, each logged by name:
+
+- **Manifest**: written with an empty repo list when absent (hubs materialize
+  on demand); a manifest already on the volume is respected as-is.
+- **Config**: `revloop.config.json` is generated with `"repos": []` plus the
+  three keys, stamped `_generated_by` so a later boot can tell **its own**
+  output (refreshed from the env every boot) from an **operator-mounted** file
+  (never overwritten — an upgrade must not delete a hand-written `bow_owners`).
+  A file the bows path cannot positively identify as its own is treated as the
+  operator's and left alone; the daemon still takes its mode and authority from
+  the environment, which outranks the file. Delete the file and redeploy to
+  have it regenerated.
+- **Version-skew guard**: the mode is honoured only when the *installed*
+  `alissa-tools-github-revloop` understands `repos_source`. On an older pin the
+  entrypoint WARNs (`bows mode landed in revloop 0.29.0 — re-pin ARG
+  REVLOOP_VERSION`), the renderer drops the three keys so the old library can
+  still load its config, and the boot falls through to the static path: with
+  `ALISSA_REVIEW_REPOS` set it continues on the static allowlist; without it
+  (and without a mounted manifest) it dies with the static path's own named
+  reason. Non-fatal where it can be, never silent.
+
+`ALISSA_REVIEW_BOW_OWNERS` is optional: unset, the daemon trusts feeds owned by
+its **own** token's actor, resolved at boot. Set it (actor ids, `|`/`,`
+separated) when the lanes were created by another actor — for example when the
+review service runs under a dedicated reviewer actor while the operator's
+account created the lanes. The executor role never takes the bows path (it runs
+no daemon and derives nothing); it still needs `ALISSA_REVIEW_REPOS` or a
+mounted manifest.
 
 ## Workspace: bootstrap-from-manifest
 
