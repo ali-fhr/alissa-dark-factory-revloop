@@ -295,6 +295,19 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
     queued            INTEGER NOT NULL DEFAULT 0,
     stages_json       TEXT    NOT NULL
 );
+
+-- The feed-derived half of the allowlist (`repos_source: bows`, issue #119),
+-- as the LAST SUCCESSFUL refresh left it: one row per derived repo, with the
+-- Body of Work it came from. Replaced wholesale on every successful refresh
+-- and never read by the daemon itself -- it is the console's window onto the
+-- effective allowlist (`/api/state` renders it beside `repos`), so it is
+-- telemetry-class: a write that fails costs a warning, not the refresh.
+CREATE TABLE IF NOT EXISTS derived_repos (
+    repo       TEXT    NOT NULL PRIMARY KEY,
+    bow_id     TEXT    NOT NULL DEFAULT '',
+    bow_title  TEXT    NOT NULL DEFAULT '',
+    derived_at INTEGER NOT NULL
+);
 """
 
 # Columns added to a table after it first shipped. CREATE TABLE IF NOT EXISTS is
@@ -837,6 +850,62 @@ class State:
             "ORDER BY reaped_at DESC, rowid DESC",
             None,
         )
+
+    def record_derived_repos(
+        self, rows: "Iterable[tuple[str, str, str]]"
+    ) -> bool:
+        """Replace the derived-repos table with `(repo, bow id, bow title)`
+        rows. Best-effort, like every telemetry write: the console's window
+        onto the derived set is not the allowlist itself, and a refresh that
+        cannot persist it still rebinds the allowlist correctly."""
+        rows = list(rows)
+        return self._write_telemetry(
+            lambda: self._replace_derived_repos(rows),
+            "recording the derived allowlist",
+        )
+
+    def _replace_derived_repos(
+        self, rows: "list[tuple[str, str, str]]"
+    ) -> None:
+        """The whole set at once, in one transaction, so a console read never
+        sees half a refresh."""
+        now = int(time.time())
+        with self._db:
+            self._db.execute("DELETE FROM derived_repos")
+            self._db.executemany(
+                "INSERT OR REPLACE INTO derived_repos "
+                "(repo, bow_id, bow_title, derived_at) VALUES (?,?,?,?)",
+                [(repo, bow_id, title, now) for repo, bow_id, title in rows],
+            )
+
+    def read_derived_repos(self) -> list[dict]:
+        """The derived-repos rows as the last successful refresh left them,
+        in insertion (derived) order."""
+        return self._read_rows(
+            "SELECT repo, bow_id, bow_title, derived_at FROM derived_repos "
+            "ORDER BY rowid",
+            None,
+        )
+
+    def in_flight_repos(self, max_age_seconds: float) -> "frozenset[str]":
+        """Casefolded `owner/repo` of every round the LEDGER still has open.
+
+        Two signals, unioned, for the never-drop-mid-round rule: a spawn
+        younger than `max_age_seconds` whose session the sweep has not reaped
+        (a round enqueued, possibly before the worker created its tmux
+        session -- the window where the roster shows nothing), and a verdict
+        post still owed (neither posted nor abandoned). The live ROSTER is
+        the third signal and is the caller's, because it needs a subprocess.
+        """
+        cutoff = int(time.time() - max_age_seconds)
+        rows = self._db.execute(
+            "SELECT DISTINCT repo FROM spawns WHERE spawned_at > ? "
+            "AND session NOT IN (SELECT session FROM reaps) "
+            "UNION SELECT DISTINCT repo FROM verdict_posts "
+            "WHERE posted_at IS NULL AND abandoned_at IS NULL",
+            (cutoff,),
+        ).fetchall()
+        return frozenset(str(row["repo"]).casefold() for row in rows)
 
     def read_stability_notices(self) -> list[dict]:
         """Stability-notice rows (one per PR, the guard's memory), newest

@@ -735,6 +735,49 @@ skills_lines() {
 
 CONFIG="${WORKSPACE_ROOT}/revloop.config.json"
 
+# The repos_source rail (issue #119), read exactly as the daemon reads it: a
+# NON-BLANK value is authoritative and surrounding whitespace is not a value.
+# Not casefolded — the daemon compares the literal against {static, bows} and
+# refuses anything else by name, so folding here would accept a spelling the
+# daemon then rejects.
+REPOS_SOURCE="$(printf '%s' "${ALISSA_REVIEW_REPOS_SOURCE:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+# May the bows arm below fire? The mode has to be REQUESTED and the INSTALLED
+# daemon has to understand it — two different questions, and answering only
+# the first is a crash loop: on a pin that predates `repos_source` the
+# generated config would land as {"repos": [], "on_missing_hub": "add"}, which
+# that library refuses with "on_missing_hub='add' requires a non-empty repos
+# allowlist" — a guard whose relaxation arrived WITH the key. So the skew guard
+# WARNs by name here and falls through to the static path, which is non-fatal
+# whenever ALISSA_REVIEW_REPOS is set and dies with its own named reason
+# otherwise. Asked once, through the renderer's own probe (idempotent), and
+# only when the mode is requested — a static deployment pays nothing.
+#
+# The DOWNGRADE case is the one the fall-through cannot hand on: a boot on
+# >= 0.29.0 with an empty seed wrote a STAMPED config (repos: [] plus the
+# three keys) and an empty-list manifest, both persisting on the volume; on
+# the old pin with the seed still empty, the mounted-mode arm below would
+# respect both, and the old daemon then refuses the file's keys in a crash
+# loop under a WARN that named a different failure. Re-rendering the file
+# through the probe is no answer either: an EMPTY static allowlist under the
+# old library is "every PR that requests this reviewer" unless the `add`
+# guard happens to catch it (ALISSA_ON_MISSING_HUB=skip and it does not), so
+# a rollback would silently WIDEN the watch. The file is positively ours, so
+# this boot stops here, by name, before any worker starts. With the seed set,
+# branch 1 below re-renders unconditionally and the rollback self-heals.
+BOWS_MODE=0
+if [ "${REPOS_SOURCE}" = "bows" ]; then
+  if revloop_dist_supports repos_source; then
+    BOWS_MODE=1
+  else
+    log "WARN: ALISSA_REVIEW_REPOS_SOURCE=bows, but the INSTALLED alissa-tools-github-revloop $(revloop_dist_version) does NOT support the 'repos_source' config key — NOT taking the bows path. bows mode landed in revloop 0.29.0 — re-pin ARG REVLOOP_VERSION."
+    log "      Falling through to the static path: with ALISSA_REVIEW_REPOS set this boot continues on the static allowlist; without it (and without a mounted alissa-workspace.yaml) it FAILS below with the static path's own reason — or right here, by name, when the config on the volume is this container's own earlier bows-path output (a downgrade)."
+    if [ "${CONTAINER_ROLE}" != "executor" ] && [ -z "$(repos_lines)" ] && config_is_generated "${CONFIG}"; then
+      die "downgrade: ${CONFIG} is this container's OWN bows-path output (it carries the ${CONFIG_PROVENANCE_KEY} stamp, so an earlier boot on revloop >= 0.29.0 wrote it with an empty static seed), and the INSTALLED alissa-tools-github-revloop $(revloop_dist_version) can neither derive an allowlist from it nor load its keys. Handing it an EMPTY static allowlist instead could widen the watch to every PR that requests this reviewer, so this boot stops before any worker starts. Re-pin ARG REVLOOP_VERSION >= 0.29.0, or set ALISSA_REVIEW_REPOS to continue on a static allowlist."
+    fi
+  fi
+fi
+
 if [ -n "$(repos_lines)" ]; then
   # ENV-DRIVEN MODE: ALISSA_REVIEW_REPOS is authoritative, so (re)generate the
   # manifest + config on EVERY boot. The files persist on the /workspace volume,
@@ -748,6 +791,14 @@ if [ -n "$(repos_lines)" ]; then
   # worktree hubs a reviewer does, so the manifest is what makes those hubs
   # exist. It skips only revloop.config.json, which configures a daemon this
   # service never starts.
+  #
+  # This branch is taken under repos_source=bows too whenever the static SEED
+  # is non-empty, and it keeps the static contract bit for bit: the config is
+  # regenerated UNCONDITIONALLY and UNSTAMPED, with no provenance check. The
+  # bows arm's never-overwrite-the-operator's-config rule applies to the
+  # empty-seed path only, so a hand-written bow_owners belongs in
+  # ALISSA_REVIEW_BOW_OWNERS (the environment outranks the file anyway), not
+  # in a mounted file that a set ALISSA_REVIEW_REPOS will rewrite next boot.
   if [ "${CONTAINER_ROLE}" = "executor" ]; then
     log "generating ${MANIFEST} from ALISSA_REVIEW_REPOS (executor role: no revloop.config.json — no daemon here)"
   else
@@ -783,10 +834,60 @@ if [ -n "$(repos_lines)" ]; then
     operators_json="$({ operators_lines || true; } | jq -R . | jq -s -c .)"
     render_revloop_config "${repos_json}" "${operators_json}" > "${CONFIG}"
   fi
+elif [ "${BOWS_MODE}" = "1" ] && [ "${CONTAINER_ROLE}" != "executor" ]; then
+  # BOWS MODE, NO STATIC ALLOWLIST: the ORDINARY configuration, not an error.
+  #
+  # The die below means "nothing to review", which under repos_source=static is
+  # true: the allowlist IS the work list. Under `bows` the allowlist is DERIVED
+  # at each refresh from the operator's `autodev:` Bodies of Work, so an empty
+  # static list is the whole point — enrolling a repo stops being a config
+  # edit. The library relaxed its matching guard (`on_missing_hub='add'`
+  # requires a non-empty allowlist only under `static`), and the container's
+  # baked `add` default is what then self-hubs each derived repo on its first
+  # review request.
+  #
+  # The manifest is written with an EMPTY repo list when absent (the hubs
+  # materialise on demand) and a mounted one is respected as-is. The config is
+  # CREATE-OR-REFRESH-OUR-OWN, never overwrite the operator's: only a file
+  # carrying this container's own `_generated_by` stamp is regenerated
+  # (revloop-config.sh, "the bows path's render"); anything not positively ours
+  # — a mounted config, or one an older/static boot wrote — is left alone and
+  # said so BY NAME, because an irreversible overwrite on a persistent volume
+  # must never be inferable only from the absence of a line. The daemon reads
+  # its mode and authority from the environment regardless, so a respected
+  # stale file costs at most a stale `repos` seed.
+  log "repos_source=bows with no static repos — the allowlist derives from feed Bodies of Work (ALISSA_REVIEW_REPOS empty is the ordinary configuration here)"
+  if [ -f "${MANIFEST}" ]; then
+    log "respecting the existing ${MANIFEST} — NOT regenerating it (a mounted manifest is the operator's)"
+  else
+    log "writing ${MANIFEST} with an empty repo list (hubs materialize on the first review request of each derived repo)"
+    {
+      printf 'name: %s\n' "${WORKSPACE_NAME}"
+      printf 'description: Containerized Alissa review daemon workspace\n'
+      printf 'repos: []\n'
+      printf 'reviewers: []\n'
+      printf 'skills:\n'
+      skills_lines | while IFS= read -r s; do
+        printf '  - %s\n' "${s}"
+      done
+      printf 'attributes: {}\n'
+    } > "${MANIFEST}"
+  fi
+  if [ -f "${CONFIG}" ] && ! config_is_generated "${CONFIG}"; then
+    log "respecting the existing ${CONFIG} — NOT regenerating it (it carries no ${CONFIG_PROVENANCE_KEY} stamp, so this container's bows path did not write it). The daemon still takes repos_source / bow_owners / bows_refresh_polls from the environment, which outranks the file; delete the file and redeploy to have it regenerated."
+  else
+    log "writing ${CONFIG} with \"repos\": [] (the allowlist derives from the feed)"
+    operators_json="$({ operators_lines || true; } | jq -R . | jq -s -c .)"
+    render_revloop_config_bows '[]' "${operators_json}" > "${CONFIG}.tmp"
+    mv "${CONFIG}.tmp" "${CONFIG}"
+  fi
 else
   # MOUNTED MODE: no allowlist in the env — respect a mounted workspace as-is.
+  # (Also where the executor role lands under bows with no static list: it runs
+  # no daemon, so there is no allowlist to derive, and a queue job still needs
+  # a manifest to run inside.)
   [ -f "${MANIFEST}" ] \
-    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to work on (the manifest is what materializes the worktree hubs a reviewer, or a queue job, runs inside)"
+    || die "no alissa-workspace.yaml mounted and ALISSA_REVIEW_REPOS is empty — nothing to work on (the manifest is what materializes the worktree hubs a reviewer, or a queue job, runs inside). ALISSA_REVIEW_REPOS is required under repos_source=static; set ALISSA_REVIEW_REPOS_SOURCE=bows (revloop >= 0.29.0) to derive the allowlist from feed Bodies of Work instead."
   log "using mounted workspace at ${WORKSPACE_ROOT} (ALISSA_REVIEW_REPOS unset)"
 fi
 

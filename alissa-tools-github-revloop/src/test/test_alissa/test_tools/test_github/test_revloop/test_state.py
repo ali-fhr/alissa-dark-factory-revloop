@@ -630,6 +630,28 @@ def test_an_unwritable_cache_never_raises_at_the_caller(tmp_path, caplog):
     assert "readonly database" in caplog.text
 
 
+def test_an_unwritable_derived_set_never_raises_at_the_caller(tmp_path, caplog):
+    """The console's window onto the derived allowlist is telemetry: a volume
+    that cannot take the write costs a WARN, never the refresh that rebinds
+    the allowlist (PR #120 round-1 [minor]: the absorb lives in State)."""
+    caplog.set_level("WARNING")
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        assert st.record_derived_repos([("acme/widgets", "bow-1", "autodev: acme/widgets")])
+        path.chmod(0o444)
+        path.parent.chmod(0o555)
+        try:
+            wrote = st.record_derived_repos([("acme/gadgets", "bow-2", "autodev: acme/gadgets")])
+        finally:
+            path.parent.chmod(0o755)
+            path.chmod(0o644)
+        assert [r["repo"] for r in st.read_derived_repos()] == ["acme/widgets"]
+
+    assert wrote is False
+    assert "recording the derived allowlist failed" in caplog.text
+    assert "readonly database" in caplog.text
+
+
 def test_an_unreadable_cache_reads_as_a_miss(ledger, caplog):
     """The one read in this class that absorbs a database error. A ledger that
     cannot answer must cost a task search, never a review: the caller sees the

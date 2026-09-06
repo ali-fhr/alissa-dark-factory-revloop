@@ -23,8 +23,17 @@
     "**/_generated/**"
   ],
 
-  "_repos": "Allowlist of owner/repo; empty means every repo that requests a review. --repo replaces this list rather than extending it.",
+  "_repos": "Allowlist of owner/repo. Under repos_source 'static' (the default) empty means every repo that requests a review. Under 'bows' this is the static SEED the feed-derived set is unioned with, and an empty derived∪static set watches NOTHING. --repo replaces this list rather than extending it.",
   "repos": [],
+
+  "_repos_source": "Where the allowlist comes from. 'static' = the repos key alone, today's behaviour bit for bit (no Alissa HTTP call exists to fail). 'bows' = repos UNIONED with the repos named by the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (the containers a Studio lane mints), re-derived every bows_refresh_polls passes from GET /v1/bodies-of-work?includeShared=true on alissa_endpoint — so creating the lane enrolls the repo with no redeploy. Only containers OWNED by an actor in bow_owners count (sharing is unilateral, so a feed-shaped title alone is never authoritative); foreign ones are warned in aggregate, never enrolled. Two fail-safe rules: a refresh that cannot list never shrinks the set (a FIRST failure starts on `repos` alone, at ERROR), and a feed that disappears keeps its repo while a round is in flight for it. Anything other than 'static'/'bows' is refused at load. Also settable by the environment (ALISSA_REVIEW_REPOS_SOURCE, which wins over this file AND the CLI flag; a blank value falls through).",
+  "repos_source": "static",
+
+  "_bows_refresh_polls": "bows only: re-derive the allowlist every N poll passes (>= 1; 1 = every pass). The enrollment-latency knob: at the default pair (60s poll, 5) a new feed enrolls its repo within ~5 minutes for one API call per five passes. Environment: ALISSA_REVIEW_BOWS_REFRESH_POLLS.",
+  "bows_refresh_polls": 5,
+
+  "_bow_owners": "bows only, optional OVERRIDE: the Alissa actor id(s) whose Bodies of Work may enroll a repo. Empty resolves at boot to the token's OWN actor (GET /v1/ping -> actorId), and a failed whoami is FATAL — never a fallback to trusting everything, nor to trusting nothing. Ids only (32 lower-case alphanumerics, the `ownerActorId` on a container's row or `actorId` from /v1/ping): a username or display name is refused at load naming the entry, because names are renameable and this list is a trust gate. Compared and de-duplicated EXACTLY (no casefolding). One entry may carry a `|`- or `,`-separated list, which is what one platform variable looks like. Environment: ALISSA_REVIEW_BOW_OWNERS.",
+  "bow_owners": [],
 
   "_authors": "SCOPE FILTER on which PR AUTHORS are worth spending rounds on — a policy knob, NOT the security boundary. Summoning this loop already costs repo write access (someone has to request the reviewer) plus a place on the `repos` allowlist above; `authors` only narrows which of those already-authorised PRs get reviewed — skip dependabot/renovate, or a teammate who does not want agent reviews. Empty (the default) means EVERY author, so an existing deployment with no `authors` key behaves exactly as before. Matching is case-insensitive (GitHub logins are). Note the deliberate asymmetry with `operators` below: that one is a GRANT and empty means nobody. A filtered PR is skipped before any round bookkeeping and gets no comment — silence, like an unwatched repo. It gates STARTING rounds only: narrow the list mid-round and the round already in flight still finishes (its session is not reaped, its verdict still becomes a review of record, and a converged PR still has its dangling review request withdrawn). --author replaces this list rather than extending it, and no entry in it can override the self-review skip.",
   "authors": [],
@@ -44,7 +53,7 @@
 
   "on_missing_review_task": "spawn_anyway",
 
-  "_on_missing_hub": "'skip' (default) or 'add' to run `alissa code workspace add`. 'add' requires a non-empty repos allowlist.",
+  "_on_missing_hub": "'skip' (default) or 'add' to run `alissa code workspace add`. 'add' requires a non-empty repos allowlist under repos_source 'static'; under 'bows' an empty static list is the ordinary configuration (the feed-authority gate bounds the blast radius instead), and 'add' is what self-hubs each derived repo on its first review request.",
   "on_missing_hub": "skip",
 
   "_reap_grace_seconds": "How long a reviewer session must be idle AND quiet (no tmux activity) before the reap sweep kills it, and before a stale round reads it as dead rather than working. Long enough that a just-merged PR's reviewer can finish its in-session close-out, and REJECTED at or above the 90-minute stale-round window (it also gates the stale-round liveness probe, whose respawn branch it would otherwise make unreachable).",
@@ -71,7 +80,7 @@
   "_loop_events_enabled": "STUDIO LOOP TELEMETRY. When true, the daemon pushes one idempotent batch of loop events per poll pass to POST /v1/loop-events on the Alissa API — rounds spawned, verdicts posted (with head/URL/attempts/held time), rounds abandoned, CR9 cap-outs, stability holds, stalls, checks holds, operator re-entry grants and session reaps — derived from the local ledger with deterministic dedupe keys, so re-emission (a failed pass, a daemon restart's backfill) lands as silent server-side duplicates. Best-effort and never fatal: a failed push is one WARN and the pass completes; there is no retry queue because the keys make re-sending the retry. Uses the same ALISSA_API_TOKEN the alissa CLI reads. Also settable by the environment (ALISSA_REV_LOOP_EVENTS_ENABLED, which wins over this file AND the CLI flags). Off by default: telemetry is an outbound write, and an upgrade must not start posting on its own.",
   "loop_events_enabled": false,
 
-  "_alissa_endpoint": "The Alissa API base the loop-events client posts to. Leave it at the default unless the deployment points telemetry at a staging API.",
+  "_alissa_endpoint": "The Alissa API base the loop-events client posts to, and (under repos_source 'bows') the feed listing is read from. Leave it at the default unless the deployment points at a staging API.",
   "alissa_endpoint": "https://api.alissa.app",
 
   "dry_run": false

@@ -106,10 +106,16 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
-Two keys have a third layer above both, the environment: `task_list_bow_id`
-(`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why) and
-`loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*).
-The environment wins over the file **and** the flags for both.
+Five keys have a third layer above both, the environment: `task_list_bow_id`
+(`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why),
+`loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*),
+and the three `repos_source: bows` keys — `repos_source`
+(`ALISSA_REVIEW_REPOS_SOURCE`), `bows_refresh_polls`
+(`ALISSA_REVIEW_BOWS_REFRESH_POLLS`) and `bow_owners`
+(`ALISSA_REVIEW_BOW_OWNERS`; see *Deriving the allowlist from feed Bodies of
+Work*). The environment wins over the file **and** the flags for all five, but a
+**blank** value falls through — an unset platform variable reference renders as
+`""`, and that must not fail boot on a mode of `''`.
 
 | key / flag | default | meaning |
 | --- | --- | --- |
@@ -119,7 +125,10 @@ The environment wins over the file **and** the flags for both.
 | `round_cap` | `10` | CR9 cap; never queues round cap+1 |
 | `stability_rounds` | `3` | **product-stability guard** (CR9 converged-by-stability): once the shipped-product diff between the head judged this many `request_changes` rounds ago and the current head is *empty*, the next round is queued carrying a **PRODUCT-STABILITY NOTICE**; if that grace round comes back `request_changes` with the product still unmoved, no further round is queued, the operator is paged once per head, and the same `alissa-review: re-enter +N` ack lifts it. A push that moves a shipped file clears the hold by itself. `0` disables the guard entirely — no comparison call, no notice, no hold |
 | `stability_nonshipped_globs` | `tests/**`, `test/**`, `**/*.test.*`, `**/*.spec.*`, `**/*.md`, `docs/**`, `**/__snapshots__/**`, `**/_generated/**` | what the guard above does **not** count as product movement. `**` crosses directory separators (so `**/*.test.*` matches `src/a/b/x.test.ts`, and `**/*.md` matches a top-level `README.md`); every other segment is an ordinary `fnmatch` pattern that cannot. Anything unmatched is **shipped** — a shipped file that changed *at all* is movement, comment-only hunks included |
-| `repos` | `[]` | allowlist of `owner/repo`; empty = all |
+| `repos` | `[]` | allowlist of `owner/repo`; under `static`, empty = **all**. Under `bows` this is the static *seed* the derived set is unioned with, and empty derived∪static = **nothing** — see *Deriving the allowlist from feed Bodies of Work* |
+| `repos_source` | `static` | where the allowlist comes from: `static` (the `repos` key alone — today's behaviour, bit for bit; no Alissa HTTP call exists to fail) or `bows` (that list **unioned** with the repos named by the operator's active `autodev: <owner>/<repo>` Bodies of Work). Anything else is refused by name at load. `ALISSA_REVIEW_REPOS_SOURCE` wins over `--repos-source`, which wins over this key — but a **blank** env var falls through |
+| `bows_refresh_polls` | `5` | `bows` only: re-derive every N poll passes; must be ≥1 (`1` = every pass). The **enrollment-latency** knob: at the default pair (60 s poll, 5) a new feed enrolls its repo within ~5 minutes, for one API call per five passes; `--bows-refresh-polls` / `ALISSA_REVIEW_BOWS_REFRESH_POLLS` |
+| `bow_owners` | `[]` | `bows` only, and an **optional override**: the actor id(s) whose Bodies of Work may enroll a repo. Empty resolves at boot to the token's **own** actor (`GET /v1/ping` → `actorId`), and a failed whoami is **fatal** — never a fallback to trusting everything, nor to trusting nothing. Ids only — a username or display name is refused at load naming the entry; entries may be `\|`- or `,`-separated, and are compared and de-duplicated **exactly** (no casefolding, which could only widen a trust gate); `--bow-owner` (repeatable; replaces the list) / `ALISSA_REVIEW_BOW_OWNERS` |
 | `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
@@ -137,7 +146,7 @@ The environment wins over the file **and** the flags for both.
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
 | `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
 | `loop_events_enabled` | `false` | push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` **once per poll pass** — one idempotent, ledger-derived batch, best-effort and never fatal. Settable by the environment (`ALISSA_REV_LOOP_EVENTS_ENABLED`, which wins over the file and `--loop-events`/`--no-loop-events`) — see *Loop telemetry (Studio ingest)* |
-| `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events client posts to; the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
+| `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events client posts to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
 
@@ -168,6 +177,84 @@ identity's, say, or everything except Dependabot and renovate.
   own login narrows the loop to a PR GitHub then forbids it to review.
 - `--author` is repeatable and *replaces* the config list, exactly like
   `--repo`.
+
+### Deriving the allowlist from feed Bodies of Work (`repos_source: bows`)
+
+A Dark Factory customer runs orcloop / devloop / revloop themselves and
+onboards a repo by creating a lane in Studio, which mints the
+`autodev: <owner>/<repo>` feed Body of Work. orcloop (`repos_source=bows`,
+≥ 0.13.0) and devloop (≥ 0.8.9) already derive their allowlists from those
+feeds. Set `repos_source` to `bows` and this daemon does too, so **creating the
+lane enrolls the repo** — no `ALISSA_REVIEW_REPOS` edit, no redeploy of the
+review service.
+
+`static` (the default) is unchanged bit for bit: nothing below happens, and no
+Alissa HTTP call exists to fail.
+
+**What is derived.** Every `bows_refresh_polls` passes the daemon lists the
+Bodies of Work its Alissa token can see (`GET /v1/bodies-of-work?includeShared=true`
+on `alissa_endpoint`) and keeps the ones that are `active`, whose title is
+`autodev: <owner>/<repo>` (prefix matching is case-insensitive; the repo half
+must look like `owner/repo`, and a malformed one is **skipped with a WARNING
+naming it**, never fatal), and whose owner passes the authority gate below. The
+results are de-duplicated case-insensitively and **unioned** with `repos` — a
+static entry is always watched and is never dropped by a refresh, in either
+mode. The startup line names the mode and the authority (`bow feed authority:
+self (<actorId>)`, or the configured ids); each refresh logs the derived set,
+and `-v` names the source container behind each repo. The reviewer console's
+`/api/state` config block renders `repos_source` and the derived set beside
+`repos`, read from the daemon's own state — no new calls. The title grammar,
+the status gate and the repo-shape check are the same as devloop's, so the two
+daemons agree about which containers are feeds.
+
+**The feed-authority gate is the security boundary.** The listing is read with
+`includeShared=true`, which is load-bearing (a feed container is the operator's,
+with the daemon merely a collaborator — without the flag the mode is silently
+inert) and which is also what makes the gate necessary: **sharing is
+unilateral**. Any actor in the tenant can add this daemon as a collaborator on
+a Body of Work of their own, with no acceptance step on this side. So a
+feed-shaped *title* is not a claim to be a feed — only an allowlisted
+**owner's** container is. A prefix-matching Body of Work owned by anyone else
+is visible but **not authoritative**: one aggregate WARNING per refresh with
+the count (`-v` names them), and it never enrolls a repo. The allowlist bounds
+where reviewer sessions spawn — and, with `on_missing_hub: add`, where code is
+cloned and opened as an agent's cwd — so a third party must not be able to
+widen it. The doctrine mirrors orcloop's and devloop's `bow_owners` verbatim.
+
+**Two fail-safe rules**, because the allowlist bounds where sessions spawn:
+
+- *Never shrink on failure.* A refresh that could not list keeps the last
+  successfully derived set and WARNs — the allowlist never shrinks because the
+  API blinked. A failure on the **first** refresh has no set to keep, so the
+  daemon starts on `repos` alone (empty `repos` ⇒ watch nothing) and says so at
+  ERROR.
+- *Never drop mid-round.* A feed that completes, is cancelled or disappears
+  drops its repo on the next successful refresh — **unless** a round is in
+  flight for a PR in that repo: a live reviewer session of this daemon's own
+  grammar for it (`review-<repo>-pr<n>-r<k>-<nonce>`, or a skill-shaped
+  `review-pr-<n>` the spawn ledger attributes), a spawn younger than the
+  stale-round window whose session the sweep has not reaped, or an owed native
+  verdict the ledger has not posted or abandoned — then it stays watched until
+  that round finishes. A session list that cannot be read drops nothing that
+  refresh. Dropping a repo out from under a running round would strand it: the
+  sweep, the spawn gate and the verdict poster all read the allowlist.
+
+**Empty means nothing under `bows` — deliberately unlike `static`.** Under
+`static`, empty `repos` means *every* PR that requests this reviewer, anywhere
+the token reaches. Under `bows` an empty derived∪static set watches **nothing**
+and logs one WARN per refresh (`bows mode derived 0 repos`): for a self-run
+fleet the correct bound is *the lanes* ∩ *review-requested*, and an empty feed
+set must not widen to "every PR that requests me". Matching is
+case-insensitive under `bows` (a feed title is operator-typed text; GitHub's
+`repository_url` is canonical) and exact under `static`, as it always was.
+
+**Interplay with `on_missing_hub`.** The load-time guard *`on_missing_hub='add'`
+requires a non-empty `repos` allowlist* applies **under `static` only**: under
+`bows` an empty static list is the ordinary configuration, and the
+feed-authority gate bounds the blast radius instead. The container's baked
+`add` default is then what self-hubs each derived repo on its first review
+request (`alissa code workspace add`), so a lane created in Studio is reviewed
+on its first request with no operator action on the review service.
 
 ### Config file discovery
 
@@ -372,7 +459,10 @@ deliberately gated, because hub-ifying clones code onto the machine and opens it
 as an agent's working directory — and the trigger is an *inbound* request from
 someone else:
 
-- it requires a non-empty `repos` allowlist (config load fails otherwise);
+- it requires a non-empty `repos` allowlist (config load fails otherwise) —
+  under `repos_source: bows` only, where the feed-authority gate bounds it
+  instead, an empty static list is allowed (see *Deriving the allowlist from
+  feed Bodies of Work*);
 - it refuses to run outside a real workspace (no `alissa-workspace.yaml`);
 - if the CLI reports success but the hub still isn't there, it reports that
   rather than spawning an agent into a missing directory.

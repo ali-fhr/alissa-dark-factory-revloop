@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import re
 import sys
 from pathlib import Path
 
+from .alissa_client import AlissaClient, AlissaError
 from .config import (
+    BOW_OWNERS_ENV,
+    BOWS_REFRESH_POLLS_ENV,
     HUB_ADD,
     HUB_SKIP,
     LOOP_EVENTS_ENV,
     ON_MISSING_CREATE,
     ON_MISSING_SKIP,
     ON_MISSING_SPAWN,
+    REPOS_BOWS,
+    REPOS_SOURCE_ENV,
+    REPOS_STATIC,
     TASK_LIST_BOW_ENV,
     Config,
     load_config_file,
@@ -81,6 +88,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="OWNER/REPO",
         help="only watch this repo; repeatable. Replaces the config list entirely.",
+    )
+    over.add_argument(
+        "--repos-source",
+        dest="repos_source",
+        choices=[REPOS_STATIC, REPOS_BOWS],
+        help="where the allowlist comes from: 'static' (the repos list alone, "
+        "the default) or 'bows' (that list unioned with the repos named by the "
+        "operator's active `autodev: <owner>/<repo>` bodies of work, "
+        "re-derived every --bows-refresh-polls passes). Under bows an EMPTY "
+        f"allowlist watches nothing. Overridden by ${REPOS_SOURCE_ENV}",
+    )
+    over.add_argument(
+        "--bows-refresh-polls",
+        dest="bows_refresh_polls",
+        type=int,
+        metavar="N",
+        help="bows mode: re-derive the allowlist every N poll passes (>= 1). "
+        f"Overridden by ${BOWS_REFRESH_POLLS_ENV}",
+    )
+    over.add_argument(
+        "--bow-owner",
+        dest="bow_owners",
+        action="append",
+        metavar="ACTOR_ID",
+        help="bows mode: an Alissa actor id whose bodies of work may enroll a "
+        "repo; repeatable, and one value may carry a `|`/`,`-separated list. "
+        "Replaces the config list entirely. Unset = this token's own actor, "
+        f"resolved at boot via GET /v1/ping. Overridden by ${BOW_OWNERS_ENV}",
     )
     over.add_argument(
         "--author",
@@ -248,6 +283,9 @@ def overrides_from(args: argparse.Namespace) -> dict:
     through. `repos` becomes a tuple so it matches the config-file form."""
     return {
         "repos": tuple(args.repos) if args.repos else None,
+        "repos_source": args.repos_source,
+        "bows_refresh_polls": args.bows_refresh_polls,
+        "bow_owners": tuple(args.bow_owners) if args.bow_owners else None,
         "authors": tuple(args.authors) if args.authors else None,
         "operators": tuple(args.operators) if args.operators else None,
         "poll_interval": args.poll_interval,
@@ -284,6 +322,54 @@ def resolve_config(args: argparse.Namespace) -> Config:
     return Config.build(workspace_root, file_data, overrides_from(args))
 
 
+def resolve_feed_authority(
+    config: Config, client: "AlissaClient | None" = None
+) -> Config:
+    """Decide WHOSE bodies of work may enroll a repo, and say so out loud.
+
+    Two answers, one of them free:
+
+    * `bow_owners` **set** — the operator named the authority explicitly. That
+      is the multi-actor case: the feed containers belong to an actor this
+      token is not. Nothing is resolved, nothing is called.
+    * `bow_owners` **unset** — the authority is **self**. The token already
+      carries an identity, so `GET /v1/ping` answers the question the operator
+      would otherwise have hand-copied out of the API.
+
+    The whoami call is **fatal on failure**, deliberately. Carrying on with an
+    empty authority is technically safe (nothing would be trusted, so nothing
+    would enroll) but it is safe *silently*: the operator would see a daemon
+    that runs and watches only the static list, which is exactly what a
+    correctly configured daemon with no feeds yet looks like. Dying names the
+    reason while someone is watching. The property being protected is not
+    "self is trusted" but "only a KNOWN actor is trusted" — an unanswered
+    whoami leaves that unknown, and no default can fill it in. Never falling
+    back to trusting everything is the other half of the same rule.
+
+    Under `static` this is a no-op: that mode never reads a Body of Work, so
+    it never needs an identity, and a daemon that only watches its static
+    list must not fail to boot because an endpoint it does not use was
+    unreachable.
+    """
+    if config.repos_source != REPOS_BOWS:
+        return config
+
+    if config.bow_owners:
+        log.info("bow feed authority: explicit (%s)", ", ".join(config.bow_owners))
+        return config
+
+    identity = (client or AlissaClient(base=config.alissa_endpoint)).ping()
+    log.info("bow feed authority: self (%s)", identity.actor_id)
+    if identity.display_name:
+        # Logged as context, never compared: a display name is renameable,
+        # which is why `bow_owners` refuses to hold one.
+        log.debug("resolved from this token's identity: %r", identity.display_name)
+    # The id came from the API, so it is the authority on its own shape and is
+    # NOT put back through the config's actor-id check -- that check exists to
+    # catch an operator typing a username, not to second-guess the server.
+    return dataclasses.replace(config, bow_owners=(identity.actor_id,))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -306,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = resolve_config(args)
         log.info("workspace: %s", config.workspace_root)
+        log.info("repos_source: %s", config.repos_source)
+        config = resolve_feed_authority(config)
 
         watcher = ReviewWatcher(config)
         for warning in watcher.preflight():
@@ -348,6 +436,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except (FileNotFoundError, ValueError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except AlissaError as exc:
+        # Only reachable from resolve_feed_authority: an unanswered whoami
+        # leaves the feed authority unknown, and starting with it unknown is
+        # the one failure this mode must not have (the poll loop's own
+        # feed reads never raise -- see bows.BowRepoSource.refresh).
+        print(
+            f"alissa error: {exc} — repos_source='bows' could not resolve the "
+            f"feed authority (GET /v1/ping). Check ALISSA_API_TOKEN and "
+            f"alissa_endpoint, or set bow_owners explicitly",
+            file=sys.stderr,
+        )
         return 2
     except CommandError as exc:
         print(f"error: {exc}", file=sys.stderr)
