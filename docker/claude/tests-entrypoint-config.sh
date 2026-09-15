@@ -57,7 +57,7 @@ out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
         -u ALISSA_MAX_CONCURRENT_SESSIONS \
         -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
         -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \
-        -u ALISSA_REV_LOOP_EVENTS_ENABLED \
+        -u ALISSA_REV_LOOP_EVENTS_ENABLED -u ALISSA_REV_FLEET_VITALS_ENABLED \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
@@ -77,6 +77,8 @@ assert_key_absent "${out}" task_list_self_scope \
   "task_list_self_scope omitted when ALISSA_TASK_LIST_SELF_SCOPE unset"
 assert_key_absent "${out}" loop_events_enabled \
   "loop_events_enabled omitted when ALISSA_REV_LOOP_EVENTS_ENABLED unset"
+assert_key_absent "${out}" fleet_vitals_enabled \
+  "fleet_vitals_enabled omitted when ALISSA_REV_FLEET_VITALS_ENABLED unset"
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
 assert_eq "${out}" '.agent_profile'  '"claude"' "agent_profile always emitted (structural: claude)"
 assert_eq "${out}" '.repos'          "${REPOS}" "repos emitted from allowlist"
@@ -183,6 +185,24 @@ else
   pass "a non-boolean ALISSA_REV_LOOP_EVENTS_ENABLED is refused, not silently false"
 fi
 
+# Fleet vitals (issue #126): the third boolean pass-through. Its garbage case
+# is pinned HERE, against whatever library the probe finds (including an old
+# pin that does not know the key): the spelling is refused BEFORE the skew
+# gate, so a typo can never be swallowed as "unsupported, dropped". The
+# set -> rendered cases run below, once SRC_TREE (a library that knows the
+# key) is defined, because the skew gate rightly drops the key on an old pin.
+if ALISSA_REV_FLEET_VITALS_ENABLED=enable render_revloop_config "${REPOS}" >/dev/null 2>"${TMPDIR:-/tmp}/fv-garbage.err"; then
+  bad "a non-boolean ALISSA_REV_FLEET_VITALS_ENABLED is refused, not silently false"
+else
+  pass "a non-boolean ALISSA_REV_FLEET_VITALS_ENABLED is refused, not silently false"
+fi
+if grep -qF "ALISSA_REV_FLEET_VITALS_ENABLED must be a boolean" "${TMPDIR:-/tmp}/fv-garbage.err"; then
+  pass "...and the refusal names the variable"
+else
+  bad "the fleet-vitals refusal did not name the variable: $(cat "${TMPDIR:-/tmp}/fv-garbage.err")"
+fi
+rm -f "${TMPDIR:-/tmp}/fv-garbage.err"
+
 echo "== override: structural keys still overridable =="
 out="$(ALISSA_ON_MISSING_HUB=skip ALISSA_AGENT_PROFILE=custom render_revloop_config "${REPOS}")"
 assert_eq "${out}" '.on_missing_hub' '"skip"'   "on_missing_hub override wins"
@@ -193,7 +213,8 @@ if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
   # ALISSA_STABILITY_ROUNDS, ALISSA_CHECKS_WAIT_SECONDS,
   # ALISSA_CHECKS_SPAWN_WAIT_SECONDS,
   # ALISSA_MAX_CONCURRENT_SESSIONS, ALISSA_REVIEW_TASK_MISS_TTL_POLLS,
-  # ALISSA_TASK_LIST_SELF_SCOPE and ALISSA_REV_LOOP_EVENTS_ENABLED are unset here
+  # ALISSA_TASK_LIST_SELF_SCOPE, ALISSA_REV_LOOP_EVENTS_ENABLED and
+  # ALISSA_REV_FLEET_VITALS_ENABLED are unset here
   # too: the library this cross-check imports is the Dockerfile-PINNED release,
   # which predates those keys and would reject them as unknown. Rendering either
   # into the config would then fail the cross-check for a version skew rather
@@ -203,7 +224,7 @@ if python3 -c 'import alissa.tools.github.revloop.config' 2>/dev/null; then
           -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
           -u ALISSA_MAX_CONCURRENT_SESSIONS \
           -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \
-          -u ALISSA_REV_LOOP_EVENTS_ENABLED \
+          -u ALISSA_REV_LOOP_EVENTS_ENABLED -u ALISSA_REV_FLEET_VITALS_ENABLED \
           bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
   # Pass the rendered JSON via an env var (not a pipe) so the heredoc can own
   # stdin as the python program.
@@ -307,6 +328,62 @@ assert_eq "${out}" '.repos'         '[]'         "the bows render takes an empty
 assert_eq "${out}" '._generated_by' '"docker/claude/revloop-config.sh"' "the bows render is stamped with its provenance"
 assert_eq "${out}" '.operators'     '["ops-bot"]' "operators pass through the bows render"
 assert_eq "${out}" '.on_missing_hub' '"add"'     "on_missing_hub stays structural under bows (self-hub on demand)"
+
+echo "== fleet vitals (issue #126): set -> rendered on a library that knows the key =="
+for truthy in 1 true TRUE yes on; do
+  out="$(env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED="${truthy}" PYTHONPATH="${SRC_TREE}" \
+        bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/fv.err")"
+  assert_eq "${out}" '.fleet_vitals_enabled' 'true' \
+    "fleet_vitals_enabled=${truthy} renders JSON true"
+done
+for falsy in 0 false FALSE no off; do
+  out="$(env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED="${falsy}" PYTHONPATH="${SRC_TREE}" \
+        bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/fv.err")"
+  assert_eq "${out}" '.fleet_vitals_enabled' 'false' \
+    "fleet_vitals_enabled=${falsy} renders JSON false"
+done
+if [ -s "${TMPROOT}/fv.err" ]; then bad "no WARN when the library supports fleet_vitals_enabled ($(cat "${TMPROOT}/fv.err"))"; else pass "no WARN when the library supports fleet_vitals_enabled"; fi
+out="$(env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED="" PYTHONPATH="${SRC_TREE}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+assert_key_absent "${out}" fleet_vitals_enabled "a blank ALISSA_REV_FLEET_VITALS_ENABLED renders as unset (Dockerfile bakes empty ENV)"
+if env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED=enable PYTHONPATH="${SRC_TREE}" \
+     bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' >/dev/null 2>&1; then
+  bad "a non-boolean ALISSA_REV_FLEET_VITALS_ENABLED is refused on a library that knows the key"
+else
+  pass "a non-boolean ALISSA_REV_FLEET_VITALS_ENABLED is refused on a library that knows the key"
+fi
+# The Dockerfile must carry the ARG (and its pass-through ENV line) -- and this
+# PR must NOT re-pin REVLOOP_VERSION: CI installs the pinned release from PyPI,
+# which cannot yet carry 0.30.0 (a sibling task re-pins once it is published).
+if grep -qE '^ARG ALISSA_REV_FLEET_VITALS_ENABLED=""$' "${HERE}/Dockerfile" \
+   && grep -qE '^\s*ALISSA_REV_FLEET_VITALS_ENABLED=\$\{ALISSA_REV_FLEET_VITALS_ENABLED\}' "${HERE}/Dockerfile"; then
+  pass "Dockerfile carries ARG ALISSA_REV_FLEET_VITALS_ENABLED and passes it through ENV"
+else
+  bad "Dockerfile is missing the ALISSA_REV_FLEET_VITALS_ENABLED ARG / ENV pass-through"
+fi
+pin="$(grep -E '^ARG REVLOOP_VERSION=' "${HERE}/Dockerfile" | head -n 1)"
+if [ -n "${pin}" ] && ! printf '%s' "${pin}" | grep -qF '0.30.0'; then
+  pass "ARG REVLOOP_VERSION is untouched by the fleet-vitals change (${pin}; the re-pin is a sibling task's)"
+else
+  bad "ARG REVLOOP_VERSION was re-pinned to the unpublished release: ${pin}"
+fi
+
+echo "== fleet vitals: skew guard — an old pin drops the key with a WARN naming the re-pin =="
+out="$(env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED=1 \
+      PYTHONPATH="${STUB_OLD}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/fv-skew.err")"
+assert_key_absent "${out}" fleet_vitals_enabled "fleet_vitals_enabled dropped on an old pin"
+if grep -qF "fleet vitals landed in revloop 0.30.0 — re-pin ARG REVLOOP_VERSION" "${TMPROOT}/fv-skew.err" \
+   && grep -qF "ALISSA_REV_FLEET_VITALS_ENABLED=1" "${TMPROOT}/fv-skew.err"; then
+  pass "the drop is WARNed by variable and re-pin"
+else
+  bad "fleet-vitals skew WARN missing or unnamed: $(cat "${TMPROOT}/fv-skew.err")"
+fi
+if env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED=enable PYTHONPATH="${STUB_OLD}" \
+     bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' >/dev/null 2>&1; then
+  bad "garbage ALISSA_REV_FLEET_VITALS_ENABLED is refused even on an old pin (never swallowed by the skew gate)"
+else
+  pass "garbage ALISSA_REV_FLEET_VITALS_ENABLED is refused even on an old pin (never swallowed by the skew gate)"
+fi
 
 echo "== bows keys: skew guard — an old pin drops them with a WARN naming the re-pin =="
 out="$(env "${BOWS_VARS[@]}" ALISSA_REVIEW_REPOS_SOURCE=bows ALISSA_REVIEW_BOWS_REFRESH_POLLS=3 ALISSA_REVIEW_BOW_OWNERS="${OWN_ID}" \

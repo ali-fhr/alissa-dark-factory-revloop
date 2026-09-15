@@ -289,6 +289,20 @@ ARG ALISSA_TASK_LIST_SELF_SCOPE=""
 # and it REQUIRES REVLOOP_VERSION >= 0.28.0 for the same reason the keys above
 # do: an older library rejects the unknown config key at load.
 ARG ALISSA_REV_LOOP_EVENTS_ENABLED=""
+# Push one FLEET-VITALS snapshot (heartbeat, poll durations, the reviewer
+# session roster with rounds, GitHub rate, cgroup memory, spawn-gate queue
+# depth, the operator inbox) to Studio's POST /v1/loop/fleet-vitals at the end
+# of every completed pass (issue #126) -- so a Factory with no console URL for
+# this seat still renders its revloop card. Same boolean spellings and refusal
+# as ALISSA_REV_LOOP_EVENTS_ENABLED, same ALISSA_API_TOKEN, same best-effort
+# posture (one WARNING per failed pass, never fatal, nothing sent in dry-run).
+# Off unless set: it is an outbound write and an image upgrade must not start
+# posting on its own. The daemon library ALSO reads this exact variable
+# directly (it outranks the rendered config), so the render is belt to that
+# brace. Pass-through, and it REQUIRES REVLOOP_VERSION >= 0.30.0: an older
+# library rejects the unknown config key at load (the renderer's skew probe
+# drops it by name on an older pin rather than failing the boot).
+ARG ALISSA_REV_FLEET_VITALS_ENABLED=""
 # Where the review allowlist comes from (issue #119). `static` (unset) is the
 # ALISSA_REVIEW_REPOS list alone, today's behaviour bit for bit. `bows` derives
 # it from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work
@@ -348,6 +362,7 @@ ENV ALISSA_REVIEW_REPOS=${ALISSA_REVIEW_REPOS} \
     ALISSA_REVIEW_TASK_MISS_TTL_POLLS=${ALISSA_REVIEW_TASK_MISS_TTL_POLLS} \
     ALISSA_TASK_LIST_SELF_SCOPE=${ALISSA_TASK_LIST_SELF_SCOPE} \
     ALISSA_REV_LOOP_EVENTS_ENABLED=${ALISSA_REV_LOOP_EVENTS_ENABLED} \
+    ALISSA_REV_FLEET_VITALS_ENABLED=${ALISSA_REV_FLEET_VITALS_ENABLED} \
     ALISSA_REVIEW_REPOS_SOURCE=${ALISSA_REVIEW_REPOS_SOURCE} \
     ALISSA_REVIEW_BOWS_REFRESH_POLLS=${ALISSA_REVIEW_BOWS_REFRESH_POLLS} \
     ALISSA_REVIEW_BOW_OWNERS=${ALISSA_REVIEW_BOW_OWNERS} \

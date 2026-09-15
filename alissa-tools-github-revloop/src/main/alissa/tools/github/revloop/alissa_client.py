@@ -1,5 +1,6 @@
-"""Alissa REST access — loop telemetry's one write (issue #112) and the two
-reads `repos_source: bows` needs (issue #119).
+"""Alissa REST access — loop telemetry's write (issue #112), the fleet-vitals
+write beside it (issue #126) and the two reads `repos_source: bows` needs
+(issue #119).
 
 This is the SECOND Alissa adapter in the package, and the split is deliberate.
 `alissa.py` shells out to the `alissa` CLI, which is the daemon's established
@@ -61,6 +62,12 @@ ENV_TOKEN = "ALISSA_API_TOKEN"
 # EMITTER splits batches at this bound; the client refuses an oversized one
 # rather than silently posting a request the API will 400.
 MAX_EVENTS_PER_POST = 200
+
+# The `error` code a 403 carries when the token's user has not activated the
+# stacked app that owns the loop ingest. Advisory (classification keys on the
+# status), but the vitals pusher reads it to warn ONCE with the activate URL
+# instead of once per pass.
+NOT_ACTIVATED = "not_activated"
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -244,6 +251,22 @@ class AlissaClient:
                 f"per call, got {len(events)} — the emitter must split"
             )
         payload = self._request("/v1/loop-events", {"events": events})
+        return payload if isinstance(payload, dict) else {}
+
+    def post_fleet_vitals(self, snapshot: dict) -> dict:
+        """Replace this seat's fleet-vitals snapshot (`POST
+        /v1/loop/fleet-vitals`, issue #126).
+
+        One body, one seat, replaced on every call — there is no batching
+        and no dedupe key, because the API keeps only the LATEST snapshot per
+        user×seat (loop events are the history). Returns the API's
+        `{"seat", "receivedAt", "replaced"}` payload (empty dict when the
+        body was empty), for the caller's debug line. The API is strict —
+        unknown keys 400, lists cap at 50, the body at 64 KB — and the
+        BUILDER (`fleet_vitals`) owns fitting the snapshot to that, so this
+        method sends exactly what it is handed.
+        """
+        payload = self._request("/v1/loop/fleet-vitals", snapshot)
         return payload if isinstance(payload, dict) else {}
 
     def ping(self) -> Identity:

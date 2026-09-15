@@ -106,16 +106,19 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
-Five keys have a third layer above both, the environment: `task_list_bow_id`
+Six keys have a third layer above both, the environment: `task_list_bow_id`
 (`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why),
 `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*),
+`fleet_vitals_enabled` (`ALISSA_REV_FLEET_VITALS_ENABLED`; see *Fleet vitals*),
 and the three `repos_source: bows` keys — `repos_source`
 (`ALISSA_REVIEW_REPOS_SOURCE`), `bows_refresh_polls`
 (`ALISSA_REVIEW_BOWS_REFRESH_POLLS`) and `bow_owners`
 (`ALISSA_REVIEW_BOW_OWNERS`; see *Deriving the allowlist from feed Bodies of
-Work*). The environment wins over the file **and** the flags for all five, but a
+Work*). The environment wins over the file **and** the flags for all six, but a
 **blank** value falls through — an unset platform variable reference renders as
-`""`, and that must not fail boot on a mode of `''`.
+`""`, and that must not fail boot on a mode of `''`. The two boolean rails
+share one reader: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, anything
+else refused by name.
 
 | key / flag | default | meaning |
 | --- | --- | --- |
@@ -146,7 +149,8 @@ Work*). The environment wins over the file **and** the flags for all five, but a
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
 | `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
 | `loop_events_enabled` | `false` | push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` **once per poll pass** — one idempotent, ledger-derived batch, best-effort and never fatal. Settable by the environment (`ALISSA_REV_LOOP_EVENTS_ENABLED`, which wins over the file and `--loop-events`/`--no-loop-events`) — see *Loop telemetry (Studio ingest)* |
-| `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events client posts to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
+| `fleet_vitals_enabled` | `false` | push **one fleet-vitals snapshot** of this daemon's live state — heartbeat, poll durations, the reviewer-session roster with each session's PR and round, the reviewer identity's cached GitHub rate, the container's memory split, the spawn-gate queue depth and the live operator inbox — to Studio's `POST /v1/loop/fleet-vitals` at the end of **every completed poll pass**, after the loop-events push. Studio keeps only the latest snapshot per seat, so a Factory with no console URL for this seat renders its revloop card from it. Best-effort and never fatal; nothing is sent in `--dry-run`. Settable by the environment (`ALISSA_REV_FLEET_VITALS_ENABLED`, which wins over the file and `--fleet-vitals`/`--no-fleet-vitals`) — see *Fleet vitals (Studio ingest)* |
+| `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
 
@@ -969,6 +973,53 @@ daemon restart resets the watermark, so the first enabled pass re-sends the
 whole ledger — that is the **backfill**, batched and deduped, not a bug. No
 events are pushed in `--dry-run` (an outbound POST is an act), and none are
 derived from vitals.
+
+### Fleet vitals (Studio ingest)
+
+The Factory's `/fleet` screen **pulls** each daemon console's `/api/state`
+over private networking with passcodes held on the hosted Factory — which is
+per-deployment by construction, so a self-run revloop with no
+`FACTORY_REVLOOP_URL` on the Factory side renders `not_configured`. With
+`fleet_vitals_enabled` on, the daemon **pushes** instead: at the end of every
+completed poll pass, **after** the loop-events push, it POSTs one snapshot of
+its live state to the Alissa API's `POST /v1/loop/fleet-vitals`
+(`seat: "revloop"`, `schemaVersion: 1`). Studio keeps only the **latest**
+snapshot per user×seat, and the Factory renders it whenever it has no console
+URL for the seat — so the revloop card shows live sessions with their rounds
+and the operator inbox with `ALISSA_UI_ENABLED` unset and no inbound network
+path at all. Same client, same `ALISSA_API_TOKEN`, same `alissa_endpoint` as
+loop events; no new secret.
+
+The snapshot is built **in-process from the same builders the reviewer
+console uses** (`webui/sources.py` and `webui/sysinfo.py`), so the card and
+the console can never disagree, and the console sidecar need not be running:
+
+| snapshot field | source |
+| --- | --- |
+| `heartbeatAt` / `asOf` | the completion time of the pass that produced it / the build time |
+| `pollIntervalS` | `poll_interval` |
+| `version` / `drift` | the running version, and the newer PyPI version when the console's drift read says *behind* (else `null`) |
+| `pollDurationsMs` | the last 60 pass durations from `poll_snapshots`, oldest first |
+| `sessions` / `sessionList` | the `alissa tmux ls` roster: `{live, managed}` counts and up to 50 rows `{name, edge: "review", repo, number, round, attempt: null, ageS, cpu, rssBytes, live, managed, url}`. The PR and round come from the spawn ledger, or from the session **name** (`review-<repo>-pr<n>-r<k>-…`) when no ledger row pairs it. **Both are `null` when the roster cannot be listed** — never `{0, 0}` for "could not list" |
+| `rate` | the console's **cached** `gh api rate_limit` read (60 s), run under the reviewer identity's credential — never an extra call per pass |
+| `memory` | the cgroup v2 split — `residentBytes`, `reclaimableBytes`, `limitBytes` (`memory.max`) — or `null` off a host without cgroup v2 |
+| `queueDepth` | owed rounds waiting on the spawn gate (`max_concurrent_sessions`) at the end of the pass |
+| `inbox` | the console's **live** inbox (cap-outs, stalled episodes, stability holds), newest first, ≤ 50: `{kind, subject, repo, number, isPr: true, ageS, url, lever}` |
+| `kpis` | `null` (orcloop-only) |
+
+The API is **strict** (unknown keys are refused, lists cap at 50, the body at
+64 KB), so the builder emits only the contract's keys and trims `sessionList`
+and `inbox` until the body fits before sending.
+
+**Best-effort, never fatal, no retry queue.** A failed push is **one WARNING**
+per pass naming the status and error, and the pass completes — the API keeps
+only the latest snapshot, so the next pass's push *is* the retry. A
+`403 not_activated` (the token's user has not activated the loop app) warns
+**once per boot** with the activate URL and logs at DEBUG after; the pass
+after activation lands on its own. In `--dry-run` the snapshot is still built
+and described (`[dry-run] would push fleet vitals (…)`) but nothing is sent.
+Every pass ends with a one-line `poll summary: … vitals: pushed|skipped|failed`
+(`skipped` = disabled or dry-run). Unset, no request is ever made.
 
 ## Reviewer console (`alissa-revloop-ui`)
 
