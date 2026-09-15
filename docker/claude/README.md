@@ -58,7 +58,7 @@ This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned by
 both an exact tag and a digest:
 
 ```dockerfile
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0@sha256:f46fd1431462392993da6dd209e23c15c3dc8495540469eaa06b40ca5bafda1c
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1@sha256:4c838a0df55391cfa1feab75568f6c493fe2fe9e9de17495d70988ca8252682a
 ```
 
 The base is **public on GHCR**, so the pull is anonymous — no registry
@@ -102,6 +102,13 @@ builds on top. What it costs is **size**: the base's compressed amd64 layers go
 from ~270 MB to ~430 MB (≈840 MB → ≈1.31 GB unpacked), and this image inherits
 all of it. Expect a slower cold pull; nothing else about the runtime changes.
 
+The bump to `0.2.1` is a **patch re-snapshot** of the agent CLIs the base
+deliberately leaves unpinned, and nothing else: claude-code goes from `2.1.241`
+to `2.1.263` (the reason for the bump — `claude-fable-5-1` needs ≥ `2.1.251`,
+and the older CLI wedged every session on it with a 400), `codex` from `0.149.1`
+to `0.153.4`, `pi` stays at `0.73.1`. The leaf contract, the image config and
+the size (~428 MB compressed amd64 layers) are unchanged.
+
 #### How the pin is written
 
 Never `:latest`, and never a bare tag either. The reference carries **two values
@@ -109,8 +116,8 @@ that do different jobs**, and a bump changes both together:
 
 | half | job |
 | --- | --- |
-| `:0.2.0` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
-| `@sha256:f46fd143…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.0` is substituted into every build with no diff to review. |
+| `:0.2.1` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
+| `@sha256:4c838a0d…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.1` is substituted into every build with no diff to review. |
 
 The digest matters more here than for an ordinary base image. This one line is now
 the *entire* review surface for claude-code, a `curl … | bash` CLI install and
@@ -118,19 +125,19 @@ the whole apt layer — none of which this repo builds, or sees, any more. A sil
 substitution should be a build failure, not a successful build of something else.
 
 The pinned digest is the **index** digest (what the registry returns as
-`Docker-Content-Digest` for the tag `0.2.0`), not the digest of the amd64 child
-manifest it currently selects (`sha256:ba2f9b7b…`). Pinning the index keeps
+`Docker-Content-Digest` for the tag `0.2.1`), not the digest of the amd64 child
+manifest it currently selects (`sha256:dd2ec8f4…`). Pinning the index keeps
 platform selection a build-time choice, so when the base gains arm64 this stays an
 ordinary two-value bump instead of a reference that can only ever resolve to
 amd64. Read the current values back with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1
 ```
 
 #### Platform: amd64 only
 
-**The base publishes `linux/amd64` and nothing else.** Its `0.2.0` index contains
+**The base publishes `linux/amd64` and nothing else.** Its `0.2.1` index contains
 exactly one platform manifest plus an attestation manifest — no `arm64`, no
 `arm/v7`. The `python:3.12-slim-bookworm` this image used to build from shipped
 five architectures, so this is a real narrowing and it is worth knowing before you
