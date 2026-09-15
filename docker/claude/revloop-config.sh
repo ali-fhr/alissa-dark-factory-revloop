@@ -36,6 +36,11 @@
 #     spellings and same refusal; the library also reads
 #     ALISSA_REV_LOOP_EVENTS_ENABLED directly and the env wins, so the render
 #     is belt to that brace),
+#     fleet_vitals_enabled (whether the daemon pushes one fleet-vitals
+#     snapshot to Studio per completed pass, issue #126 -- the third boolean
+#     pass-through, same spellings, same refusal, same env-wins rule through
+#     ALISSA_REV_FLEET_VITALS_ENABLED; skew-gated like the bows keys below,
+#     because it landed in 0.30.0 and an older pin rejects the unknown key),
 #     operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
@@ -46,11 +51,12 @@
 #     a string, an int and a JSON array of `|`/`,`-split ids respectively,
 #     exactly as devloop's generator emits them. The library ALSO reads the
 #     three ALISSA_REVIEW_* variables directly and the env wins, so as with
-#     loop_events_enabled the render is belt to that brace. These three are
-#     the only keys here gated on a VERSION-SKEW probe (see revloop_dist_supports
-#     below): an image whose entrypoint knows them while its pinned library does
-#     not is the ordinary state between a release and its re-pin, and an
-#     unknown key fails the daemon's config load outright).
+#     loop_events_enabled the render is belt to that brace. These three --
+#     and fleet_vitals_enabled above -- are the only keys here gated on a
+#     VERSION-SKEW probe (see revloop_dist_supports below): an image whose
+#     entrypoint knows them while its pinned library does not is the ordinary
+#     state between a release and its re-pin, and an unknown key fails the
+#     daemon's config load outright).
 #
 #   * STRUCTURAL (container constants) — always emitted with an explicit value
 #     the container requires, INDEPENDENT of the library default. Pass-through is
@@ -175,17 +181,18 @@ bow_owners_lines() {
     | awk '!seen[$0]++' || true
 }
 
-# _skew_value <config_key> <env_var> <value> — <value> if the installed dist
-# supports <config_key>, else "" after a WARNING naming both. Used for the three
-# bows keys only (see the header).
+# _skew_value <config_key> <env_var> <value> [<landed>] — <value> if the
+# installed dist supports <config_key>, else "" after a WARNING naming both
+# (and the release the key landed in, default the bows release). Used for the
+# three bows keys and fleet_vitals_enabled (see the header).
 _skew_value() {
-  local key="$1" var="$2" value="$3"
+  local key="$1" var="$2" value="$3" landed="${4:-bows mode landed in revloop 0.29.0}"
   [ -n "${value}" ] || { printf ''; return 0; }
   if revloop_dist_supports "${key}"; then
     printf '%s' "${value}"
   else
-    printf '[revloop-config] WARN: %s=%s is set, but the INSTALLED alissa-tools-github-revloop %s does NOT support the `%s` config key — dropping it from revloop.config.json so the daemon can still load. bows mode landed in revloop 0.29.0 — re-pin ARG REVLOOP_VERSION.\n' \
-      "${var}" "${value}" "$(revloop_dist_version)" "${key}" >&2
+    printf '[revloop-config] WARN: %s=%s is set, but the INSTALLED alissa-tools-github-revloop %s does NOT support the `%s` config key — dropping it from revloop.config.json so the daemon can still load. %s — re-pin ARG REVLOOP_VERSION.\n' \
+      "${var}" "${value}" "$(revloop_dist_version)" "${key}" "${landed}" >&2
     printf ''
   fi
 }
@@ -206,6 +213,19 @@ render_revloop_config() {
   owners_json="$(bow_owners_lines | jq -R . | jq -s -c .)"
   [ "${owners_json}" != "[]" ] || owners_json=""
   owners_json="$(_skew_value bow_owners ALISSA_REVIEW_BOW_OWNERS "${owners_json}")"
+  # The fleet-vitals toggle (issue #126). The SPELLING is refused by name
+  # HERE, before the skew gate, so a typo is refused on every pin -- the gate
+  # would otherwise swallow it as "unsupported, dropped" on an old library and
+  # the operator's mistake would boot as the default. jq re-checks below, the
+  # same belt the other two booleans wear.
+  local fvitals
+  case "$(printf '%s' "${ALISSA_REV_FLEET_VITALS_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" in
+    ""|1|true|yes|on|0|false|no|off) ;;
+    *) printf '[revloop-config] ERROR: ALISSA_REV_FLEET_VITALS_ENABLED must be a boolean (1/0, true/false, yes/no, on/off), got %s\n' \
+         "${ALISSA_REV_FLEET_VITALS_ENABLED}" >&2
+       return 1 ;;
+  esac
+  fvitals="$(_skew_value fleet_vitals_enabled ALISSA_REV_FLEET_VITALS_ENABLED "${ALISSA_REV_FLEET_VITALS_ENABLED:-}" "fleet vitals landed in revloop 0.30.0")"
   # --arg (string) + tonumber for the numeric pass-through keys: an unset/empty
   # env var yields "" and the key is dropped, so the library default wins.
   jq -n \
@@ -227,6 +247,7 @@ render_revloop_config() {
     --arg     missttl "${ALISSA_REVIEW_TASK_MISS_TTL_POLLS:-}" \
     --arg     selfsc  "${ALISSA_TASK_LIST_SELF_SCOPE:-}" \
     --arg     levents "${ALISSA_REV_LOOP_EVENTS_ENABLED:-}" \
+    --arg     fvitals "${fvitals}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
@@ -248,6 +269,11 @@ render_revloop_config() {
          if . == "1" or . == "true" or . == "yes" or . == "on" then true
          elif . == "0" or . == "false" or . == "no" or . == "off" then false
          else error("ALISSA_REV_LOOP_EVENTS_ENABLED must be a boolean (1/0, true/false, yes/no, on/off)")
+         end) } end)
+     + (if $fvitals == "" then {} else { fleet_vitals_enabled: ($fvitals | ascii_downcase |
+         if . == "1" or . == "true" or . == "yes" or . == "on" then true
+         elif . == "0" or . == "false" or . == "no" or . == "off" then false
+         else error("ALISSA_REV_FLEET_VITALS_ENABLED must be a boolean (1/0, true/false, yes/no, on/off)")
          end) } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)
