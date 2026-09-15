@@ -1,10 +1,10 @@
 # Changelog
 
 Releases of `alissa-tools-github-revloop`. The version of record is the
-plain-text `version` file next to `version.py`; entries here start at 0.29.1
+plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
-## 0.29.1
+## 0.30.1
 
 - **Round admission: one round per re-request** (issue #128). A round on a
   head that already carries a verdict of record is queued only on a
