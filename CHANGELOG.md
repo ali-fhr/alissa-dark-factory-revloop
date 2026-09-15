@@ -17,5 +17,7 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
   as before. New ledger table `verdicts` (PR, head, posted_at) stamped from
   the daemon's native posts and from every reviewer-identity review observed
   on the current head; one INFO line per ignored request; the timeline is
-  read at most once per candidate PR per poll. New config key
+  read at most once per candidate PR per poll, and a timeline that cannot be
+  read — or runs past the 2,000-event bound — admits on the snapshot alone
+  with a warning rather than wedging the PR. New config key
   `verdict_cooldown_s` / flag `--verdict-cooldown-s`.

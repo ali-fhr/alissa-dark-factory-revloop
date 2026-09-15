@@ -548,9 +548,16 @@ POST), and stamps every reviewer-identity review it observes on the current
 head (a session's own `gh pr review` never passes through the daemon). The
 timeline is read **once per candidate PR per poll**, memoised for the pass,
 and only for a PR that already carries a verdict on its head past the
-cooldown. A timeline that cannot be read admits on the snapshot alone, with a
-warning — a wedged loop on every read error is the worse trade, and the
-cooldown still covers the incident's window.
+cooldown. A timeline that cannot be read — an error, or more than 2,000
+events, past which the endpoint's oldest-first paging leaves precisely the
+newest requests unread — admits on the snapshot alone, with a warning: a
+wedged loop on every read error is the worse trade, and the cooldown still
+covers the incident's window. Two clocks are kept apart: the cooldown is a
+duration on the daemon host's wall clock, while (b) compares the timeline's
+`created_at` with GitHub's own `submitted_at`, so a host running ahead of
+GitHub cannot make its own native post look newer than a genuine re-request
+that followed it (the ledger's local stamp stands in only while GitHub's
+reviews list has not yet shown the verdict at all).
 
 A refused round is `skipped` in the poll snapshot and holds no place in the
 spawn queue. Each ignored request is announced **once at INFO** —

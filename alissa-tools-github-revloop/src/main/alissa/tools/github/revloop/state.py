@@ -762,6 +762,21 @@ class State:
         )
         self._db.commit()
 
+    def note_observed_verdict(
+        self, repo: str, number: int, head_sha: str, posted_at: int,
+        review_url: str = "",
+    ) -> bool:
+        """TELEMETRY write-back of a verdict the loop saw on GitHub, so the
+        ledger converges on GitHub's truth (issue #128). Absorbed like every
+        other telemetry write: GitHub already holds the record, so a row the
+        ledger cannot take costs nothing. `record_verdict` itself stays the
+        hard write the daemon's own native post makes -- that row IS the
+        record until GitHub's reviews list catches up. True on success."""
+        return self._write_telemetry(
+            lambda: self.record_verdict(repo, number, head_sha, posted_at, review_url),
+            f"recording the verdict on {repo}#{number} at {head_sha[:8]}",
+        )
+
     def last_verdict_at(self, repo: str, number: int, head_sha: str) -> int | None:
         """When the newest verdict of record on this head landed (epoch
         seconds), or None when the ledger knows of none on it."""
@@ -773,7 +788,11 @@ class State:
         return int(row["at"]) if row and row["at"] is not None else None
 
     def read_verdicts(self, limit: int | None = None) -> list[dict]:
-        """Verdict-of-record rows, newest first."""
+        """Verdict-of-record rows, newest first. For inspection; nothing in
+        the loop reads it. Mind that a `read_only=True` opener skips SCHEMA,
+        so against a ledger whose daemon has not yet restarted onto a version
+        with the `verdicts` table this raises `no such table`, not `[]` --
+        whoever wires it into the console first should guard for that."""
         return self._read_rows(
             "SELECT repo, number, head_sha, posted_at, review_url FROM verdicts "
             "ORDER BY posted_at DESC, number DESC",

@@ -57,6 +57,7 @@ from alissa.tools.github.revloop.ghclient import (
     CHECKS_UNKNOWN,
     COMMENT_PAGE_LIMIT,
     PER_PAGE,
+    TIMELINE_PAGE_LIMIT,
     CheckContext,
     CheckRollup,
     GitHub,
@@ -66,6 +67,7 @@ from alissa.tools.github.revloop.ghclient import (
     RateLimited,
     Review,
     ReviewerTokenUnset,
+    TimelineTruncated,
     TruncatedListing,
     countable_rounds,
     rollup_of,
@@ -9587,6 +9589,128 @@ def test_a_rate_limited_timeline_read_propagates(config, monkeypatch):
 
     with pytest.raises(RateLimited):
         w.evaluate(OWNER, REPO, NUMBER)
+
+
+def test_a_truncated_timeline_admits_on_the_snapshot_and_warns(config, monkeypatch, caplog):
+    """Round-1 [major]: a timeline longer than the bound is the SAME state as
+    an unreadable one -- the newest request cannot be seen -- and takes the
+    same branch. Answering with the newest request within the bound instead
+    would refuse every same-head round on a long-timelined PR forever."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    gh.timeline_error = TimelineTruncated("acme/widgets#7 has more than 2000 timeline events")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+    assert any(
+        "more than 2000 timeline events" in r.message and "admitting the round" in r.message
+        for r in caplog.records
+    )
+
+
+def timeline_api(pages):
+    """A fake `_api` serving `pages` (lists of timeline events) for the issue
+    timeline endpoint, counting the pages it was asked for."""
+    asked = []
+
+    def api(*args, **kwargs):
+        path = [a for a in args if a.startswith("repos/")][0]
+        assert path.endswith("/timeline")
+        page = int([a for a in args if a.startswith("page=")][0].split("=")[1])
+        asked.append(page)
+        return pages[page - 1] if page <= len(pages) else []
+
+    api.asked = asked
+    return api
+
+
+def _requested(login, at):
+    return {"event": "review_requested", "requested_reviewer": {"login": login}, "created_at": at}
+
+
+def _full_timeline_pages(count):
+    return [
+        [_requested("alissa-app", f"2026-01-{p + 1:02d}T00:{i:02d}:00Z") for i in range(PER_PAGE)]
+        for p in range(count)
+    ]
+
+
+def test_exactly_the_timeline_bound_is_a_complete_read():
+    """Round-1 [nit]: twenty full pages used to be reported as "more than
+    2000 events". One probe past the bound settles it: an empty probe means
+    the read was complete, and the newest request on the last page is the
+    answer."""
+    gh = GitHub("alissa-app")
+    gh._api = timeline_api(_full_timeline_pages(TIMELINE_PAGE_LIMIT))
+
+    newest = gh.review_requested_at(OWNER, REPO, NUMBER, "alissa-app")
+
+    assert newest == f"2026-01-{TIMELINE_PAGE_LIMIT:02d}T00:{PER_PAGE - 1:02d}:00Z"
+    assert gh._api.asked == list(range(1, TIMELINE_PAGE_LIMIT + 2)), "one probe, no more"
+
+
+def test_a_timeline_past_the_bound_raises_instead_of_answering_stale():
+    """The endpoint pages oldest-first, so past the bound it is the NEWEST
+    events that go unread -- exactly what the gate asks about. A stale
+    answer would be mistaken for the newest; an exception cannot be."""
+    gh = GitHub("alissa-app")
+    gh._api = timeline_api(_full_timeline_pages(TIMELINE_PAGE_LIMIT + 1))
+
+    with pytest.raises(TimelineTruncated) as excinfo:
+        gh.review_requested_at(OWNER, REPO, NUMBER, "alissa-app")
+
+    assert f"more than {TIMELINE_PAGE_LIMIT * PER_PAGE} timeline events" in str(excinfo.value)
+    assert gh._api.asked == list(range(1, TIMELINE_PAGE_LIMIT + 2)), "bounded: the probe is the last read"
+
+
+def test_a_short_timeline_never_probes_past_its_last_page():
+    """The probe is paid only by a timeline that filled every page: a short
+    page ends the walk as before."""
+    gh = GitHub("alissa-app")
+    gh._api = timeline_api([[_requested("alissa-app", "2026-01-01T00:00:00Z"),
+                             _requested("someone-else", "2026-01-02T00:00:00Z")]])
+
+    assert gh.review_requested_at(OWNER, REPO, NUMBER, "alissa-app") == "2026-01-01T00:00:00Z"
+    assert gh._api.asked == [1]
+
+
+def test_a_host_running_ahead_of_github_cannot_outdate_a_genuine_re_request(config, monkeypatch):
+    """Round-1 [minor], two clocks: the ledger stamps the daemon's own post
+    with THIS host's clock, the timeline's `created_at` is GitHub's. With the
+    host 200 s ahead, the ledger's stamp sits 200 s "after" GitHub's record of
+    the same verdict -- and a genuine re-request 100 s after the verdict must
+    still read as newer. The comparison is GitHub-vs-GitHub; the local stamp
+    serves the cooldown alone."""
+    now, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=600, request_age=500)
+    w.state.record_verdict(SLUG, NUMBER, "0d9d66b7", int(now["t"]) - 400, "native-post")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+
+def test_the_ledger_stamp_decides_while_github_has_not_shown_the_verdict(config, monkeypatch):
+    """The window the ledger exists for: the daemon's native post is in the
+    ledger and not yet in GitHub's reviews list. With no GitHub stamp to
+    compare against, the ledger's is the verdict's clock for (b) too, and the
+    request that opened the finished round is still older than it."""
+    now = _clock(monkeypatch, start=1_800_000_000.0)
+    w, gh, al = watcher(config, make_pr(sha="0d9d66b7", requested=("alissa-app",)), [])
+    w.state.record_verdict(SLUG, NUMBER, "0d9d66b7", int(now["t"]) - 300, "native-post")
+    gh.request_events = [("alissa-app", _iso(now["t"] - 400))]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert "older than the last verdict" in d.reason
+    assert al.enqueued == []
+
+    gh.request_events = [("alissa-app", _iso(now["t"] - 200))]
+    w.poll_once()  # a fresh pass re-reads the timeline: the newer request admits
+    assert len(al.enqueued) == 1
 
 
 def test_the_verdict_cooldown_default_is_pinned():

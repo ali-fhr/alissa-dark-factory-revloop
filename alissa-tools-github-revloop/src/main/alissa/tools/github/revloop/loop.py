@@ -56,6 +56,7 @@ from .ghclient import (
     PullRequest,
     RateLimited,
     Review,
+    TimelineTruncated,
     TruncatedListing,
     countable_rounds,
     verdict_marker,
@@ -210,6 +211,18 @@ DEFERRAL_CLEARED = (
     "spawn gate: clear after %d pass(es) over %.0f min — every owed round "
     "spawned"
 )
+
+
+@dataclass(frozen=True)
+class VerdictOfRecord:
+    """The newest verdict on a PR's current head, as the round-admission gate
+    needs it (issue #128): `at` is the newer of GitHub's `submitted_at` and
+    the ledger's local stamp -- the cooldown's clock -- and `github_at` is
+    GitHub's stamp alone (None while GitHub's reviews list has not yet shown
+    the verdict), the only one comparable with a timeline `created_at`."""
+
+    at: float
+    github_at: float | None
 
 
 @dataclass(frozen=True)
@@ -2386,10 +2399,20 @@ class ReviewWatcher:
         the other pre-start refusals. Each ignored request is announced once at
         INFO -- "stale request" must be tellable from "idle" in the log -- and
         repeated at debug while the same request keeps being seen.
+
+        Two clocks, kept apart (PR #129 round 1): the cooldown is a duration
+        on THIS host's wall clock, measured from the newer of GitHub's stamp
+        and the ledger's local one; the comparison in (b) is GitHub's
+        `created_at` against GitHub's `submitted_at`, both GitHub's clock, so
+        a host running ahead of GitHub cannot make its own native post look
+        newer than a genuine re-request that followed it. The ledger's local
+        stamp enters (b) only while GitHub's reviews list has not yet shown
+        the verdict at all -- the window the ledger exists for.
         """
-        verdict_at = self._last_verdict_at(pr, my_reviews)
-        if verdict_at is None:
+        verdict = self._last_verdict_at(pr, my_reviews)
+        if verdict is None:
             return None
+        verdict_at = verdict.at
 
         key = (pr.full_name, pr.number)
         since = time.time() - verdict_at
@@ -2414,11 +2437,13 @@ class ReviewWatcher:
 
         requested = self._fresh_request_at(pr)
         if requested is None:
-            # The timeline could not be read (logged there). The snapshot is
-            # all that is left, and past the cooldown it is the pre-#128
+            # The newest request could not be seen -- the timeline was
+            # unreadable or longer than the bound (logged there). The snapshot
+            # is all that is left, and past the cooldown it is the pre-#128
             # trigger: a wedged loop on every read failure is the worse trade.
             return None
         request_at = _epoch(requested)
+        verdict_at = verdict.github_at if verdict.github_at is not None else verdict.at
         if request_at is not None and request_at > verdict_at:
             return None
 
@@ -2447,33 +2472,34 @@ class ReviewWatcher:
 
     def _last_verdict_at(
         self, pr: PullRequest, my_reviews: list[Review]
-    ) -> float | None:
-        """When the newest verdict of record on the CURRENT head landed (epoch
-        seconds), or None when no reviewer-identity review judges this head.
+    ) -> VerdictOfRecord | None:
+        """The newest verdict of record on the CURRENT head, or None when no
+        reviewer-identity review judges this head.
 
-        Two sources, the newer wins. GitHub's reviews list is the authority
-        for a verdict the reviewer SESSION posted (it never passes through the
-        daemon), and the newest review is the one that matters: judging an
-        older commit, it is not a verdict on this head at all. The ledger
-        covers the daemon's own native posts during the window before GitHub's
-        list shows them. A GitHub-observed verdict is written back to the
-        ledger as telemetry, so the ledger converges on GitHub's truth and a
-        row lost either way costs nothing.
+        Two sources, the newer wins for the cooldown. GitHub's reviews list is
+        the authority for a verdict the reviewer SESSION posted (it never
+        passes through the daemon), and the newest review is the one that
+        matters: judging an older commit, it is not a verdict on this head at
+        all. The ledger covers the daemon's own native posts during the window
+        before GitHub's list shows them. A GitHub-observed verdict is written
+        back to the ledger as telemetry, so the ledger converges on GitHub's
+        truth and a row lost either way costs nothing. GitHub's own stamp is
+        carried out separately because it is the only one in the timeline's
+        clock domain -- see `_admit_round`.
         """
         newest = my_reviews[-1] if my_reviews else None
         seen: float | None = None
         if newest is not None and newest.commit_id and newest.commit_id == pr.head_sha:
             seen = _epoch(newest.submitted_at)
             if seen is not None:
-                self.state._write_telemetry(
-                    lambda: self.state.record_verdict(
-                        pr.full_name, pr.number, pr.head_sha, int(seen or 0), newest.url
-                    ),
-                    f"recording the verdict on {pr.slug} at {pr.head_sha[:8]}",
+                self.state.note_observed_verdict(
+                    pr.full_name, pr.number, pr.head_sha, int(seen), newest.url
                 )
         ledger = self.state.last_verdict_at(pr.full_name, pr.number, pr.head_sha)
         candidates = [at for at in (seen, ledger) if at is not None]
-        return max(candidates) if candidates else None
+        if not candidates:
+            return None
+        return VerdictOfRecord(at=max(candidates), github_at=seen)
 
     def _fresh_request_at(self, pr: PullRequest) -> str | None:
         """When this login was most recently asked to review the PR, from the
@@ -2490,6 +2516,18 @@ class ReviewWatcher:
             )
         except RateLimited:
             raise
+        except TimelineTruncated as exc:
+            # Same epistemic state as an unreadable timeline -- the newest
+            # request cannot be seen -- so the same answer: fail OPEN. The
+            # alternative, comparing against the newest request WITHIN the
+            # bound, refuses every same-head round on a long-timelined PR
+            # forever with nothing but a warning (PR #129 round 1, major).
+            log.warning(
+                "%s: %s — admitting the round on the review-request snapshot "
+                "alone, which is what the post-verdict cooldown guards",
+                pr.slug, exc,
+            )
+            requested = None
         except Exception as exc:
             log.warning(
                 "%s: could not read the issue timeline for review requests to "

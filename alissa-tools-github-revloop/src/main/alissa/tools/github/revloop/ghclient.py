@@ -46,9 +46,14 @@ COMMENT_PAGE_LIMIT = 20
 # `review_requested` event and the bound keeps a long-lived PR from turning one
 # poll into an unbounded walk. The endpoint pages oldest-first with no
 # direction parameter, so past the bound it is the NEWEST events that go
-# unread: the gate then sees an older request than the true newest and refuses
-# a same-head round it might have admitted. Fail-closed on a PR with more than
-# 2,000 timeline events, and the warning below names it; a push still re-arms.
+# unread, and the newest is exactly what the gate is asking about. So a walk
+# that hits the bound does NOT answer with the newest request it happened to
+# see (an old one, which would refuse every same-head round on that PR
+# forever): it raises TimelineTruncated, and the gate treats "could not see
+# the newest request" the same way whether it arrives as silence or as an
+# exception -- see loop._fresh_request_at. Whether the bound was actually
+# exceeded is settled by ONE probe past it, so exactly 2,000 events is a
+# complete read and not a false alarm (PR #129 round 1).
 TIMELINE_PAGE_LIMIT = 20
 
 # The compare endpoint's HARD cap on the `files` array, and it is a cap, not a
@@ -442,6 +447,13 @@ def countable_rounds(reviews: list["Review"]) -> int:
 
 class RateLimited(RuntimeError):
     pass
+
+
+class TimelineTruncated(RuntimeError):
+    """The issue timeline has more events than TIMELINE_PAGE_LIMIT pages hold,
+    so the newest `review_requested` may lie past what was read. Raised
+    INSTEAD of a stale answer: a caller that compares request timestamps must
+    not mistake "the newest within the bound" for "the newest"."""
 
 
 class IdentityMismatch(RuntimeError):
@@ -1210,23 +1222,26 @@ class GitHub:
         can read through, whereas the timeline event is immutable history --
         the request's timestamp can be compared with the verdict's (issue
         #128). Pages oldest-first like issue_comments, bounded by
-        TIMELINE_PAGE_LIMIT.
+        TIMELINE_PAGE_LIMIT -- and past the bound it raises TimelineTruncated
+        rather than answering with an older request than the true newest
+        (the reasoning is at the constant). The bound is checked with one
+        probe past the last page, so a timeline of exactly
+        TIMELINE_PAGE_LIMIT * PER_PAGE events reads as complete.
         """
         wanted = login.casefold()
         newest: str | None = None
-        for page in range(1, TIMELINE_PAGE_LIMIT + 1):
-            data = (
-                self._api(
-                    "-X",
-                    "GET",
-                    f"repos/{owner}/{repo}/issues/{number}/timeline",
-                    "-f",
-                    f"per_page={PER_PAGE}",
-                    "-f",
-                    f"page={page}",
-                )
-                or []
-            )
+        for page in range(1, TIMELINE_PAGE_LIMIT + 2):
+            data = self._timeline_page(owner, repo, number, page)
+            if page > TIMELINE_PAGE_LIMIT:
+                # The probe: anything here means the bound was exceeded.
+                if data:
+                    raise TimelineTruncated(
+                        f"{owner}/{repo}#{number} has more than "
+                        f"{TIMELINE_PAGE_LIMIT * PER_PAGE} timeline events — the "
+                        f"newest review request to {login} may lie past the "
+                        f"{TIMELINE_PAGE_LIMIT * PER_PAGE} that were read"
+                    )
+                break
             for event in data:
                 if (event or {}).get("event") != "review_requested":
                     continue
@@ -1238,14 +1253,21 @@ class GitHub:
                     newest = at
             if len(data) < PER_PAGE:
                 break
-        else:
-            log.warning(
-                "%s/%s#%d has more than %d timeline events — only the first %d "
-                "were read for review requests to %s",
-                owner, repo, number, TIMELINE_PAGE_LIMIT * PER_PAGE,
-                TIMELINE_PAGE_LIMIT * PER_PAGE, login,
-            )
         return newest
+
+    def _timeline_page(self, owner: str, repo: str, number: int, page: int) -> list:
+        return (
+            self._api(
+                "-X",
+                "GET",
+                f"repos/{owner}/{repo}/issues/{number}/timeline",
+                "-f",
+                f"per_page={PER_PAGE}",
+                "-f",
+                f"page={page}",
+            )
+            or []
+        )
 
     def issue_comments(self, owner: str, repo: str, number: int) -> list[IssueComment]:
         """Every issue comment on the PR, oldest first -- see COMMENT_PAGE_LIMIT
