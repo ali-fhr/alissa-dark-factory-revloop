@@ -64,7 +64,7 @@
 #     deliberate, reviewable change to this line, and that is the ONLY thing that
 #     advances the shared infrastructure layers;
 #   * the `@sha256:` is the ENFORCING half — a tag is mutable, so without it a
-#     re-push of `0.2.0` is substituted into every build with no diff to review.
+#     re-push of `0.2.1` is substituted into every build with no diff to review.
 #     That matters more here than for an ordinary base: this pin is now the whole
 #     review surface for claude-code, the `curl … | bash` CLI install and the apt
 #     layer, none of which this repo builds any more.
@@ -77,10 +77,10 @@
 # into the reference, so an arm64 base, once published, needs only the ordinary
 # two-value bump. Read the current one back with:
 #
-#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0
+#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1
 #
 # The base is linux/amd64-ONLY today; see "Base image" in README.md.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.0@sha256:f46fd1431462392993da6dd209e23c15c3dc8495540469eaa06b40ca5bafda1c
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1@sha256:4c838a0df55391cfa1feab75568f6c493fe2fe9e9de17495d70988ca8252682a
 
 # Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
 # release this repo publishes on merge (it must match the dist's version file,
