@@ -22,8 +22,11 @@ from enum import Enum
 from pathlib import Path
 
 from .alissa import (
+    READINESS_AUTO,
+    READINESS_OPERATOR,
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
+    VerdictEnvelope,
     Alissa,
     ManagedSession,
     SessionRef,
@@ -391,9 +394,49 @@ NATIVE_VERDICT_BODY = (
     "Submitted by the review daemon under the configured reviewer identity, so "
     "this round has a verdict of record on GitHub. The round's findings and "
     "reasoning are in the reviewer session's own comments on this PR{task_note}."
-    "{head_note}\n\n"
+    "{head_note}{readiness}\n\n"
     "{marker}"
 )
+
+# The merge-readiness trailer (issue #130). orcloop's opt-in merge edge merges
+# a PR only when the reviewer's APPROVE on the current head carries
+# `Merge-Readiness: auto`; the judgment is the reviewer session's (the
+# envelope's `- **Merge-Readiness:**` line) and this daemon only CARRIES it,
+# in a grammar the consumer can parse: one plain-text line, line-anchored,
+# the last non-empty line before the hidden verdict marker --
+#
+#   Merge-Readiness: auto
+#   Merge-Readiness: operator — <one-line reason>
+#
+# The rules that make it safe to consume: it is emitted on APPROVE events
+# ONLY (a request_changes envelope with a stray `auto` line carries nothing;
+# an approve the checks gate downgraded carries nothing), and an envelope
+# with no parseable line fails CLOSED to `operator`, with a reason that tells
+# the operator why the merge waited on them.
+READINESS_TRAILER_LABEL = "Merge-Readiness:"
+READINESS_MISSING_REASON = "envelope carries no Merge-Readiness line"
+
+
+def readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
+    """The line the native APPROVE carries for `envelope`'s judgment.
+
+    The caller has already decided the event is an APPROVE; this only maps
+    the envelope onto the grammar. `auto` is emitted bare -- the consumer
+    keys on the value, and an operator reads a reason only when the merge is
+    theirs to make. A missing or unparseable judgment (None envelope, or one
+    whose readiness did not parse) is `operator` with a reason saying so.
+    """
+    if envelope is not None and envelope.readiness == READINESS_AUTO:
+        return f"{READINESS_TRAILER_LABEL} {READINESS_AUTO}"
+    if envelope is not None and envelope.readiness == READINESS_OPERATOR:
+        if envelope.readiness_reason:
+            return (
+                f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR} — "
+                f"{envelope.readiness_reason}"
+            )
+        return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR}"
+    return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR} — {READINESS_MISSING_REASON}"
+
 
 # Appended to the body when the round's review task is known.
 _VERDICT_TASK_NOTE = ", and the CR6 verdict envelope is on `{task_ref}`"
@@ -599,6 +642,17 @@ _RECORD_THE_CAP = (
     "operator re-entry grants) — record THAT number in the review task "
     "description, and correct it if the description carries a different cap "
     "from a stale template default. "
+)
+
+# The merge-readiness line (issue #130). The verdict envelope is where the
+# reviewer's judgment lives; the daemon copies it onto the native review as a
+# trailer the merge edge reads, and an envelope without the line posts as
+# `operator` -- so a reviewer who skips it has silently withheld auto-merge.
+_MERGE_READINESS_LINE = (
+    "Your verdict envelope MUST carry the skill's `- **Merge-Readiness:** auto | "
+    "operator — <reason>` line — the daemon copies it onto the native review as "
+    "the `Merge-Readiness:` trailer the merge edge reads, and an envelope "
+    "without the line posts as `operator`. "
 )
 
 # -- the reviewer session's own CI gate (issue #84) ---------------------------
@@ -881,6 +935,7 @@ ROUND_1_DIRECTIVE = (
     "severity-tagged comments via gh pr review, record the verdict evidence, "
     "move the task to pending_validation. "
     + _RECORD_THE_CAP
+    + _MERGE_READINESS_LINE
     + "{credential}"
     + _CHECKS_BEFORE_VERDICT
     + "{checks}"
@@ -899,6 +954,7 @@ ROUND_K_DIRECTIVE = (
     "verify the fixes, sweep the new diff with the full rubric, record a "
     "round-{round} verdict envelope, move the task to pending_validation. "
     + _RECORD_THE_CAP
+    + _MERGE_READINESS_LINE
     + "{credential}"
     + _CHECKS_BEFORE_VERDICT
     + "{checks}"
@@ -3169,9 +3225,10 @@ class ReviewWatcher:
         Never raises past RateLimited: a broken post must stall this PR, not
         the whole poll pass.
         """
-        verdict = self.alissa.latest_verdict(task.ref)
+        envelope = self.alissa.latest_envelope(task.ref)
+        verdict = None if envelope is None else envelope.verdict
         if verdict not in (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES):
-            # count_verdicts and latest_verdict read the same envelopes with
+            # count_verdicts and latest_envelope read the same envelopes with
             # the same pattern, so this is nearly unreachable -- but "I know a
             # round finished and cannot tell you its verdict" must never be
             # resolved by guessing one onto the PR.
@@ -3266,6 +3323,11 @@ class ReviewWatcher:
                 return gate.hold
             event = gate.event
 
+        # The trailer follows the EVENT, not the envelope: an approve the
+        # checks gate turned into a REQUEST_CHANGES or COMMENT carries none,
+        # because `auto` on anything but an APPROVE is exactly what the
+        # consumer must never see (issue #130).
+        trailer = readiness_trailer(envelope) if event == EVENT_APPROVE else ""
         body = gate.lead + NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
@@ -3275,6 +3337,7 @@ class ReviewWatcher:
                 if moved
                 else ""
             ),
+            readiness=f"\n\n{trailer}" if trailer else "",
             marker=verdict_marker(round_),
         )
         try:
@@ -3312,14 +3375,20 @@ class ReviewWatcher:
         self.state.record_verdict(
             pr.full_name, pr.number, judged, int(time.time()), url or ""
         )
+        # The readiness carried on the post, in the same three records. Only
+        # an APPROVE carries one, so only an APPROVE names it.
+        readiness_value = trailer[len(READINESS_TRAILER_LABEL):].strip()
+        readiness_note = f" readiness={readiness_value}" if trailer else ""
         log.info(
-            "%s round %d closed: native %s review submitted as %s (%s)%s",
-            pr.slug, round_, event, self.github.login, url or "no url", gate_note,
+            "%s round %d closed: native %s review submitted as %s (%s)%s%s",
+            pr.slug, round_, event, self.github.login, url or "no url",
+            readiness_note, gate_note,
         )
         self._append_activity(
             pr,
             f"- {_now()} — round {round_} — native `{event}` review submitted "
-            f"as `{self.github.login}` (verdict of record){gate_note}",
+            f"as `{self.github.login}` (verdict of record){gate_note}"
+            + (f" — merge-readiness: `{readiness_value}`" if trailer else ""),
         )
         if event == EVENT_COMMENT:
             # A degraded verdict takes the PR out of the loop (the review

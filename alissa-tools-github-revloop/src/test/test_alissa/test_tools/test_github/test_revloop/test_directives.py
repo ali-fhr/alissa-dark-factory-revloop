@@ -43,6 +43,12 @@ def test_directive_demands_registered_review_and_a_verdict(template):
     # (4) self-kill as the final action, using the injected session name
     assert "alissa tmux kill review-widgets-pr7-r2" in text
     assert text.rstrip().endswith("do nothing after it.")
+    # (5) the envelope must carry the merge-readiness judgment (issue #130):
+    # the daemon copies it onto the native review, and a missing line posts
+    # as operator -- a reviewer who skips it has withheld auto-merge silently.
+    assert "merge-readiness" in text
+    assert "auto | operator" in text
+    assert "without the line posts as `operator`" in text
 
 
 @pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE])

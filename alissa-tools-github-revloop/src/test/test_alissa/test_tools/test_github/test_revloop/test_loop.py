@@ -34,9 +34,14 @@ from alissa.tools.github.revloop.config import (
     resolve_config_path,
 )
 from alissa.tools.github.revloop.alissa import (
+    MAX_READINESS_REASON_CHARS,
+    READINESS_AUTO,
+    READINESS_OPERATOR,
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
     Alissa,
+    VerdictEnvelope,
+    parse_readiness,
     ManagedSession,
     SessionRef,
     Task,
@@ -328,9 +333,15 @@ class FakeGitHub:
 
 
 class FakeAlissa:
-    def __init__(self, task=None, verdict=None, verdict_count=0):
+    def __init__(
+        self, task=None, verdict=None, verdict_count=0, readiness=None, readiness_reason=""
+    ):
         self.task = task
         self.verdict = verdict  # newest CR6 envelope verdict, or None
+        # The newest envelope's Merge-Readiness judgment (issue #130): None
+        # models an envelope without the line, the case that fails closed.
+        self.readiness = readiness
+        self.readiness_reason = readiness_reason
         self.verdict_count = verdict_count  # envelopes on the task = rounds done
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
@@ -419,6 +430,18 @@ class FakeAlissa:
     def latest_verdict(self, task_ref):
         self.verdict_calls.append(task_ref)
         return self.verdict
+
+    def latest_envelope(self, task_ref):
+        # The same read as `latest_verdict` in production, so the same call
+        # record: a test counting verdict reads sees this one too.
+        self.verdict_calls.append(task_ref)
+        if self.verdict is None:
+            return None
+        return VerdictEnvelope(
+            verdict=self.verdict,
+            readiness=self.readiness,
+            readiness_reason=self.readiness_reason,
+        )
 
     def count_verdicts(self, task_ref):
         self.count_calls.append(task_ref)
@@ -531,7 +554,10 @@ def config(tmp_path):
     )
 
 
-def watcher(config, pr, reviews, task=FakeTask(), state=None, verdict=None, verdict_count=None):
+def watcher(
+    config, pr, reviews, task=FakeTask(), state=None, verdict=None, verdict_count=None,
+    readiness=None, readiness_reason="",
+):
     # Default the review task's envelope count to the number of substantive
     # GitHub reviews, so a scenario's rounds are consistent across both signals.
     # Tests that exercise github-vs-envelope divergence pass verdict_count.
@@ -540,6 +566,7 @@ def watcher(config, pr, reviews, task=FakeTask(), state=None, verdict=None, verd
     al = FakeAlissa(
         task, verdict=verdict,
         verdict_count=default_count if verdict_count is None else verdict_count,
+        readiness=readiness, readiness_reason=readiness_reason,
     )
     w = ReviewWatcher(config, github=gh, alissa=al, state=state or State(config.state_db))
     return w, gh, al
@@ -1638,6 +1665,103 @@ def test_verdict_is_read_from_the_body_when_the_title_is_bare(monkeypatch):
 def test_malformed_or_absent_evidence_degrades_to_no_verdict(monkeypatch, payload):
     """The daemon polls forever; this must never raise."""
     assert verdict_from(monkeypatch, payload) is None
+
+
+def envelope_from(monkeypatch, payload, ref="TASK-500"):
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
+    return alissa_mod.Alissa().latest_envelope(ref)
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("- **Merge-Readiness:** auto", ("auto", "")),
+        ("- **Merge-Readiness:** operator — touches convex/schema.ts",
+         ("operator", "touches convex/schema.ts")),
+        ("* **Merge-Readiness**: operator - hyphen separator", ("operator", "hyphen separator")),
+        ("Merge-Readiness: auto", ("auto", "")),
+        ("Merge-Readiness: operator – en dash", ("operator", "en dash")),
+        ("- **Merge-Readiness:** **auto**", ("auto", "")),
+        ("  - **Merge-Readiness:**   operator   ", ("operator", "")),
+        ("- **Merge-Readiness:** operator —", ("operator", "")),
+    ],
+    ids=["bullet-bold", "bullet-bold-reason", "star-bold-outside-colon", "plain",
+         "en-dash", "bold-value", "padded", "empty-reason"],
+)
+def test_readiness_line_variants_parse(line, expected):
+    assert parse_readiness(f"# Review verdict: o/r#1 — approve\n\n{line}\n\nmore\n") == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "- **Merge-Readiness:** Auto",
+        "- **Merge-Readiness:** OPERATOR",
+        "- **Merge-Readiness:** automatic",
+        "- **Merge-Readiness:** maybe",
+        "- **Merge-Readiness:**",
+        "Merge readiness: auto",
+        "the Merge-Readiness: auto line goes here",
+    ],
+    ids=["capitalised", "upper", "prefix-word", "unknown", "empty", "no-hyphen", "mid-line"],
+)
+def test_readiness_line_that_misses_the_grammar_is_missing(line):
+    """`Auto` is not a judgment the daemon carries: value case is part of the
+    contract, and anything that misses it fails closed downstream."""
+    assert parse_readiness(f"body\n{line}\n") == (None, "")
+
+
+def test_readiness_reason_is_one_bounded_backtick_free_line():
+    readiness, reason = parse_readiness(
+        "- **Merge-Readiness:** operator — `a`  b\nnext line\n"
+    )
+    assert (readiness, reason) == ("operator", "a b")
+    _, long = parse_readiness("- **Merge-Readiness:** operator — " + "r" * 300)
+    assert len(long) == MAX_READINESS_REASON_CHARS
+
+
+def test_the_first_readiness_line_wins():
+    assert parse_readiness(
+        "- **Merge-Readiness:** operator — first\n- **Merge-Readiness:** auto\n"
+    ) == ("operator", "first")
+
+
+def test_the_envelope_carries_its_readiness_with_the_verdict(monkeypatch):
+    item = envelope("approve", 2, "2026-07-18T20:20:00Z")
+    item["markdownContent"] += "\n- **Merge-Readiness:** operator — touches convex/schema.ts\n"
+    got = envelope_from(monkeypatch, {"evidence": [item]})
+    assert got == VerdictEnvelope("approve", "operator", "touches convex/schema.ts")
+    assert verdict_from(monkeypatch, {"evidence": [item]}) == "approve", "the word alone, unchanged"
+
+
+def test_readiness_comes_off_the_newest_envelope_not_a_neighbour(monkeypatch):
+    older = envelope("request_changes", 1, "2026-07-18T18:31:00Z")
+    older["markdownContent"] += "\n- **Merge-Readiness:** auto\n"
+    newer = envelope("approve", 2, "2026-07-18T20:20:00Z")
+    got = envelope_from(monkeypatch, {"evidence": [older, newer]})
+    assert got == VerdictEnvelope("approve", None, "")
+
+
+def test_readiness_is_read_from_the_title_when_the_body_has_none(monkeypatch):
+    item = envelope("approve", 1, "2026-07-18T20:20:00Z")
+    item["title"] += "\nMerge-Readiness: auto"
+    assert envelope_from(monkeypatch, {"evidence": [item]}).readiness == "auto"
+
+
+def test_get_task_detail_verdict_is_still_the_word(monkeypatch):
+    """`TaskDetail.verdict` keeps its shape: the decide path compares it to the
+    verdict constants, and a record there would silently never match."""
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    item = envelope("approve", 1, "2026-07-18T20:20:00Z")
+    item["markdownContent"] += "\n- **Merge-Readiness:** auto\n"
+    payload = {"taskNumber": 500, "title": "Review PR acme/widgets#7", "status": "committed",
+               "evidence": [item]}
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+    assert detail is not None and detail.verdict == VERDICT_APPROVE
 
 
 def test_undated_envelope_loses_to_a_dated_one(monkeypatch):
@@ -3665,7 +3789,9 @@ def test_the_dry_run_pass_never_records_a_grant(ack_config):
 # native review submitted by the configured reviewer identity.
 
 
-def envelope_ahead(config, verdict, *, reviews=None, state=None):
+def envelope_ahead(
+    config, verdict, *, reviews=None, state=None, readiness=None, readiness_reason=""
+):
     """A PR whose review task carries a round-1 verdict envelope that no
     countable reviewer review backs — the #298 shape."""
     return watcher(
@@ -3675,6 +3801,8 @@ def envelope_ahead(config, verdict, *, reviews=None, state=None):
         state=state,
         verdict=verdict,
         verdict_count=1,
+        readiness=readiness,
+        readiness_reason=readiness_reason,
     )
 
 
@@ -3693,10 +3821,186 @@ def test_an_envelope_with_no_native_review_is_posted_as_one(config, no_post_grac
 
 
 def test_an_approve_envelope_posts_a_native_approve(config, no_post_grace):
-    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
 
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
     assert gh.submitted[0]["event"] == "APPROVE"
+    assert trailer_of(gh.submitted[0]["body"]) == "Merge-Readiness: auto"
+
+
+# -- the Merge-Readiness trailer (issue #130) --------------------------------
+#
+# orcloop's merge edge reads the reviewer's judgment off the native APPROVE:
+# one line-anchored `Merge-Readiness: auto | operator — <reason>` line, the
+# last non-empty line before the hidden verdict marker. The daemon carries
+# the envelope's line; it never invents `auto`, and an envelope without the
+# line fails closed to `operator`.
+
+# The consumer's own grammar, verbatim from the contract, so a trailer that
+# passes here is one orcloop parses.
+CONSUMER_READINESS_RE = re.compile(
+    r"^Merge-Readiness:[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$"
+)
+
+
+def trailer_of(body):
+    """The last non-empty line before the verdict marker, or None when the
+    marker is missing."""
+    marker_at = body.find("<!-- alissa-revloop:verdict")
+    if marker_at < 0:
+        return None
+    lines = [line for line in body[:marker_at].splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def readiness_lines(body):
+    return [line for line in body.splitlines() if line.startswith("Merge-Readiness:")]
+
+
+def test_an_operator_envelope_carries_its_reason_onto_the_approve(config, no_post_grace):
+    w, gh, _ = envelope_ahead(
+        config, VERDICT_APPROVE,
+        readiness=READINESS_OPERATOR, readiness_reason="touches convex/schema.ts",
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    body = gh.submitted[0]["body"]
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert trailer_of(body) == "Merge-Readiness: operator — touches convex/schema.ts"
+    match = CONSUMER_READINESS_RE.match(trailer_of(body))
+    assert match and match.group(1) == "operator"
+    assert match.group(2) == "touches convex/schema.ts"
+
+
+def test_an_approve_envelope_without_the_line_fails_closed_to_operator(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)  # readiness=None
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    body = gh.submitted[0]["body"]
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert trailer_of(body) == (
+        "Merge-Readiness: operator — envelope carries no Merge-Readiness line"
+    )
+    assert CONSUMER_READINESS_RE.match(trailer_of(body)).group(1) == "operator"
+
+
+def test_an_operator_envelope_with_no_reason_posts_a_bare_operator(config, no_post_grace):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_OPERATOR)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert trailer_of(gh.submitted[0]["body"]) == "Merge-Readiness: operator"
+
+
+def test_the_trailer_is_the_last_line_before_the_marker_and_counts_one_round(
+    config, no_post_grace
+):
+    """Position is part of the contract: the consumer reads the last non-empty
+    line before the marker. And the marker still does its own job — the post
+    counts as the round it closes, not as a second one."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    body = gh.submitted[0]["body"]
+    assert body.rstrip().endswith(verdict_marker(1))
+    assert readiness_lines(body) == ["Merge-Readiness: auto"], "exactly one line"
+    assert trailer_of(body) == "Merge-Readiness: auto"
+    assert "TASK-500" in body, "the task note still precedes it"
+    assert body.index("TASK-500") < body.index("Merge-Readiness:")
+    assert countable_rounds(gh.my_reviews(OWNER, REPO, NUMBER)) == 1
+
+
+def test_a_head_moved_note_still_precedes_the_trailer(config, no_post_grace):
+    st = State(config.state_db)
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, state=st, readiness=READINESS_AUTO)
+    st.note_verdict_post_owed(f"{OWNER}/{REPO}", NUMBER, 1, "0ld0ld0ld")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    body = gh.submitted[0]["body"]
+    assert "the head is now" in body
+    assert body.index("the head is now") < body.index("Merge-Readiness:")
+    assert trailer_of(body) == "Merge-Readiness: auto"
+
+
+def test_a_request_changes_envelope_never_carries_a_trailer(config, no_post_grace):
+    """A stray `auto` on a request_changes envelope carries nothing: `auto`
+    is never emitted on anything but an APPROVE."""
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES, readiness=READINESS_AUTO)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+    assert readiness_lines(gh.submitted[0]["body"]) == []
+    assert trailer_of(gh.submitted[0]["body"]) is not None, "the marker is still there"
+    assert "Merge-Readiness" not in gh.submitted[0]["body"]
+
+
+def test_an_approve_the_checks_gate_downgrades_carries_no_trailer(config, no_post_grace):
+    """The envelope says auto; the head is red; the post is a REQUEST_CHANGES
+    — and a REQUEST_CHANGES carries no readiness at all."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    gh.default_rollup = rollup_of([failing_check()])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+    assert "Merge-Readiness" not in gh.submitted[0]["body"]
+
+
+def test_an_approve_degraded_to_a_comment_carries_no_trailer(config, no_post_grace, monkeypatch):
+    _clock(monkeypatch, start=time.time())
+    impatient = dataclasses.replace(config, checks_wait_seconds=0, checks_spawn_wait_seconds=0)
+    w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "COMMENT"
+    assert "Merge-Readiness" not in gh.submitted[0]["body"]
+
+
+def test_the_round_close_log_and_activity_row_name_the_readiness(config, no_post_grace, caplog):
+    w, gh, _ = envelope_ahead(
+        config, VERDICT_APPROVE,
+        readiness=READINESS_OPERATOR, readiness_reason="touches convex/schema.ts",
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+
+    assert any(
+        "closed: native APPROVE" in r.getMessage()
+        and "readiness=operator — touches convex/schema.ts" in r.getMessage()
+        for r in caplog.records
+    )
+    rows = activity_comments(gh)
+    assert len(rows) == 1
+    assert "merge-readiness: `operator — touches convex/schema.ts`" in rows[0].body
+
+
+def test_a_non_approve_close_names_no_readiness(config, no_post_grace, caplog):
+    w, gh, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES, readiness=READINESS_AUTO)
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+
+    assert not any("readiness=" in r.getMessage() for r in caplog.records)
+    assert "merge-readiness" not in activity_comments(gh)[0].body
+
+
+def test_the_trailer_reason_arrives_flat_bounded_and_fence_free(config, no_post_grace):
+    """The parser is where the bound lives (the envelope is read off the task
+    once); the post trusts what it is handed, so this pins the whole path from
+    a hostile envelope body to the posted trailer."""
+    hostile = "touches `convex/schema.ts`\nand also\n```\nfenced\n```\n" + "x" * 300
+    readiness, reason = parse_readiness(f"- **Merge-Readiness:** operator — {hostile}")
+    assert readiness == READINESS_OPERATOR
+    w, gh, _ = envelope_ahead(
+        config, VERDICT_APPROVE, readiness=readiness, readiness_reason=reason
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    trailer = trailer_of(gh.submitted[0]["body"])
+    assert trailer.startswith("Merge-Readiness: operator — touches convex/schema.ts")
+    assert "\n" not in trailer and "`" not in trailer
+    assert len(trailer) <= len("Merge-Readiness: operator — ") + MAX_READINESS_REASON_CHARS
+    assert CONSUMER_READINESS_RE.match(trailer)
 
 
 def test_an_approve_envelope_does_not_converge_before_its_native_review(config):

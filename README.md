@@ -337,6 +337,42 @@ inject the token at runtime like any other secret. The entrypoint resolves the
 login at boot and refuses to start if the variable is empty, the token is
 rejected, or it belongs to someone other than `ALISSA_REVIEWER_LOGIN`.
 
+#### The `Merge-Readiness` trailer on a native approve
+
+Every native **APPROVE** the daemon posts ends with one line-anchored,
+plain-text trailer — the last non-empty line before the hidden
+`<!-- alissa-revloop:verdict round=N -->` marker:
+
+```
+Merge-Readiness: auto
+Merge-Readiness: operator — <one-line reason>
+```
+
+The judgment is the reviewer session's, not the daemon's: the
+`alissa-code-review` verdict envelope carries a
+`- **Merge-Readiness:** auto | operator — <reason>` line, and the daemon
+**carries** it onto the native review so a consumer (orcloop's opt-in merge
+edge, which merges only on an approve of the current head that reads `auto`)
+can parse it without reading Alissa. The grammar a consumer should use, and the
+one this daemon's tests pin, is
+`^Merge-Readiness:[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$` —
+first match wins, value case-sensitive. The daemon emits exactly one such line,
+and:
+
+- **carried from the envelope; missing = operator.** An envelope with no
+  parseable line (absent, `Auto` capitalised, any other word) posts
+  `Merge-Readiness: operator — envelope carries no Merge-Readiness line`. The
+  daemon never invents `auto`;
+- **approve events only.** A `request_changes` envelope carries no trailer
+  whatever it says, and neither does an approve the CI checks gate downgraded
+  to `REQUEST_CHANGES` or `COMMENT` — `auto` on anything but an APPROVE is the
+  one thing a consumer must never see;
+- the reason is flattened to one line, stripped of backticks and bounded to 200
+  characters at the parser, so it can never fence the marker away;
+- there is no config key. The trailer is information the reviewer already
+  produced, not a lever. The round-close log line carries `readiness=…` and
+  the activity comment's round row names it.
+
 ### Never approve a red head: the CI checks gate
 
 An `APPROVE` from the reviewer identity is the operator's cue to merge, so it

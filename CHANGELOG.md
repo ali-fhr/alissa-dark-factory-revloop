@@ -4,6 +4,21 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.0
+
+- **`Merge-Readiness` trailer on native approves** (issue #130). Every native
+  `APPROVE` review the daemon posts now ends with one line-anchored
+  `Merge-Readiness: auto` or `Merge-Readiness: operator — <reason>` line, the
+  last non-empty line before the hidden verdict marker, carried from the
+  `- **Merge-Readiness:**` line of the reviewer's verdict envelope. An envelope
+  without a parseable line posts `operator — envelope carries no
+  Merge-Readiness line` (fail closed; the daemon never invents `auto`);
+  `REQUEST_CHANGES`/`COMMENT` events — including an approve the checks gate
+  downgraded — carry no trailer. Reasons are flattened to one backtick-free
+  line of at most 200 characters. Both reviewer directives now ask for the
+  envelope line; the round-close log line carries `readiness=…` and the
+  activity row names it. No new config key.
+
 ## 0.30.1
 
 - **Round admission: one round per re-request** (issue #128). A round on a
