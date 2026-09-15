@@ -62,6 +62,10 @@ _TAIL_MIN_LEN = 22
 # real footprint and a charge the kernel would give back under pressure.
 _CGROUP_CURRENT = "memory.current"
 _CGROUP_STAT = "memory.stat"
+# The container's hard memory limit. cgroup v2 writes the literal `max` when
+# there is none, which `_read_int_file` reports as None -- the right answer
+# for "no limit", and the same answer as "no cgroup v2 at all".
+_CGROUP_MAX = "memory.max"
 _CGROUP_STAT_KEYS = (
     "anon",
     "file",
@@ -338,6 +342,21 @@ def cgroup_memory(
     }
     out.update(stat)
     return out
+
+
+def cgroup_memory_limit(
+    cgroup_root: "str | os.PathLike[str]" = "/sys/fs/cgroup",
+) -> "int | None":
+    """The container's hard memory limit in bytes (`memory.max`), or None
+    when it is unlimited (`max`), unreadable, or there is no cgroup v2.
+
+    Separate from `cgroup_memory` on purpose: that payload is the console
+    tile's, pinned key-for-key by its tests and rendered by the page, and
+    the fleet-vitals snapshot (issue #126) is the only reader that wants
+    the limit -- the Factory draws a resident-over-limit meter from it.
+    Never raises, like every read here.
+    """
+    return _read_int_file(Path(cgroup_root) / _CGROUP_MAX)
 
 
 def disk_usage(path: "str | os.PathLike[str]") -> "dict | None":

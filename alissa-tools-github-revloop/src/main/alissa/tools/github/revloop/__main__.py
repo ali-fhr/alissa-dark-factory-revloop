@@ -13,6 +13,7 @@ from .alissa_client import AlissaClient, AlissaError
 from .config import (
     BOW_OWNERS_ENV,
     BOWS_REFRESH_POLLS_ENV,
+    FLEET_VITALS_ENV,
     HUB_ADD,
     HUB_SKIP,
     LOOP_EVENTS_ENV,
@@ -262,6 +263,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="do not push loop telemetry even if the config enables it",
     )
+    vitals = over.add_mutually_exclusive_group()
+    vitals.add_argument(
+        "--fleet-vitals",
+        dest="fleet_vitals_enabled",
+        action="store_true",
+        default=None,
+        help="push one fleet-vitals snapshot (heartbeat, sessions, inbox, "
+        "rate, memory) to Studio's POST /v1/loop/fleet-vitals at the end of "
+        "every completed poll pass — best-effort, never fatal. "
+        f"Overridden by ${FLEET_VITALS_ENV}",
+    )
+    vitals.add_argument(
+        "--no-fleet-vitals",
+        dest="fleet_vitals_enabled",
+        action="store_false",
+        help="do not push fleet vitals even if the config enables it",
+    )
     over.add_argument(
         "--alissa-endpoint",
         dest="alissa_endpoint",
@@ -317,6 +335,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "task_list_self_scope": args.task_list_self_scope,
         "task_list_bow_id": args.task_list_bow_id,
         "loop_events_enabled": args.loop_events_enabled,
+        "fleet_vitals_enabled": args.fleet_vitals_enabled,
         "alissa_endpoint": args.alissa_endpoint,
         "dry_run": args.dry_run,
     }

@@ -360,8 +360,27 @@ class Sources:
         spawns: "list[dict] | None" = None,
         index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None,
     ) -> "list[dict]":
+        """The managed-session table -- `session_rows`, with an unlistable
+        roster degraded to the empty table the dashboard has always rendered
+        (a panel cannot draw None). A caller that must tell "nobody is live"
+        from "could not list" reads `session_rows` directly."""
+        return self.session_rows(spawns, index) or []
+
+    def session_rows(
+        self,
+        spawns: "list[dict] | None" = None,
+        index: "tuple[dict[int, list[int]], dict[int, dict]] | None" = None,
+    ) -> "list[dict] | None":
         """The managed-session table: liveness from `alissa tmux ls`, footprint
-        from /proc, and the PR round each session is reviewing.
+        from /proc, and the PR round each session is reviewing -- or None
+        when the roster could not be LISTED at all.
+
+        None is a distinct answer from `[]`, and the fleet-vitals snapshot
+        (issue #126) depends on the distinction: it reports `sessions: null`
+        for a roster it could not read and must never report `{0, 0}` for
+        it, because a Factory card reading "0 live" over a broken tmux would
+        be the reassuring-direction error. A listing that returned anything
+        other than a JSON list is "could not list" too.
 
         The round comes from the spawn ledger (session name is its primary
         key), not from the session name itself: the name carries a nonce and
@@ -379,9 +398,9 @@ class Sources:
         table) the old lazy build is unchanged and a table with no live pane
         still never scans `/proc`.
         """
-        raw = self._safe_json(["alissa", "tmux", "ls", "--json"]) or []
+        raw = self._safe_json(["alissa", "tmux", "ls", "--json"])
         if not isinstance(raw, list):
-            return []
+            return None
         if spawns is not None:
             by_session = {row["session"]: row for row in spawns}
         else:
@@ -441,6 +460,16 @@ class Sources:
                     ),
                 }
             )
+        return out
+
+    def memory(self) -> dict:
+        """The container's cgroup memory split (`sysinfo.cgroup_memory`) plus
+        its hard `limit` (`sysinfo.cgroup_memory_limit`), every field None
+        off a host without cgroup v2. The fleet-vitals builder's read (issue
+        #126); the dashboard tile keeps reading `cgroup_memory` directly, so
+        its payload is untouched."""
+        out = dict(sysinfo.cgroup_memory(self._cgroup_root))
+        out["limit"] = sysinfo.cgroup_memory_limit(self._cgroup_root)
         return out
 
     # -- two cached remote checks ------------------------------------------
@@ -602,12 +631,7 @@ class Sources:
         # built once, so the two panels can never disagree about which PRs the
         # newest pass still had in hand.
         items = self._pipeline(latest)
-        inbox = self._inbox(
-            ledgers["escalations"],
-            ledgers["pings"],
-            ledgers.get("stability_pings", []),
-            live_prs=self._live_prs(latest, items),
-        )
+        inbox = self._inbox_for(latest, items, ledgers)
         sparklines = {
             "poll_duration_ms": [s["duration_ms"] for s in chrono],
             "active_sessions": [s["in_flight"] + s["deferred"] for s in chrono],
@@ -677,6 +701,31 @@ class Sources:
             "top_procs": top_procs,
             "log": self.log_tail(),
         }
+
+    def inbox(self) -> dict:
+        """The operator inbox on its own -- the `_inbox` split (`live`,
+        `settled`, `settled_dropped`, `truncated`) built exactly as the
+        dashboard builds it, off the newest snapshot and the two inbox
+        ledgers, for a caller that wants no other panel. The fleet-vitals
+        builder's read (issue #126): the snapshot carries the LIVE half, so
+        the Factory card and this console can never disagree about what the
+        operator still owes."""
+        snaps = self.snapshots(1)
+        latest = snaps[0] if snaps else None
+        return self._inbox_for(latest, self._pipeline(latest), self.ledgers())
+
+    def _inbox_for(
+        self, latest: "dict | None", items: "list[dict]", ledgers: dict
+    ) -> dict:
+        """`_inbox` over the two ledgers, with the liveness oracle derived
+        from `items` -- the one place the dashboard and `inbox()` share, so
+        the two cannot drift on which rows are live."""
+        return self._inbox(
+            ledgers["escalations"],
+            ledgers["pings"],
+            ledgers.get("stability_pings", []),
+            live_prs=self._live_prs(latest, items),
+        )
 
     def _pipeline(self, latest: "dict | None") -> "list[dict]":
         """The PR-centric board: one row per PR the newest poll pass saw.

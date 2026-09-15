@@ -15,6 +15,9 @@ site. `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`, see
 `env_loop_events_enabled`) has it because a container deployment toggles
 telemetry with one variable and no config-file edit (issue #112); the env wins
 over both other layers so the two env-backed keys share one precedence story.
+`fleet_vitals_enabled` (`ALISSA_REV_FLEET_VITALS_ENABLED`, see
+`env_fleet_vitals_enabled`) is the second Studio push and rides the same rail
+through the same boolean reader (issue #126).
 The three `repos_source: bows` keys (issue #119) ride the same rail for the
 same container reason: `repos_source` (`ALISSA_REVIEW_REPOS_SOURCE`),
 `bows_refresh_polls` (`ALISSA_REVIEW_BOWS_REFRESH_POLLS`) and `bow_owners`
@@ -192,6 +195,7 @@ CONFIG_KEYS = (
     "task_list_self_scope",
     "task_list_bow_id",
     "loop_events_enabled",
+    "fleet_vitals_enabled",
     "alissa_endpoint",
     "dry_run",
 )
@@ -206,6 +210,11 @@ TASK_LIST_BOW_ENV = "ALISSA_REVIEW_TASK_BOW"
 # TASK_LIST_BOW_ENV it outranks both the config file and the CLI flag — see the
 # module docstring for the shared precedence story.
 LOOP_EVENTS_ENV = "ALISSA_REV_LOOP_EVENTS_ENABLED"
+
+# The environment variable toggling the fleet-vitals push (issue #126): one
+# snapshot of this daemon's live state per completed pass, to Studio's
+# `POST /v1/loop/fleet-vitals`. Same rail and same reader as LOOP_EVENTS_ENV.
+FLEET_VITALS_ENV = "ALISSA_REV_FLEET_VITALS_ENABLED"
 
 # The three `repos_source: bows` rails (issue #119). Same precedence as the two
 # above -- env > file > flag -- and the same blank-falls-through rule, because
@@ -259,18 +268,21 @@ def _validate_alissa_endpoint(endpoint: str) -> str:
     )
 
 
-def env_loop_events_enabled(
-    environ: "Mapping[str, str] | None" = None,
+def _env_bool(
+    name: str, environ: "Mapping[str, str] | None" = None,
 ) -> "bool | None":
-    """The loop-events toggle from the environment, or None when unset.
+    """One boolean env rail: True/False, or None when unset.
 
-    None and empty are the SAME answer — an exported-but-empty variable is how
-    a container renders "unset" (the Dockerfile bakes empty ENV defaults), and
-    it must fall through to the file/CLI layers rather than read as false. A
-    non-boolean spelling raises: the startup phase turns a ValueError into
-    `config error` + exit 2, which is where a typo belongs.
+    Shared by every boolean the environment can set (`LOOP_EVENTS_ENV`,
+    `FLEET_VITALS_ENV`) so the accepted spellings and the refusal are one
+    rule, not two copies that drift (issue #126). None and empty are the SAME
+    answer — an exported-but-empty variable is how a container renders
+    "unset" (the Dockerfile bakes empty ENV defaults), and it must fall
+    through to the file/CLI layers rather than read as false. A non-boolean
+    spelling raises, naming the variable: the startup phase turns a
+    ValueError into `config error` + exit 2, which is where a typo belongs.
     """
-    raw = (os.environ if environ is None else environ).get(LOOP_EVENTS_ENV)
+    raw = (os.environ if environ is None else environ).get(name)
     value = (raw or "").strip().lower()
     if not value:
         return None
@@ -279,9 +291,25 @@ def env_loop_events_enabled(
     if value in _ENV_FALSE:
         return False
     raise ValueError(
-        f"{LOOP_EVENTS_ENV} must be a boolean "
+        f"{name} must be a boolean "
         f"(1/0, true/false, yes/no, on/off), got {raw!r}"
     )
+
+
+def env_loop_events_enabled(
+    environ: "Mapping[str, str] | None" = None,
+) -> "bool | None":
+    """The loop-events toggle from the environment, or None when unset —
+    `_env_bool` over LOOP_EVENTS_ENV."""
+    return _env_bool(LOOP_EVENTS_ENV, environ)
+
+
+def env_fleet_vitals_enabled(
+    environ: "Mapping[str, str] | None" = None,
+) -> "bool | None":
+    """The fleet-vitals toggle from the environment, or None when unset —
+    `_env_bool` over FLEET_VITALS_ENV (issue #126)."""
+    return _env_bool(FLEET_VITALS_ENV, environ)
 
 
 def env_task_list_bow_id(environ: "Mapping[str, str] | None" = None) -> "str | None":
@@ -811,6 +839,15 @@ class Config:
     # when on: a failed push is one WARN and the pass completes.
     loop_events_enabled: bool = False
 
+    # Whether the loop pushes one FLEET-VITALS snapshot — heartbeat, poll
+    # durations, the reviewer-session roster, rate, memory, queue depth, the
+    # operator inbox — to Studio's `POST /v1/loop/fleet-vitals` at the end
+    # of every completed pass (issue #126), so a Factory with no console URL
+    # for this seat can still render its card. OFF by default for the same
+    # reason `loop_events_enabled` is; toggled by FLEET_VITALS_ENV above the
+    # file and the CLI; best-effort when on (one WARN per failed pass).
+    fleet_vitals_enabled: bool = False
+
     # The Alissa/Studio API base the loop-events client posts to. One knob so
     # a staging deployment can point telemetry somewhere else; everything else
     # about the client (its bearer token) comes from the environment.
@@ -909,8 +946,8 @@ class Config:
         "not specified on the CLI" and fall through to the file / defaults.
 
         `environ` is the fourth layer and applies to the env-backed keys
-        (`task_list_bow_id`, `loop_events_enabled`, `repos_source`,
-        `bows_refresh_polls`, `bow_owners`); it wins over both of the others
+        (`task_list_bow_id`, `loop_events_enabled`, `fleet_vitals_enabled`,
+        `repos_source`, `bows_refresh_polls`, `bow_owners`); it wins over both of the others
         (see the module docstring). Defaults to the real environment, so
         callers that do not care pass nothing.
         """
@@ -966,6 +1003,11 @@ class Config:
         env_events = env_loop_events_enabled(environ)
         if env_events is not None:
             raw["loop_events_enabled"] = env_events
+        # ...and the fleet-vitals toggle (issue #126), the same rail through
+        # the same reader.
+        env_vitals = env_fleet_vitals_enabled(environ)
+        if env_vitals is not None:
+            raw["fleet_vitals_enabled"] = env_vitals
 
         # The three bows rails (issue #119), same layer and same reason: the
         # container hands the daemon its mode with one variable. Each is
@@ -1205,6 +1247,7 @@ class Config:
             task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
             task_list_bow_id=bow_id,
             loop_events_enabled=bool(raw.get("loop_events_enabled", False)),
+            fleet_vitals_enabled=bool(raw.get("fleet_vitals_enabled", False)),
             alissa_endpoint=endpoint,
             dry_run=bool(raw.get("dry_run", False)),
         )

@@ -363,7 +363,7 @@ automatically; locally pass `--build-arg`):
 | ARG / env | default | meaning |
 | --- | --- | --- |
 | `ALISSA_REVIEW_REPOS` | *(required under `static` if no manifest mounted)* | allowlist as one `\|`-separated string (see below). Under `ALISSA_REVIEW_REPOS_SOURCE=bows` it is the optional static *seed* and may be empty — the allowlist then derives from the operator's feed Bodies of Work |
-| `ALISSA_REVIEW_REPOS_SOURCE` | *(unset ⇒ library default `static`)* | `bows` derives the allowlist from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (unioned with `ALISSA_REVIEW_REPOS`), so **enrolling a repo is creating the lane** — see [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Under `bows` an *empty* allowlist watches **nothing** (unlike `static`, where empty means every PR that requests this reviewer). The daemon library also reads this exact variable directly and it wins over the rendered config and the CLI flags; a blank value falls through. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` — on an older pin the entrypoint WARNs by name and boots the static path |
+| `ALISSA_REVIEW_REPOS_SOURCE` | *(unset ⇒ library default `static`)* | `bows` derives the allowlist from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (unioned with `ALISSA_REVIEW_REPOS`), so **enrolling a repo is creating the lane** — see [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Under `bows` an *empty* allowlist watches **nothing** (unlike `static`, where empty means every PR that requests this reviewer). The daemon library also reads this exact variable directly and it wins over the rendered config and the CLI flags; a blank value falls through. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0`, which the default build ships (the Dockerfile `ARG` default is `0.29.0`) — only a deliberate `--build-arg REVLOOP_VERSION` below that makes the entrypoint WARN by name and boot the static path |
 | `ALISSA_REVIEW_BOWS_REFRESH_POLLS` | *daemon default* (currently 5) | `bows` only: re-derive the allowlist every N poll passes (≥1), rendered as a JSON number. The enrollment-latency knob. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_BOW_OWNERS` | *(unset ⇒ the token's own actor)* | `bows` only: the Alissa actor **id(s)** whose Bodies of Work may enroll a repo, one `\|`- or `,`-separated string, rendered as a JSON array. Unset, the daemon resolves the authority to its own token's actor at boot (`GET /v1/ping`) and refuses to start if it cannot. Ids only — a username or display name is refused by the daemon at load. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through** |
@@ -380,6 +380,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_REVIEW_TASK_MISS_TTL_POLLS` | *daemon default* (currently 10) | how many polls a PR with **no** Alissa review task is taken on trust before the daemon searches the actor's task corpus for one again. That search is the widest read the daemon makes and the PR→task mapping can only cache an answer that exists, so an unmapped PR used to pay the whole corpus every poll, indefinitely. Trades **latency** for reads: a review task created inside the window is picked up at the re-arm, not the next poll. Floor `1` — there is no value that disables it, and `0` is refused at config load. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.18.0` |
 | `ALISSA_TASK_LIST_SELF_SCOPE` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` narrows `alissa task list` to this actor's own rows (`--self`), dropping the sponsor's corpus; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. Off by default on measured evidence: it saves ~4% of the payload, and a small minority of review tasks on the live fleet are owned by another actor — one the list cannot see is a round the daemon cannot count. Set it only where every review task is created by this daemon's own reviewer sessions. The other narrowings (status filter, digest view) are probed from the installed CLI and need no variable. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.18.0` |
 | `ALISSA_REV_LOOP_EVENTS_ENABLED` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` makes the daemon push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` once per poll pass — one idempotent, ledger-derived batch, best-effort and never fatal, authenticated with the container's existing `ALISSA_API_TOKEN`; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. The daemon library also reads this exact variable directly and it **wins over the rendered config and the CLI flags**, so the render can never contradict the env. Off by default: telemetry is an outbound write and an image upgrade must not start posting on its own. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.28.0` |
+| `ALISSA_REV_FLEET_VITALS_ENABLED` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` makes the daemon push **one fleet-vitals snapshot** of its live state (heartbeat, poll durations, the reviewer-session roster with rounds, GitHub rate, cgroup memory, spawn-gate queue depth, the live operator inbox) to Studio's `POST /v1/loop/fleet-vitals` at the end of every completed poll pass, after the loop-events push — so a Factory with **no** `FACTORY_REVLOOP_URL` still renders this seat's card, with `ALISSA_UI_ENABLED` unset. Built in-process from the console's own builders (the sidecar need not run); best-effort and never fatal (one WARNING per failed pass; a `403 not_activated` warns once per boot with the activate URL); nothing sent in dry-run; authenticated with the container's existing `ALISSA_API_TOKEN`. `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false` — on every pin, before the skew gate. The daemon library also reads this exact variable directly and it **wins over the rendered config and the CLI flags**. Off by default: an outbound write, and an image upgrade must not start posting on its own. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.30.0`; on an older pin the renderer drops the key with a WARN naming the re-pin |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
@@ -401,6 +402,7 @@ The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
 `ALISSA_MAX_CONCURRENT_SESSIONS`, `ALISSA_CHECKS_WAIT_SECONDS`,
 `ALISSA_CHECKS_SPAWN_WAIT_SECONDS`, `ALISSA_REVIEW_TASK_MISS_TTL_POLLS`,
 `ALISSA_TASK_LIST_SELF_SCOPE`, `ALISSA_REV_LOOP_EVENTS_ENABLED`,
+`ALISSA_REV_FLEET_VITALS_ENABLED`,
 `ALISSA_REVIEW_REPOS_SOURCE`, `ALISSA_REVIEW_BOWS_REFRESH_POLLS`,
 `ALISSA_REVIEW_BOW_OWNERS` and `ALISSA_REVIEW_OPERATORS` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
@@ -661,7 +663,13 @@ which mints the `autodev: <owner>/<repo>` feed Body of Work. orcloop and devloop
 already derive their allowlists from those feeds; set
 `ALISSA_REVIEW_REPOS_SOURCE=bows` on **this** service too and the reviewer
 derives its allowlist the same way — so a new lane needs **no
-`ALISSA_REVIEW_REPOS` edit and no redeploy** here either. `ALISSA_REVIEW_REPOS`
+`ALISSA_REVIEW_REPOS` edit and no redeploy** here either. The mode is honoured
+on a **default build**: `ARG REVLOOP_VERSION` defaults to `0.29.0`, the
+release that landed `repos_source`, so a `docker build docker/claude` with no
+`--build-arg` (a self-run fleet, the CI image check, a customer build) boots a
+library that understands the key. Only an image deliberately built with
+`--build-arg REVLOOP_VERSION` below `0.29.0` takes the version-skew
+fall-through described below. `ALISSA_REVIEW_REPOS`
 becomes an optional static seed (unioned with the derived set, never dropped)
 and may be left empty: the entrypoint no longer dies on an empty allowlist under
 `bows`. With the baked `on_missing_hub=add`, each derived repo is hub-ified on
@@ -685,7 +693,10 @@ Three things the entrypoint does on this path, each logged by name:
   provenance check — so a hand-written `bow_owners` belongs in
   `ALISSA_REVIEW_BOW_OWNERS`, never in a mounted file a set seed will rewrite.
 - **Version-skew guard**: the mode is honoured only when the *installed*
-  `alissa-tools-github-revloop` understands `repos_source`. On an older pin the
+  `alissa-tools-github-revloop` understands `repos_source` — probed from the
+  library at boot, not read off the pin. The default build installs `0.29.0`
+  and passes the probe; the guard exists for an image built with an explicit
+  older `--build-arg REVLOOP_VERSION`. On such a pin the
   entrypoint WARNs (`bows mode landed in revloop 0.29.0 — re-pin ARG
   REVLOOP_VERSION`), the renderer drops the three keys so the old library can
   still load its config, and the boot falls through to the static path: with

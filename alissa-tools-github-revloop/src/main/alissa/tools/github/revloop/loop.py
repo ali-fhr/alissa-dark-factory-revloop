@@ -60,6 +60,12 @@ from .ghclient import (
     countable_rounds,
     verdict_marker,
 )
+from .fleet_vitals import (
+    VITALS_FAILED,
+    VITALS_SKIPPED,
+    FleetVitalsPusher,
+    build_pusher,
+)
 from .loop_events import LoopEventsEmitter, build_emitter
 from .proc import CommandError
 from .state import State
@@ -1649,6 +1655,18 @@ class ReviewWatcher:
         self._loop_events: LoopEventsEmitter | None = (
             build_emitter(self.state, endpoint=config.alissa_endpoint)
             if config.loop_events_enabled
+            else None
+        )
+        # The Studio fleet-vitals push (issue #126), or None when the knob
+        # is off — same posture as the loop-events emitter above: nothing is
+        # built, read or logged for the disabled default. The pusher owns
+        # its own in-process `Sources` (the console's data layer), so the
+        # console sidecar need not be running.
+        self._fleet_vitals: FleetVitalsPusher | None = (
+            build_pusher(
+                config, github=self.github, endpoint=config.alissa_endpoint
+            )
+            if config.fleet_vitals_enabled
             else None
         )
         # (repo, number, comment id) of every re-entry directive already
@@ -5208,10 +5226,17 @@ class ReviewWatcher:
         # calls. Written in dry-run too: a snapshot OBSERVES the pass, it is
         # not a side effect the daemon takes, so a future console sees dry-run
         # passes as well as live ones.
-        self._write_snapshot(
-            results, reaped, duration_ms=int((time.monotonic() - started) * 1000)
-        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        self._write_snapshot(results, reaped, duration_ms=duration_ms)
         self._emit_loop_events()
+        # AFTER the loop-events push, and after the snapshot, so the vitals
+        # heartbeat is the completion time of a pass whose exhaust is already
+        # written and whose events are already on their way.
+        vitals = self._push_fleet_vitals(completed_at=time.time())
+        log.info(
+            "poll summary: %d candidate(s), %d reaped, %d ms, vitals: %s",
+            len(results), reaped, duration_ms, vitals,
+        )
         return results
 
     def _emit_loop_events(self) -> None:
@@ -5238,6 +5263,35 @@ class ReviewWatcher:
                 "telemetry is best-effort, the pass completes",
                 type(exc).__name__, exc,
             )
+
+    def _push_fleet_vitals(self, *, completed_at: float) -> str:
+        """Push this pass's fleet-vitals snapshot to Studio, when enabled
+        (issue #126). Returns the outcome word the poll summary prints:
+        `pushed`, `skipped` (disabled, or dry-run -- the pusher logs what it
+        WOULD send and sends nothing) or `failed`.
+
+        `queue_depth` is the spawn gate's waiting set at the end of the pass:
+        every round this pass deferred for a slot, pruned to live candidates
+        at the pass's start and drained as slots free -- the "owed rounds
+        waiting on `max_concurrent_sessions`" the Factory card shows.
+
+        The pusher itself never raises for an API condition (one WARNING, the
+        pass completes); the guard here is the same never-fatal promise held
+        against a code defect, so vitals can never take down a poll.
+        """
+        if self._fleet_vitals is None:
+            return VITALS_SKIPPED
+        try:
+            return self._fleet_vitals.push_once(
+                heartbeat_at=completed_at, queue_depth=len(self._waiting)
+            )
+        except Exception as exc:
+            log.warning(
+                "fleet-vitals: pusher failed unexpectedly (%s: %s) — vitals "
+                "are best-effort, the pass completes",
+                type(exc).__name__, exc,
+            )
+            return VITALS_FAILED
 
     def _note_ledger_unwritable(self) -> None:
         """Report a pass refused because the ledger cannot record it.
