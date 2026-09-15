@@ -145,6 +145,7 @@ else refused by name.
 | `max_concurrent_sessions` | `4` | **spawn gate**: at this many live reviewer sessions of this daemon's own grammar, an owed round *waits* instead of spawning and is retried next poll. Deferral burns no round number and no attempt, trips no stale-round respawn, and pages nobody. Must be **≤ `reap_session_cap`**, which the loader enforces — the cap is the alarm, this is the limit |
 | `checks_wait_seconds` | `1800` | how long a round holds its **approve** while the judged head's CI rollup is still running (or unreadable) before recording the verdict as a `COMMENT` instead. Applies **per condition waited on**: an unreadable hold that becomes a genuine *pending* one restarts the clock once, so the worst-case hold is **twice** this. A **red** rollup never waits and never approves — see *Never approve a red head* |
 | `checks_spawn_wait_seconds` | `900` | **pre-spawn CI gate**: how long an owed round waits for the head's checks to *conclude* before its reviewer is queued at all. The key above gates the verdict the *daemon* posts; this is the only structural gate on the verdict a reviewer *session* posts. Past the bound the round is queued anyway, told it may not approve. `0` disables the *hold* and relies on the directive alone. **It also bounds the reviewer session's own in-round wait**: the same number is written into every directive as how long a session may wait for a running check before submitting, floored at 5 minutes so a `0` here cannot read as "do not wait at all" — see *Never approve a red head* |
+| `verdict_cooldown_s` | `120` | **post-verdict cooldown**: after a verdict lands on a head, no round is queued on that *same* head for this long, whatever the PR's `requested_reviewers` snapshot says. Past it, a same-head round still needs a `review_requested` timeline event **newer than the verdict**. `0` disables the cooldown and leaves the timeline check to decide alone — see *Round admission: one round per re-request* |
 | `review_task_miss_ttl_polls` | `10` | how many polls a PR with **no** review task is taken on trust before the task corpus is searched for one again. Trades **latency** for reads: a review task created mid-window is picked up at the re-arm rather than the next poll. Floor `1` — there is no value that turns it off — see *Bounding the task-list read* |
 | `task_list_self_scope` | `false` | narrow `alissa task list` to this actor's own rows (`--self`). **Off by default on evidence**: a small minority of review tasks on the live fleet are owned by another actor, and a review task the list cannot see is a round the daemon cannot count — see *Bounding the task-list read* |
 | `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
@@ -480,6 +481,8 @@ Leave it on `skip` unless you want unattended clones.
 | pending request, no prior review | spawn round 1 |
 | pending request, k−1 reviews submitted | spawn round k (round-k directive: verify triage, verify fixes, sweep delta) |
 | round already enqueued | in-flight, no-op |
+| a verdict landed on the current head less than `verdict_cooldown_s` ago | **not queued**, whatever `requested_reviewers` says — see *Round admission: one round per re-request* |
+| a verdict stands on the current head and the newest `review_requested` for the reviewer login predates it | **not queued** — the request is the one that opened the finished round; one INFO line says so, and a fresh re-request (or a push) opens the next round |
 | a round is owed but `max_concurrent_sessions` reviewer sessions are live | **deferred** — the round waits for a slot and is retried next poll; it burns no round number and no attempt — see *Spawn back-pressure* |
 | a round is owed but the head's CI has not concluded | **held** — the reviewer is not queued until the checks settle, bounded by `checks_spawn_wait_seconds`; a session that has not started cannot approve ahead of its evidence — see *Never approve a red head* |
 | a round is owed and the head's CI is red | queued **now**, with the failing jobs and run URLs in its directive and no approve permitted |
@@ -507,6 +510,60 @@ Leave it on `skip` unless you want unattended clones.
 `COMMENTED` reviews close a round, not just `APPROVED`/`CHANGES_REQUESTED` —
 single-operator workspaces post comment-mode reviews per CR5, and the loop must
 still advance.
+
+### Round admission: one round per re-request
+
+The loop's edge trigger has always been GitHub consuming the review request
+when the requested identity submits a review — but that consumption is not
+atomic with the daemon's reads. On studio #1243 round 1 posted
+`request_changes` on head `0d9d66b7` at 14:35:32; the poll ten seconds later
+still found the PR in `review-requested:@me` with `alissa-app` in
+`requested_reviewers`, and queued **round 2 on the same head**. Nobody had
+asked for it (the timeline's next `review_requested` came at 14:44:02). That
+phantom round bounced on the CR8 triage gate, which made the devloop spawn a
+second fix session on one branch: a reviewer round and a developer session
+wasted, plus a push-collision risk.
+
+`requested_reviewers` is therefore a **hint, never the verdict**. A round on
+head `H` is admitted only when
+
+- **(a)** no verdict of record exists for `(PR, H)` — a push re-arms exactly as
+  before, since the newest reviewer-identity review then judges an older
+  commit; or
+- **(b)** the issue timeline (`GET /repos/{owner}/{repo}/issues/{n}/timeline`)
+  shows a `review_requested` event for the reviewer login **newer than the
+  last verdict on `H`** — the request that opened the finished round cannot be
+  the request for the next one.
+
+And inside `verdict_cooldown_s` (default 120 s) of that verdict **nothing** is
+queued on `H`, whatever the timeline says. The cooldown alone would have
+prevented #1243; (b) is what makes the gate correct rather than merely rare, and
+the cooldown spares (b) a GitHub call in exactly the window where the stale
+snapshot is most likely.
+
+The verdict's timestamp is the newer of GitHub's own review record and the
+ledger's `verdicts` table: the daemon stamps its native posts the moment they
+land (so the cooldown holds even while GitHub's reviews list still lags the
+POST), and stamps every reviewer-identity review it observes on the current
+head (a session's own `gh pr review` never passes through the daemon). The
+timeline is read **once per candidate PR per poll**, memoised for the pass,
+and only for a PR that already carries a verdict on its head past the
+cooldown. A timeline that cannot be read — an error, or more than 2,000
+events, past which the endpoint's oldest-first paging leaves precisely the
+newest requests unread — admits on the snapshot alone, with a warning: a
+wedged loop on every read error is the worse trade, and the cooldown still
+covers the incident's window. Two clocks are kept apart: the cooldown is a
+duration on the daemon host's wall clock, while (b) compares the timeline's
+`created_at` with GitHub's own `submitted_at`, so a host running ahead of
+GitHub cannot make its own native post look newer than a genuine re-request
+that followed it (the ledger's local stamp stands in only while GitHub's
+reviews list has not yet shown the verdict at all).
+
+A refused round is `skipped` in the poll snapshot and holds no place in the
+spawn queue. Each ignored request is announced **once at INFO** —
+`round N: request seen at T is older than the last verdict at V on head H —
+waiting for a fresh re-request` — and repeated at debug while the same request
+keeps being seen, so an operator can tell *stale request* from *idle*.
 
 ### Round close-out: withdrawing a dangling self review request
 

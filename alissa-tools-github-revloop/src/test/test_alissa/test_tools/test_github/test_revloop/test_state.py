@@ -652,6 +652,24 @@ def test_an_unwritable_derived_set_never_raises_at_the_caller(tmp_path, caplog):
     assert "readonly database" in caplog.text
 
 
+def test_an_observed_verdict_write_back_is_absorbed_but_a_native_post_is_not(ledger, caplog):
+    """Round-1 [minor]: the absorb lives in State. `note_observed_verdict` is
+    telemetry (GitHub already holds the record) and swallows the database
+    error with a WARN; `record_verdict` is the hard write behind the daemon's
+    own native post and still raises."""
+    assert ledger.note_observed_verdict(REPO, 7, "abc123", 1_000, "url") is True
+    assert ledger.last_verdict_at(REPO, 7, "abc123") == 1_000
+
+    ledger._db.execute("DROP TABLE verdicts")
+
+    with caplog.at_level("WARNING"):
+        assert ledger.note_observed_verdict(REPO, 7, "abc123", 2_000, "url") is False
+    assert "recording the verdict on acme/widgets#7 at abc123" in caplog.text
+
+    with pytest.raises(sqlite3.DatabaseError):
+        ledger.record_verdict(REPO, 7, "abc123", 3_000, "url")
+
+
 def test_an_unreadable_cache_reads_as_a_miss(ledger, caplog):
     """The one read in this class that absorbs a database error. A ledger that
     cannot answer must cost a task search, never a review: the caller sees the

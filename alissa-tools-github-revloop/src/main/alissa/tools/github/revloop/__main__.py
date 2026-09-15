@@ -202,6 +202,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     over.add_argument(
+        "--verdict-cooldown-s",
+        type=int,
+        metavar="SECONDS",
+        help="how long after a verdict lands on a head no round may be queued "
+        "on that same head, whatever the PR's requested_reviewers snapshot "
+        "says; 0 leaves the review_requested timeline check to decide alone",
+    )
+
+    over.add_argument(
         "--review-task-miss-ttl-polls",
         type=int,
         metavar="N",
@@ -321,6 +330,7 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "max_concurrent_sessions": args.max_concurrent_sessions,
         "checks_wait_seconds": args.checks_wait_seconds,
         "checks_spawn_wait_seconds": args.checks_spawn_wait_seconds,
+        "verdict_cooldown_s": args.verdict_cooldown_s,
         "review_task_miss_ttl_polls": args.review_task_miss_ttl_polls,
         "task_list_self_scope": args.task_list_self_scope,
         "task_list_bow_id": args.task_list_bow_id,
