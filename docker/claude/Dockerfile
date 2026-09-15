@@ -82,15 +82,21 @@
 # The base is linux/amd64-ONLY today; see "Base image" in README.md.
 FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1@sha256:4c838a0df55391cfa1feab75568f6c493fe2fe9e9de17495d70988ca8252682a
 
-# Version of the daemon to install from PyPI. Bump per release: 0.16.0 is the
+# Version of the daemon to install from PyPI. Bump per release: 0.29.0 is the
 # release this repo publishes on merge (it must match the dist's version file,
 # or the image ships a library that cannot read the config this image renders).
+# 0.29.0 is also the release that introduced `repos_source` (issue #119), so a
+# DEFAULT build -- no `--build-arg REVLOOP_VERSION` -- honours
+# ALISSA_REVIEW_REPOS_SOURCE=bows instead of taking the entrypoint's
+# version-skew fall-through (issue #124; the pin sat at 0.16.14 until the
+# release was on PyPI, because check-image.yaml installs the pin from there).
 #
 # The FLOOR is separate from the current pin and moves far less often: never
 # below 0.15.0, the first version shipping the `alissa-revloop-ui` console
 # script the entrypoint starts. Naming the two apart keeps the next release a
-# one-line edit.
-ARG REVLOOP_VERSION=0.16.14
+# one-line edit. The bows arm is skew-guarded (capability-probed, not
+# version-pinned), so it does NOT move the floor.
+ARG REVLOOP_VERSION=0.29.0
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.
