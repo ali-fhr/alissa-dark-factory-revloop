@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -25,6 +25,7 @@ from alissa.tools.github.revloop.config import (
     DEFAULT_REAP_GRACE_SECONDS,
     DEFAULT_REAP_SESSION_CAP,
     DEFAULT_REVIEW_TASK_MISS_TTL_POLLS,
+    DEFAULT_VERDICT_COOLDOWN_SECONDS,
     HUB_ADD,
     ON_MISSING_SKIP,
     Config,
@@ -125,6 +126,12 @@ _REVIEW_STATES = {
 }
 
 
+# What FakeGitHub's timeline answers when a test makes no claim about review
+# requests: later than every verdict a fixture can carry, so the round-admission
+# gate (issue #128) reads it as a fresh re-request.
+FRESH_REQUEST_AT = "2099-01-01T00:00:00Z"
+
+
 class FakeGitHub:
     def __init__(self, pr: PullRequest, reviews: list[Review], login: str = "alissa-app"):
         self.login = login
@@ -170,6 +177,17 @@ class FakeGitHub:
         self.changed_files: list[str] = ["src/app.py"]
         self.compares: list[tuple[str, str]] = []
         self.compare_error: BaseException | None = None
+        # The PR's issue timeline as the round-admission gate reads it: the
+        # (login, created_at) of every `review_requested` event. None means
+        # the fixture makes no claim, and the default then answers "a request
+        # newer than any verdict" -- every pre-existing scenario in this file
+        # has the PR in the review-requested search precisely because someone
+        # asked for another look AFTER the last verdict, which is the world
+        # before issue #128 and the one these tests were written for. A test
+        # about the gate sets the list explicitly.
+        self.request_events: list[tuple[str, str]] | None = None
+        self.timeline_reads = 0
+        self.timeline_error: BaseException | None = None
 
     def pull_request(self, owner, repo, number):
         self.pr_fetches += 1
@@ -294,6 +312,17 @@ class FakeGitHub:
         # The starved case the sweep exists for is a PR ABSENT from this
         # search; sweep tests empty it out.
         return list(self.requests)
+
+    def review_requested_at(self, owner, repo, number, login):
+        """Mirrors GitHub.review_requested_at: the newest `review_requested`
+        event for `login`, counted so a test can bound the gate's reads."""
+        self.timeline_reads += 1
+        if self.timeline_error:
+            raise self.timeline_error
+        if self.request_events is None:
+            return FRESH_REQUEST_AT
+        mine = [at for who, at in self.request_events if who == login]
+        return max(mine) if mine else None
 
 
 class FakeAlissa:
@@ -2884,13 +2913,14 @@ def test_round_number_comes_from_envelopes_when_github_overcounts(config):
     assert al.enqueued[-1]["session"].startswith("review-widgets-pr7-r2-")
 
 
-def test_empty_body_round_still_counts_via_envelope(config, no_post_grace):
+def test_empty_body_round_still_counts_via_envelope(config, no_post_grace, monkeypatch):
     # The prior round's GitHub review had an empty body (is_substantive False),
     # so github shows 0 countable reviews -- but its verdict envelope was
     # recorded. Two things follow, in order: that round has no verdict of
     # record, so the daemon posts one natively (issue #51); and the NEXT round
     # is numbered from the envelope, so it is round 2 and not a repeat of
     # round 1 (a repeat collides on the session name -> the worker wedges).
+    now = _clock(monkeypatch, start=time.time())
     pr = make_pr()
     w, gh, al = watcher(
         config, pr, [], verdict_count=1, verdict=VERDICT_REQUEST_CHANGES
@@ -2900,6 +2930,9 @@ def test_empty_body_round_still_counts_via_envelope(config, no_post_grace):
     assert posted.action is Action.POSTED
     assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
 
+    # The next round is re-requested on the same head LATER: inside the
+    # post-verdict cooldown nothing is queued on it (issue #128).
+    now["t"] += config.verdict_cooldown_s
     d = w.evaluate(OWNER, REPO, NUMBER)
     assert d.action is Action.SPAWNED
     assert d.round == 2
@@ -3881,19 +3914,23 @@ def test_a_red_rollup_verdict_does_not_converge_the_loop(config, no_post_grace):
     assert gh.removed == [], "the review request is not withdrawn"
 
 
-def test_a_later_green_round_approves_the_same_code(config, no_post_grace):
+def test_a_later_green_round_approves_the_same_code(config, no_post_grace, monkeypatch):
     """The whole point of not converging: the implementer re-requests, CI is
     green by then, the next round runs and approves — no new commit required.
 
     The re-request is explicit because it has to be: submitting round 1's
     verdict consumed the pending request (the fake models that), so the PR is
-    out of the poll set until someone asks again."""
+    out of the poll set until someone asks again. And it comes LATER: a
+    same-head round inside the post-verdict cooldown is never queued (issue
+    #128)."""
+    now = _clock(monkeypatch, start=time.time())
     st = State(config.state_db)
     w, gh, al = envelope_ahead(config, VERDICT_APPROVE, state=st)
     gh.default_rollup = rollup_of([failing_check()])
     w.evaluate(OWNER, REPO, NUMBER)  # round 1: red, REQUEST_CHANGES
     assert gh.requests == [], "the verdict consumed the review request"
 
+    now["t"] += config.verdict_cooldown_s
     gh.requests = [(OWNER, REPO, NUMBER)]  # the DEV side re-requests
     gh.default_rollup = rollup_of([CheckContext("test", "success")])
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED, "round 2 is owed"
@@ -4000,8 +4037,9 @@ def test_a_held_round_notes_the_wait_once_and_posts_no_comment(config, no_post_g
     assert st.pinged(SLUG, NUMBER, checks_hold_kind(1, "abc123"))
 
 
-def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_grace):
+def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_grace, monkeypatch):
     """Past the bound the verdict is recorded, but never as an approve."""
+    now = _clock(monkeypatch, start=time.time())
     st = State(config.state_db)
     # The PRE-SPAWN gate is off here as well as the verdict one: the rollup
     # stays pending for the whole test, so otherwise the round-2 assertion at
@@ -4021,7 +4059,9 @@ def test_a_rollup_that_never_concludes_degrades_to_a_comment(config, no_post_gra
     assert "`test`" in gh.submitted[0]["body"]
     assert "re-request review" in gh.submitted[0]["body"], "says how to re-enter"
 
-    # ...and it converges nothing, so a re-requested round 2 is owed.
+    # ...and it converges nothing, so a re-requested round 2 is owed -- once
+    # the same-head post-verdict cooldown has passed (issue #128).
+    now["t"] += impatient.verdict_cooldown_s
     gh.requests = [(OWNER, REPO, NUMBER)]
     assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
 
@@ -9320,3 +9360,250 @@ def test_a_derived_repo_is_hub_ified_on_its_first_request(tmp_path):
 
     assert al.added == [(OWNER, REPO, tmp_path)]
     assert [d.action for _, d in results] == [Action.SPAWNED]
+
+
+# -- round admission: one round per re-request (issue #128) -----------------
+#
+# The studio #1243 replay. Round 1 posted `request_changes` on head 0d9d66b7 at
+# T; the poll at T+10s still saw the reviewer in `requested_reviewers` and
+# queued round 2 on the same head, which bounced on the CR8 triage gate and
+# made the devloop spawn a second fix session on one branch.
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _replay_1243(config, monkeypatch, *, verdict_age, request_age=None, sha="0d9d66b7"):
+    """A PR at `sha` whose round-1 verdict landed `verdict_age` seconds ago,
+    with the reviewer STILL in the PR's requested_reviewers snapshot. The
+    timeline's newest `review_requested` for the login is `request_age`
+    seconds ago (None = the one that opened round 1, 14 minutes before the
+    verdict, exactly as on #1243)."""
+    now = _clock(monkeypatch, start=1_800_000_000.0)
+    verdict_at = now["t"] - verdict_age
+    requested_at = now["t"] - request_age if request_age is not None else verdict_at - 14 * 60
+    w, gh, al = watcher(
+        config,
+        make_pr(sha=sha, requested=("alissa-app",)),
+        [review("CHANGES_REQUESTED", sha=sha, at=_iso(verdict_at))],
+    )
+    gh.request_events = [("alissa-app", _iso(requested_at))]
+    return now, w, gh, al
+
+
+def test_a_stale_snapshot_ten_seconds_after_a_verdict_queues_nothing(config, monkeypatch, caplog):
+    """The incident, byte for byte: verdict at T, poll at T+10s, no newer
+    request. Inside the cooldown the timeline is not even consulted."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=10)
+
+    with caplog.at_level(logging.INFO):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert d.round == 2
+    assert "post-verdict cooldown" in d.reason
+    assert al.enqueued == [], "round 2 must not be queued on the head round 1 just judged"
+    assert gh.timeline_reads == 0, "the cooldown decides without a GitHub call"
+    assert any("inside the 120s post-verdict cooldown" in r.message for r in caplog.records)
+
+
+def test_past_the_cooldown_a_request_older_than_the_verdict_queues_nothing(config, monkeypatch, caplog):
+    """The precise rule: `requested_reviewers` is a hint; the timeline is the
+    verdict. The request that opened round 1 predates round 1's verdict, so it
+    cannot be the request for round 2."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+
+    with caplog.at_level(logging.INFO):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert al.enqueued == []
+    assert gh.timeline_reads == 1
+    lines = [r for r in caplog.records if "waiting for a fresh re-request" in r.message]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+    assert "round 2: request seen at " in lines[0].message
+    assert "is older than the last verdict at " in lines[0].message, lines[0].message
+
+
+def test_a_request_newer_than_the_verdict_admits_the_round(config, monkeypatch):
+    """#1243's genuine re-request came 9 minutes after the verdict; that one
+    opens the next round on the same head."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=9 * 60 + 30, request_age=30)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+    assert len(al.enqueued) == 1
+    assert gh.timeline_reads == 1
+
+
+def test_a_request_for_someone_else_is_not_a_request_for_this_login(config, monkeypatch):
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    gh.request_events.append(("human-reviewer", _iso(time.time() - 30)))
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+    assert al.enqueued == []
+
+
+def test_a_timeline_with_no_request_at_all_queues_nothing_and_says_so(config, monkeypatch, caplog):
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    gh.request_events = []
+
+    with caplog.at_level(logging.INFO):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert al.enqueued == []
+    assert any(
+        "no review_requested event for alissa-app" in r.message
+        and "waiting for a fresh re-request" in r.message
+        for r in caplog.records
+    )
+
+
+def test_a_moved_head_is_admitted_regardless_of_requests_or_cooldown(config, monkeypatch):
+    """Rule 3: a push re-arms exactly as before. The newest verdict judges an
+    older commit, so there is no verdict for (PR, head) and nothing to
+    compare a request against -- no timeline read is spent either."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=10)
+    gh._pr = dataclasses.replace(gh._pr, head_sha="e1e1e1e1")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.round == 2
+    assert gh.timeline_reads == 0
+
+
+def test_the_cooldown_boundary(config, monkeypatch):
+    """One second inside the window refuses with no timeline read; at the
+    window's edge the timeline decides, and a fresh request admits."""
+    now, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=119, request_age=5)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+    assert gh.timeline_reads == 0
+
+    now["t"] += 1  # exactly verdict_cooldown_s after the verdict
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert gh.timeline_reads == 1
+
+
+def test_a_zero_cooldown_leaves_the_timeline_to_decide(config, monkeypatch):
+    off = dataclasses.replace(config, verdict_cooldown_s=0)
+    _, w, gh, al = _replay_1243(off, monkeypatch, verdict_age=10, request_age=5)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert gh.timeline_reads == 1
+
+    # A fresh ledger: the round just admitted above is in flight in this one.
+    off = dataclasses.replace(off, state_path=config.state_db.with_name("second.db"))
+    _, w, gh, al = _replay_1243(off, monkeypatch, verdict_age=10)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+    assert al.enqueued == []
+
+
+def test_timeline_reads_are_one_per_pr_per_pass(config, monkeypatch):
+    """Bounded: however often a PR is evaluated within a pass, the timeline is
+    walked once; a new pass reads it again (the re-request may have landed)."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert gh.timeline_reads == 1
+
+    w.poll_once()
+    assert gh.timeline_reads == 2
+    assert al.enqueued == []
+
+
+def test_the_stale_request_line_is_announced_once_then_debug(config, monkeypatch, caplog):
+    """`stale request` must be tellable from `idle` in the log, without a PR
+    that sits with a dangling request turning every poll into an INFO line."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+
+    with caplog.at_level(logging.DEBUG):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.poll_once()
+
+    # The gate's own line names the verdict's timestamp; the pass-level
+    # decision line only names the head, so this picks out the gate's.
+    lines = [r for r in caplog.records if "older than the last verdict at " in r.message]
+    assert [r.levelno for r in lines] == [logging.INFO, logging.DEBUG]
+
+
+def test_a_daemon_posted_verdict_starts_the_cooldown_from_the_ledger(config, no_post_grace, monkeypatch):
+    """The daemon's own native post is stamped in the ledger the moment it
+    lands, so the cooldown holds even if GitHub's reviews list were still to
+    lag the POST (the fake's review record carries a fixture-era stamp, so
+    only the ledger can be what refuses here)."""
+    now = _clock(monkeypatch, start=time.time())
+    st = State(config.state_db)
+    w, gh, al = envelope_ahead(config, VERDICT_REQUEST_CHANGES, state=st)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert st.last_verdict_at(SLUG, NUMBER, "abc123") == int(now["t"])
+
+    gh.requests = [(OWNER, REPO, NUMBER)]
+    now["t"] += 10
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.action is Action.SKIPPED
+    assert "post-verdict cooldown" in d.reason
+    assert len(al.enqueued) == 0
+
+    now["t"] += config.verdict_cooldown_s
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+
+
+def test_an_observed_verdict_is_written_back_to_the_ledger(config, monkeypatch):
+    """A session's own `gh pr review` never passes through the daemon; the
+    gate records what it sees on GitHub so the ledger converges on it."""
+    now, w, gh, _ = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert w.state.last_verdict_at(SLUG, NUMBER, "0d9d66b7") == int(now["t"]) - 5 * 60
+    assert w.state.last_verdict_at(SLUG, NUMBER, "e1e1e1e1") is None
+
+
+def test_an_unreadable_timeline_admits_on_the_snapshot_and_warns(config, monkeypatch, caplog):
+    """Fail open past the cooldown: a wedged loop on every timeline read error
+    is the worse trade, and the cooldown still covers the incident's window."""
+    _, w, gh, al = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    gh.timeline_error = CommandError(["gh", "api"], 1, "HTTP 500")
+
+    with caplog.at_level(logging.WARNING):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert any("could not read the issue timeline" in r.message for r in caplog.records)
+
+
+def test_a_rate_limited_timeline_read_propagates(config, monkeypatch):
+    _, w, gh, _ = _replay_1243(config, monkeypatch, verdict_age=5 * 60)
+    gh.timeline_error = RateLimited("secondary rate limit")
+
+    with pytest.raises(RateLimited):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+
+def test_the_verdict_cooldown_default_is_pinned():
+    """Two polls at the default cadence: long enough for the request the
+    verdict consumed to be gone from every read, short enough that a genuine
+    same-head re-request waits at most one extra poll."""
+    assert DEFAULT_VERDICT_COOLDOWN_SECONDS == 120
+    assert Config(workspace_root=".").verdict_cooldown_s == DEFAULT_VERDICT_COOLDOWN_SECONDS
+
+
+def test_a_negative_verdict_cooldown_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="verdict_cooldown_s"):
+        Config.build(tmp_path, {"verdict_cooldown_s": -1})
+
+
+def test_the_verdict_cooldown_layers_like_every_other_key(tmp_path):
+    cfg = Config.build(tmp_path, {"verdict_cooldown_s": 30})
+    assert cfg.verdict_cooldown_s == 30
+    cfg = Config.build(tmp_path, {"verdict_cooldown_s": 30}, {"verdict_cooldown_s": 0})
+    assert cfg.verdict_cooldown_s == 0

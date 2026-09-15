@@ -41,6 +41,15 @@ SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"}
 # concatenates one JSON document per page and would not parse.
 PER_PAGE = 100
 COMMENT_PAGE_LIMIT = 20
+# The issue timeline grows with every label, push, comment and request over a
+# PR's life; the round-admission gate reads it for the newest
+# `review_requested` event and the bound keeps a long-lived PR from turning one
+# poll into an unbounded walk. The endpoint pages oldest-first with no
+# direction parameter, so past the bound it is the NEWEST events that go
+# unread: the gate then sees an older request than the true newest and refuses
+# a same-head round it might have admitted. Fail-closed on a PR with more than
+# 2,000 timeline events, and the warning below names it; a push still re-arms.
+TIMELINE_PAGE_LIMIT = 20
 
 # The compare endpoint's HARD cap on the `files` array, and it is a cap, not a
 # page: `files` is not paginated at all. Measured against api.github.com on
@@ -1186,6 +1195,57 @@ class GitHub:
             ],
             env=self._env(),
         )
+
+    def review_requested_at(
+        self, owner: str, repo: str, number: int, login: str
+    ) -> str | None:
+        """When `login` was most recently asked to review the PR, as the
+        timeline's `created_at` (ISO-8601), or None if it never was.
+
+        Read from `GET /repos/{owner}/{repo}/issues/{n}/timeline`, keeping only
+        `review_requested` events whose `requested_reviewer` is `login` (a team
+        request carries `requested_team` instead and is nobody's round). The
+        PR's own `requested_reviewers` array is NOT this: GitHub removes the
+        request there when the review lands, with a propagation lag the daemon
+        can read through, whereas the timeline event is immutable history --
+        the request's timestamp can be compared with the verdict's (issue
+        #128). Pages oldest-first like issue_comments, bounded by
+        TIMELINE_PAGE_LIMIT.
+        """
+        wanted = login.casefold()
+        newest: str | None = None
+        for page in range(1, TIMELINE_PAGE_LIMIT + 1):
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/issues/{number}/timeline",
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                )
+                or []
+            )
+            for event in data:
+                if (event or {}).get("event") != "review_requested":
+                    continue
+                who = ((event.get("requested_reviewer") or {}).get("login") or "")
+                if who.casefold() != wanted:
+                    continue
+                at = event.get("created_at") or ""
+                if at and (newest is None or at > newest):
+                    newest = at
+            if len(data) < PER_PAGE:
+                break
+        else:
+            log.warning(
+                "%s/%s#%d has more than %d timeline events — only the first %d "
+                "were read for review requests to %s",
+                owner, repo, number, TIMELINE_PAGE_LIMIT * PER_PAGE,
+                TIMELINE_PAGE_LIMIT * PER_PAGE, login,
+            )
+        return newest
 
     def issue_comments(self, owner: str, repo: str, number: int) -> list[IssueComment]:
         """Every issue comment on the PR, oldest first -- see COMMENT_PAGE_LIMIT

@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS grants (
     PRIMARY KEY (repo, number, comment_id)
 );
 
+-- Every verdict of record the daemon knows about, keyed by the head it
+-- judged (issue #128): the round-admission gate refuses to queue a round on a
+-- head inside `verdict_cooldown_s` of the newest verdict on it, and past the
+-- cooldown admits one only on a `review_requested` event NEWER than that
+-- verdict. Two writers: loop._close_round_natively stamps its own post the
+-- moment it lands (so the cooldown holds even while GitHub's reviews list
+-- still lags the POST), and loop.evaluate stamps every reviewer-identity
+-- review it observes on the current head (a session's own `gh pr review`
+-- never passes through the daemon). Rows are never pruned -- one per verdict
+-- ever landed -- and a lost row costs nothing: GitHub's reviews list is read
+-- alongside it and the gate takes the newer of the two.
+CREATE TABLE IF NOT EXISTS verdicts (
+    repo       TEXT    NOT NULL,
+    number     INTEGER NOT NULL,
+    head_sha   TEXT    NOT NULL,
+    posted_at  INTEGER NOT NULL,
+    review_url TEXT,
+    PRIMARY KEY (repo, number, head_sha, posted_at)
+);
+
 CREATE TABLE IF NOT EXISTS pings (
     repo      TEXT    NOT NULL,
     number    INTEGER NOT NULL,
@@ -727,6 +747,38 @@ class State:
             (repo, number, kind, int(time.time())),
         )
         self._db.commit()
+
+    def record_verdict(
+        self, repo: str, number: int, head_sha: str, posted_at: int,
+        review_url: str = "",
+    ) -> None:
+        """Remember that a verdict of record landed on `head_sha` at
+        `posted_at` (epoch seconds). Idempotent per (PR, head, timestamp), so
+        the same GitHub review observed on every poll writes one row."""
+        self._db.execute(
+            "INSERT OR IGNORE INTO verdicts "
+            "(repo, number, head_sha, posted_at, review_url) VALUES (?,?,?,?,?)",
+            (repo, number, head_sha, int(posted_at), review_url),
+        )
+        self._db.commit()
+
+    def last_verdict_at(self, repo: str, number: int, head_sha: str) -> int | None:
+        """When the newest verdict of record on this head landed (epoch
+        seconds), or None when the ledger knows of none on it."""
+        row = self._db.execute(
+            "SELECT MAX(posted_at) AS at FROM verdicts "
+            "WHERE repo=? AND number=? AND head_sha=?",
+            (repo, number, head_sha),
+        ).fetchone()
+        return int(row["at"]) if row and row["at"] is not None else None
+
+    def read_verdicts(self, limit: int | None = None) -> list[dict]:
+        """Verdict-of-record rows, newest first."""
+        return self._read_rows(
+            "SELECT repo, number, head_sha, posted_at, review_url FROM verdicts "
+            "ORDER BY posted_at DESC, number DESC",
+            limit,
+        )
 
     def escalated(self, repo: str, number: int, head_sha: str) -> bool:
         """Whether this head has been paged at all. Not the whole dedupe story

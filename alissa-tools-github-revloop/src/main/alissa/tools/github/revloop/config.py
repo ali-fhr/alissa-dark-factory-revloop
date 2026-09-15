@@ -187,6 +187,7 @@ CONFIG_KEYS = (
     "max_concurrent_sessions",
     "checks_wait_seconds",
     "checks_spawn_wait_seconds",
+    "verdict_cooldown_s",
     "review_task_miss_ttl_polls",
     "task_list_self_scope",
     "task_list_bow_id",
@@ -511,6 +512,24 @@ DEFAULT_CHECKS_WAIT_SECONDS = 30 * 60
 # still-running rollup, which is the directive-only posture.
 DEFAULT_CHECKS_SPAWN_WAIT_SECONDS = 15 * 60
 
+# How long, after a verdict lands on a head, NO round may be queued on that same
+# head -- whatever the PR's `requested_reviewers` snapshot says (issue #128).
+#
+# GitHub consumes a review request the moment the requested identity submits a
+# review, but not atomically with the daemon's reads: on studio #1243 a
+# `request_changes` verdict landed at 14:35:32 and the poll ten seconds later
+# still saw the reviewer in `requested_reviewers`, queued round 2 on the SAME
+# head, and that phantom round bounced on the CR8 triage gate -- which made the
+# devloop spawn a second fix session on one branch. The cooldown is the blunt
+# guard against that propagation lag: two polls' worth at the default cadence,
+# long enough for the request the verdict consumed to be gone from every read.
+# The precise guard is the timeline check in loop._admit_round, which admits a
+# same-head round only on a `review_requested` event NEWER than the verdict;
+# the cooldown spares that check a GitHub call in exactly the window where the
+# stale snapshot is most likely. 0 disables the cooldown and leaves the timeline
+# check to decide alone.
+DEFAULT_VERDICT_COOLDOWN_SECONDS = 120
+
 # How many polls a PR with NO review task may be taken on trust before the
 # daemon searches the task corpus for one again (issue #87).
 #
@@ -749,6 +768,12 @@ class Config:
     # re-decided by the poll like every other owed round, so there is no second
     # timer to configure.
     checks_spawn_wait_seconds: int = DEFAULT_CHECKS_SPAWN_WAIT_SECONDS
+
+    # How long after a verdict lands on a head no round may be queued on that
+    # same head, regardless of the PR's `requested_reviewers` snapshot; see
+    # DEFAULT_VERDICT_COOLDOWN_SECONDS. 0 is legal and means "no cooldown": the
+    # timeline check alone decides whether a same-head round is admitted.
+    verdict_cooldown_s: int = DEFAULT_VERDICT_COOLDOWN_SECONDS
 
     # How many polls a PR with no review task is taken on trust before the
     # corpus is searched again; see DEFAULT_REVIEW_TASK_MISS_TTL_POLLS. Floor 1
@@ -1103,6 +1128,10 @@ class Config:
                 f"checks_spawn_wait_seconds must be >= 0, got {spawn_wait}"
             )
 
+        cooldown = int(raw.get("verdict_cooldown_s", cls.verdict_cooldown_s))
+        if cooldown < 0:
+            raise ValueError(f"verdict_cooldown_s must be >= 0, got {cooldown}")
+
         miss_ttl = int(
             raw.get("review_task_miss_ttl_polls", cls.review_task_miss_ttl_polls)
         )
@@ -1171,6 +1200,7 @@ class Config:
             max_concurrent_sessions=max_sessions,
             checks_wait_seconds=checks_wait,
             checks_spawn_wait_seconds=spawn_wait,
+            verdict_cooldown_s=cooldown,
             review_task_miss_ttl_polls=miss_ttl,
             task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
             task_list_bow_id=bow_id,

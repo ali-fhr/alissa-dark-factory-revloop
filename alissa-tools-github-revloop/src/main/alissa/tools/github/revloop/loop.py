@@ -16,6 +16,7 @@ import secrets
 import sqlite3
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -1245,6 +1246,26 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
 
+def _epoch(stamp: str) -> float | None:
+    """A GitHub ISO-8601 timestamp (`2026-09-15T14:35:32Z`) as epoch seconds,
+    or None for an empty or unparseable one. A naive stamp is read as UTC,
+    which is what GitHub emits."""
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _stamp(epoch: float) -> str:
+    """The inverse of _epoch, for log lines: UTC, seconds, `Z`."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def grant_activity_kind(comment_id: int) -> str:
     """The ping-ledger kind that dedupes ONE grant's activity line.
 
@@ -1687,6 +1708,18 @@ class ReviewWatcher:
         # has listed this pass (the preflight refresh, or a sweep whose list
         # failed), and the refresh lists for itself.
         self._pass_roster: list[ManagedSession] | None = None
+        # (repo full name, PR number) -> when the reviewer login was most
+        # recently asked to review that PR, per the issue timeline (an ISO
+        # stamp, or None for never) -- the round-admission gate's one GitHub
+        # read, memoised so a PR costs at most one timeline walk per pass
+        # (issue #128). Cleared with the other per-pass memos in poll_once.
+        self._pass_requests: dict[tuple[str, int], str | None] = {}
+        # (repo full name, PR number) -> (head, verdict epoch) of the last
+        # stale request the gate announced at INFO for that PR, so the line
+        # goes out once per ignored request and repeats at debug while the
+        # same request keeps being seen. In-memory on purpose: a restart
+        # costs one repeated line, not a ledger write per poll.
+        self._ignored_requests: dict[tuple[str, int], tuple[str, float]] = {}
         # (repo full name, PR number) -> where that round sits in the spawn
         # queue, from the first pass that deferred it. Cross-pass and
         # in-memory: it is a FAIRNESS ORDER, not a decision the daemon must
@@ -2152,6 +2185,17 @@ class ReviewWatcher:
             if deferred is not None:
                 return deferred
 
+        # THE ROUND-ADMISSION GATE (issue #128): a round on a head that already
+        # carries a verdict needs FRESH evidence of a request -- a
+        # `review_requested` event newer than that verdict -- and never starts
+        # inside the post-verdict cooldown at all. Below the in-flight and
+        # stale-round reads (a running round costs no timeline call) and above
+        # every other refusal, because a round this gate turns away must
+        # consume neither a rollup nor a place in the slot queue.
+        refused = self._admit_round(pr, my_reviews, round_)
+        if refused is not None:
+            return refused
+
         # THE SPAWN GATE, and it sits here -- past every branch that decides
         # WHETHER a round is owed, immediately before the one that acts.
         # Upstream of it the loop is only reading; downstream it starts an
@@ -2288,6 +2332,161 @@ class ReviewWatcher:
             f"(waiting {int(time.monotonic() - wait.since)}s)",
             round_,
         )
+
+    # -- round admission (issue #128) ----------------------------------------
+
+    def _admit_round(
+        self, pr: PullRequest, my_reviews: list[Review], round_: int
+    ) -> Decision | None:
+        """Refuse a round the PR's review-request snapshot alone would start,
+        or None to carry on.
+
+        The search set is `review-requested:@me`, and the loop's edge trigger
+        has always been GitHub consuming that request when the requested
+        identity submits a review. That consumption is not atomic with the
+        daemon's reads: on studio #1243 round 1 posted `request_changes` at
+        14:35:32 on head 0d9d66b7, the poll at 14:35:42 still found the PR in
+        the search with the reviewer in `requested_reviewers`, and queued round
+        2 on the same head -- a round nobody asked for, which then bounced on
+        the CR8 triage gate and made the devloop spawn a second fix session on
+        one branch. `requested_reviewers` is therefore a HINT here, never the
+        verdict. A round on head H is admitted only when
+
+        (a) no verdict of record exists for (PR, H) -- a push re-arms exactly
+            as before, since the newest review then judges an older commit; or
+        (b) the issue timeline shows a `review_requested` event for the
+            reviewer login NEWER than the last verdict on H.
+
+        And inside `verdict_cooldown_s` of that verdict nothing is admitted on
+        H at all, whatever the timeline says: the cooldown alone would have
+        prevented #1243, and (b) is what makes the gate correct rather than
+        merely rare. The verdict's timestamp is the newer of GitHub's own
+        review record and the ledger's (the daemon stamps its native posts the
+        moment they land, before GitHub's reviews list catches up).
+
+        A refused round is a SKIPPED decision and holds no queue place, like
+        the other pre-start refusals. Each ignored request is announced once at
+        INFO -- "stale request" must be tellable from "idle" in the log -- and
+        repeated at debug while the same request keeps being seen.
+        """
+        verdict_at = self._last_verdict_at(pr, my_reviews)
+        if verdict_at is None:
+            return None
+
+        key = (pr.full_name, pr.number)
+        since = time.time() - verdict_at
+        cooldown = self.config.verdict_cooldown_s
+        # A verdict stamped in the FUTURE (clock skew between GitHub and this
+        # host) is not inside the window measured from it; the timeline check
+        # below still decides, so nothing is lost by not guessing.
+        if 0 <= since < cooldown:
+            self._waiting.pop(key, None)
+            log.info(
+                "%s round %d: the last verdict on head %s landed %.0fs ago (%s) "
+                "— inside the %ds post-verdict cooldown, not queuing whatever "
+                "the review-request snapshot says",
+                pr.slug, round_, pr.head_sha[:8], since, _stamp(verdict_at), cooldown,
+            )
+            return Decision(
+                Action.SKIPPED,
+                f"head {pr.head_sha[:8]} had a verdict {int(since)}s ago — inside "
+                f"the {cooldown}s post-verdict cooldown",
+                round_,
+            )
+
+        requested = self._fresh_request_at(pr)
+        if requested is None:
+            # The timeline could not be read (logged there). The snapshot is
+            # all that is left, and past the cooldown it is the pre-#128
+            # trigger: a wedged loop on every read failure is the worse trade.
+            return None
+        request_at = _epoch(requested)
+        if request_at is not None and request_at > verdict_at:
+            return None
+
+        self._waiting.pop(key, None)
+        seen = (
+            f"request seen at {requested}"
+            if request_at is not None
+            else f"no review_requested event for {self.github.login} on the timeline"
+        )
+        message = (
+            "%s round %d: %s is older than the last verdict at %s on head %s "
+            "— waiting for a fresh re-request"
+        )
+        args = (pr.slug, round_, seen, _stamp(verdict_at), pr.head_sha[:8])
+        if self._ignored_requests.get(key) == (pr.head_sha, verdict_at):
+            log.debug(message, *args)
+        else:
+            self._ignored_requests[key] = (pr.head_sha, verdict_at)
+            log.info(message, *args)
+        return Decision(
+            Action.SKIPPED,
+            f"{seen} is older than the last verdict on head {pr.head_sha[:8]} "
+            f"— waiting for a fresh re-request",
+            round_,
+        )
+
+    def _last_verdict_at(
+        self, pr: PullRequest, my_reviews: list[Review]
+    ) -> float | None:
+        """When the newest verdict of record on the CURRENT head landed (epoch
+        seconds), or None when no reviewer-identity review judges this head.
+
+        Two sources, the newer wins. GitHub's reviews list is the authority
+        for a verdict the reviewer SESSION posted (it never passes through the
+        daemon), and the newest review is the one that matters: judging an
+        older commit, it is not a verdict on this head at all. The ledger
+        covers the daemon's own native posts during the window before GitHub's
+        list shows them. A GitHub-observed verdict is written back to the
+        ledger as telemetry, so the ledger converges on GitHub's truth and a
+        row lost either way costs nothing.
+        """
+        newest = my_reviews[-1] if my_reviews else None
+        seen: float | None = None
+        if newest is not None and newest.commit_id and newest.commit_id == pr.head_sha:
+            seen = _epoch(newest.submitted_at)
+            if seen is not None:
+                self.state._write_telemetry(
+                    lambda: self.state.record_verdict(
+                        pr.full_name, pr.number, pr.head_sha, int(seen or 0), newest.url
+                    ),
+                    f"recording the verdict on {pr.slug} at {pr.head_sha[:8]}",
+                )
+        ledger = self.state.last_verdict_at(pr.full_name, pr.number, pr.head_sha)
+        candidates = [at for at in (seen, ledger) if at is not None]
+        return max(candidates) if candidates else None
+
+    def _fresh_request_at(self, pr: PullRequest) -> str | None:
+        """When this login was most recently asked to review the PR, from the
+        issue timeline, memoised for the pass: one timeline walk per candidate
+        PR per poll, however many times the PR is evaluated. None when the
+        read failed (a RateLimited still propagates to run_forever's backoff,
+        exactly as every other read path lets it)."""
+        key = (pr.full_name, pr.number)
+        if key in self._pass_requests:
+            return self._pass_requests[key]
+        try:
+            requested = self.github.review_requested_at(
+                pr.owner, pr.repo, pr.number, self.github.login
+            )
+        except RateLimited:
+            raise
+        except Exception as exc:
+            log.warning(
+                "%s: could not read the issue timeline for review requests to "
+                "%s (%s) — admitting the round on the review-request snapshot "
+                "alone, which is what the post-verdict cooldown guards",
+                pr.slug, self.github.login, exc,
+            )
+            requested = None
+        else:
+            # A timeline with no request at all is a real answer -- the
+            # snapshot said "requested" and history says nobody did -- and it
+            # is memoised as the empty string so the miss is not re-read.
+            requested = requested or ""
+        self._pass_requests[key] = requested
+        return requested
 
     def _refused_before_start(
         self, pr: PullRequest, round_: int, task: Task | None
@@ -3050,6 +3249,12 @@ class ReviewWatcher:
         )
         self.state.record_verdict_post(
             pr.full_name, pr.number, round_, url, verdict=verdict
+        )
+        # The round-admission gate's cooldown is measured from HERE for the
+        # daemon's own posts, so it holds even while GitHub's reviews list
+        # still lags the POST it just accepted (issue #128).
+        self.state.record_verdict(
+            pr.full_name, pr.number, judged, int(time.time()), url or ""
         )
         log.info(
             "%s round %d closed: native %s review submitted as %s (%s)%s",
@@ -4902,6 +5107,7 @@ class ReviewWatcher:
         self._session_census = None
         self._census_probed = self._census_warned = False
         self._pass_roster = None
+        self._pass_requests = {}
 
         # THE LEDGER GATE (issue #62, PR #63 round-1 blocker). Nothing below
         # may run when the ledger cannot record what it does.
