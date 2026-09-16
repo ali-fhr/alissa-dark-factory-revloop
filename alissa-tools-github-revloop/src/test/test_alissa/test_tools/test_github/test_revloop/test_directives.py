@@ -49,6 +49,14 @@ def test_directive_demands_registered_review_and_a_verdict(template):
     assert "merge-readiness" in text
     assert "auto | operator" in text
     assert "without the line posts as `operator`" in text
+    # (6) and the session's OWN native review must END with the bare trailer
+    # (issue #134): on the normal path the session posts the verdict itself,
+    # so nothing else can put the line where the merge edge reads it.
+    assert "merge-readiness: auto" in text
+    assert "merge-readiness: operator — <one-line reason>" in text
+    assert "last non-empty line" in text
+    assert "byte-equal" in text
+    assert "`auto` only on an approve of the reviewed head" in text
 
 
 @pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE])

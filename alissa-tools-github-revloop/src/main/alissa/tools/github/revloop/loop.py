@@ -23,7 +23,9 @@ from pathlib import Path
 
 from .alissa import (
     READINESS_AUTO,
+    READINESS_MISSING,
     READINESS_OPERATOR,
+    READINESS_TRAILER_LABEL,
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
     VerdictEnvelope,
@@ -33,6 +35,7 @@ from .alissa import (
     Task,
     TaskDetail,
     is_review_task_for,
+    parse_trailer,
     session_repo_slug,
 )
 from .alissa_client import AlissaClient
@@ -413,7 +416,11 @@ NATIVE_VERDICT_BODY = (
 # an approve the checks gate downgraded carries nothing), and an envelope
 # with no parseable line fails CLOSED to `operator`, with a reason that tells
 # the operator why the merge waited on them.
-READINESS_TRAILER_LABEL = "Merge-Readiness:"
+#
+# The label and the grammar live in alissa.py (READINESS_TRAILER_LABEL,
+# parse_trailer): the emitter below builds from the label the regex is built
+# from, and _observe_session_readiness reads a session's own review with that
+# same regex (issue #134) -- one grammar, two writers, no drift.
 READINESS_MISSING_REASON = "envelope carries no Merge-Readiness line"
 
 
@@ -644,15 +651,28 @@ _RECORD_THE_CAP = (
     "from a stale template default. "
 )
 
-# The merge-readiness line (issue #130). The verdict envelope is where the
-# reviewer's judgment lives; the daemon copies it onto the native review as a
-# trailer the merge edge reads, and an envelope without the line posts as
-# `operator` -- so a reviewer who skips it has silently withheld auto-merge.
+# The merge-readiness line (issue #130, #134). The verdict envelope is where
+# the reviewer's judgment lives. On the NORMAL path the session posts its own
+# native review, and that body passes through nothing -- so the session must
+# write the trailer itself, as the bare last non-empty line, in the consumer's
+# grammar (studio #1258 wrote it inside backticks mid-sentence and the merge
+# edge held the approve). The daemon copies the envelope's line onto a native
+# review only on the rounds where it posts the verdict itself, and an
+# envelope without the line posts as `operator` -- so a reviewer who skips it
+# has silently withheld auto-merge. The two grammar sentences are the
+# README's ("The `Merge-Readiness` trailer on a native approve"), verbatim.
 _MERGE_READINESS_LINE = (
     "Your verdict envelope MUST carry the skill's `- **Merge-Readiness:** auto | "
-    "operator — <reason>` line — the daemon copies it onto the native review as "
-    "the `Merge-Readiness:` trailer the merge edge reads, and an envelope "
-    "without the line posts as `operator`. "
+    "operator — <reason>` line, AND your OWN native review (every `gh pr review` "
+    "form and the reviews-API POST alike) MUST END with the bare line "
+    "`Merge-Readiness: auto` or `Merge-Readiness: operator — <one-line reason>` "
+    "as its last non-empty line — plain text at the start of the line, not in "
+    "backticks, not bold, not mid-sentence — byte-equal in value and reason to "
+    "the envelope's line; `auto` only on an APPROVE of the reviewed head. The "
+    "merge edge reads that line off the review and holds an approve without "
+    "it. The daemon copies the envelope's line onto a native review only when "
+    "it posts the verdict itself, and an envelope without the line posts as "
+    "`operator`. "
 )
 
 # -- the reviewer session's own CI gate (issue #84) ---------------------------
@@ -2191,6 +2211,14 @@ class ReviewWatcher:
         # "that round has no native verdict", producing a duplicate post over a
         # session that closed its own round correctly.
         owed = completed - self.state.abandoned_rounds(pr.full_name, number)
+
+        # Observation only (issue #134): a session-posted APPROVE on the
+        # current head is looked at once for the Merge-Readiness trailer the
+        # merge edge reads. Above the native post and convergence because it
+        # decides nothing -- it reports; and it must run on the pass that
+        # converges, since a converged PR leaves the search set.
+        self._observe_session_readiness(pr, my_reviews, completed)
+
         if task is not None and owed > native:
             # Terminal for this pass either way. On a landed post the review
             # request it consumed drops the PR out of the search, so
@@ -4040,6 +4068,95 @@ class ReviewWatcher:
             round_,
             session=session,
             deferred=True,
+        )
+
+    def _observe_session_readiness(
+        self, pr: PullRequest, my_reviews: list[Review], round_: int
+    ) -> None:
+        """Say whether the session's own APPROVE carries the trailer (issue #134).
+
+        The merge edge reads `Merge-Readiness:` off the reviewer identity's
+        APPROVE on the current head. On the normal path that review is the
+        SESSION's -- posted by its own `gh pr review`, passing through nothing
+        here -- so a body without the bare line (studio #1258 had it inside
+        backticks mid-sentence) is an approve the edge holds, silently. The
+        fix is the skill's and the directive's; this is the daemon SEEING it:
+        one WARNING and one activity row per (PR, head) when the trailer is
+        missing, the `readiness=auto|operator` term when it parses.
+
+        Observation only, by contract: never a review posted, never the
+        session's review edited, never a round re-run. Scoped to the newest
+        reviewer-identity APPROVED review on the current head -- the review the
+        merge edge reads, whatever the identity wrote after it (a round-k
+        reviewer that fell back to `--comment`, a follow-up write-up) -- and
+        NOT the daemon's own post: that one is emitter-built and already
+        reported `readiness=` at post time (a second row for it would be
+        noise). Once per (PR, head) via the ledger flag beside the verdicts
+        row: a new head re-arms, a re-poll of the same head is silent.
+
+        Emit, then record, like every other activity note here: the ledger
+        flag lands only after the activity row did, so a transient comment
+        failure retries next poll instead of losing the row; and never under
+        `--dry-run`, where the row cannot land and a durable flag would let a
+        diagnostic pass silence the daemon it was run to diagnose (see
+        `_warn_identity_drift`). The flag rides a verdict row that
+        `last_verdict_at` also reads, so it is stamped only with the review's
+        own time -- an unreadable GitHub stamp keeps the log line and skips
+        both the row and the flag rather than inventing a verdict at "now".
+        """
+        approves = [
+            r for r in my_reviews
+            if r.state == "APPROVED" and r.commit_id and r.commit_id == pr.head_sha
+        ]
+        newest = approves[-1] if approves else None
+        if newest is None or newest.verdict_round is not None:
+            return
+        if self.state.readiness_observed(pr.full_name, pr.number, pr.head_sha) is not None:
+            return
+
+        value, reason = parse_trailer(newest.body)
+        head7 = pr.head_sha[:7]
+        if value is None:
+            readiness = READINESS_MISSING
+            log.warning(
+                "%s approve at %s by %s carries no Merge-Readiness trailer — the "
+                "merge edge will hold it; the session must end its review body "
+                "with the line (see directive)",
+                pr.slug, head7, self.github.login,
+            )
+            line = (
+                f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
+                f"`{self.github.login}` at `{head7}` — readiness=missing (no "
+                f"`{READINESS_TRAILER_LABEL}` trailer on the review body; the merge "
+                f"edge will hold it)"
+            )
+        else:
+            readiness = value
+            term = f"{value} — {reason}" if reason else value
+            log.info(
+                "%s approve at %s by %s carries readiness=%s",
+                pr.slug, head7, self.github.login, term,
+            )
+            line = (
+                f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
+                f"`{self.github.login}` at `{head7}` — readiness={term}"
+            )
+
+        posted_at = _epoch(newest.submitted_at)
+        if posted_at is None:
+            # No stamp to key a verdict row on; the log line above is the
+            # whole report for this poll, and the next poll says it again.
+            log.debug(
+                "%s: approve at %s has no readable submitted_at; readiness row "
+                "and flag skipped", pr.slug, head7,
+            )
+            return
+        if not self._append_activity(pr, line):
+            return  # retried next poll, like every other activity note
+        if self.config.dry_run:
+            return
+        self.state.note_readiness(
+            pr.full_name, pr.number, pr.head_sha, int(posted_at), readiness, newest.url,
         )
 
     def _convergence_reason(

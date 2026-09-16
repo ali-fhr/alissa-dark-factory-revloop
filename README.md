@@ -362,14 +362,55 @@ Merge-Readiness: operator — <one-line reason>
 
 The judgment is the reviewer session's, not the daemon's: the
 `alissa-code-review` verdict envelope carries a
-`- **Merge-Readiness:** auto | operator — <reason>` line, and the daemon
+`- **Merge-Readiness:** auto | operator — <reason>` line, and the trailer
 **carries** it onto the native review so a consumer (orcloop's opt-in merge
 edge, which merges only on an approve of the current head that reads `auto`)
 can parse it without reading Alissa. The grammar a consumer should use, and the
 one this daemon's tests pin, is
 `^Merge-Readiness:[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$` —
-first match wins, value case-sensitive. The daemon emits exactly one such line,
-and:
+first match wins, value case-sensitive.
+
+There are **two paths** onto the review, and which one a round takes decides
+who writes the line (issue #134):
+
+- **session-posted** — the normal path. The reviewer session submits its own
+  native review (`gh pr review`, or the reviews-API POST), and that body passes
+  through nothing in this daemon. The session writes the trailer itself, per
+  the skill and per both round directives: the bare `Merge-Readiness: auto` or
+  `Merge-Readiness: operator — <one-line reason>` line as the review body's
+  **last non-empty line**, plain text at the start of the line — not inside
+  backticks, not bold, not mid-sentence — and byte-equal in value and reason
+  to the envelope's line. The daemon **verifies and warns**: the first poll
+  that sees a reviewer-identity `APPROVE` on the current head reads the body
+  of the **newest such approve** — the review the merge edge reads, whatever
+  the identity posted after it — with that same grammar and logs
+  `readiness=auto|operator` (log line and an activity-comment row) when it
+  parses. When it does not, it logs **one `WARNING` per (PR, head)** —
+
+  ```
+  <owner>/<repo>#<n> approve at <head7> by <login> carries no Merge-Readiness trailer — the merge edge will hold it; the session must end its review body with the line (see directive)
+  ```
+
+  — and appends one `readiness=missing` row to the activity comment. That is
+  the whole of it: the daemon never posts a review on the session's behalf,
+  never edits the session's review, never re-runs the round. A missing
+  trailer is a **hold on the merge edge**, not a review failure — the approve
+  stands, the PR converges, and the merge waits for an operator. The
+  observation is made once per head (a flag beside the verdict's row in the
+  `verdicts` ledger table, written only after the activity row landed, so a
+  failed row is retried next poll rather than lost — and never under
+  `--dry-run`, which reports but touches no ledger); a push re-arms it, a
+  re-poll of the same head is silent. `REQUEST_CHANGES` and `COMMENT` reviews are never checked — `auto`
+  on anything but an `APPROVE` is nothing a consumer should see, so nothing
+  but an `APPROVE` owes the line;
+- **daemon-posted** — the rounds where the session did not submit its own
+  review and the daemon closes the round natively from the envelope. The
+  daemon **copies the envelope's line** onto its native review as the trailer,
+  and emits exactly one such line, per the rules below.
+
+The emitter and the check share one regex (`parse_trailer`), so a line the
+daemon writes is by construction a line it — and the consumer — reads back.
+On the daemon-posted path:
 
 - **carried from the envelope; missing = operator.** An envelope with no
   parseable line (absent, `Auto` capitalised, any other word) posts
@@ -383,7 +424,8 @@ and:
   characters at the parser, so it can never fence the marker away;
 - there is no config key. The trailer is information the reviewer already
   produced, not a lever. The round-close log line carries `readiness=…` and
-  the activity comment's round row names it.
+  the activity comment's round row names it, exactly as the session-posted
+  observation does.
 
 ### Never approve a red head: the CI checks gate
 
@@ -594,6 +636,8 @@ ledger's `verdicts` table: the daemon stamps its native posts the moment they
 land (so the cooldown holds even while GitHub's reviews list still lags the
 POST), and stamps every reviewer-identity review it observes on the current
 head (a session's own `gh pr review` never passes through the daemon). The
+same row carries the `Merge-Readiness` observation flag for a session-posted
+approve (see the trailer section above). The
 timeline is read **once per candidate PR per poll**, memoised for the pass,
 and only for a PR that already carries a verdict on its head past the
 cooldown. A timeline that cannot be read — an error, or more than 2,000

@@ -106,12 +106,20 @@ CREATE TABLE IF NOT EXISTS grants (
 -- never passes through the daemon). Rows are never pruned -- one per verdict
 -- ever landed -- and a lost row costs nothing: GitHub's reviews list is read
 -- alongside it and the gate takes the newer of the two.
+--
+-- `readiness` (issue #134) is the once-per-(PR, head) flag for the
+-- Merge-Readiness observation: NULL until the loop has looked at a
+-- session-posted APPROVE on that head, then `auto` / `operator` / `missing`
+-- -- the last being the one the loop WARNs about, once, because the merge
+-- edge will hold an approve with no trailer. Lives beside the verdict row
+-- rather than in a table of its own: it is a fact about that verdict.
 CREATE TABLE IF NOT EXISTS verdicts (
     repo       TEXT    NOT NULL,
     number     INTEGER NOT NULL,
     head_sha   TEXT    NOT NULL,
     posted_at  INTEGER NOT NULL,
     review_url TEXT,
+    readiness  TEXT,
     PRIMARY KEY (repo, number, head_sha, posted_at)
 );
 
@@ -349,6 +357,9 @@ _ADDED_COLUMNS = {
         ("checks_held_state", "TEXT"),
         ("checks_pending_at", "INTEGER"),
         ("verdict", "TEXT"),
+    ),
+    "verdicts": (
+        ("readiness", "TEXT"),
     ),
 }
 
@@ -777,6 +788,51 @@ class State:
             f"recording the verdict on {repo}#{number} at {head_sha[:8]}",
         )
 
+    def readiness_observed(self, repo: str, number: int, head_sha: str) -> str | None:
+        """The Merge-Readiness observation already made on this head
+        (`auto` / `operator` / `missing`), or None when the loop has not yet
+        looked at a session-posted APPROVE on it (issue #134). The once-per-
+        (PR, head) guard for the WARNING and its activity row."""
+        row = self._db.execute(
+            "SELECT readiness FROM verdicts "
+            "WHERE repo=? AND number=? AND head_sha=? AND readiness IS NOT NULL "
+            "ORDER BY posted_at DESC LIMIT 1",
+            (repo, number, head_sha),
+        ).fetchone()
+        return str(row["readiness"]) if row and row["readiness"] is not None else None
+
+    def note_readiness(
+        self, repo: str, number: int, head_sha: str, posted_at: int,
+        readiness: str, review_url: str = "",
+    ) -> bool:
+        """TELEMETRY: flag the verdict row for `head_sha` at `posted_at` with
+        the readiness the loop observed on it, creating the row if GitHub's
+        list showed the review before the ledger did (issue #134). Absorbed
+        like note_observed_verdict: a flag the ledger cannot take costs one
+        repeated WARNING on the next poll, not a wrong decision -- nothing
+        downstream reads the `readiness` column but the dedupe. The ROW is
+        another matter: it is a verdict row, and `last_verdict_at` reads its
+        `posted_at` for the post-verdict cooldown, so `posted_at` must be the
+        review's own GitHub stamp -- never a synthetic "now". The caller skips
+        the write when it has no such stamp. True on success."""
+        def write() -> None:
+            self._db.execute(
+                "INSERT OR IGNORE INTO verdicts "
+                "(repo, number, head_sha, posted_at, review_url) VALUES (?,?,?,?,?)",
+                (repo, number, head_sha, int(posted_at), review_url),
+            )
+            self._db.execute(
+                "UPDATE verdicts SET readiness=? "
+                "WHERE repo=? AND number=? AND head_sha=? AND posted_at=?",
+                (readiness, repo, number, head_sha, int(posted_at)),
+            )
+            self._db.commit()
+
+        return self._write_telemetry(
+            write,
+            f"recording readiness={readiness} on {repo}#{number} at {head_sha[:8]}",
+        )
+
     def last_verdict_at(self, repo: str, number: int, head_sha: str) -> int | None:
         """When the newest verdict of record on this head landed (epoch
         seconds), or None when the ledger knows of none on it."""
@@ -794,7 +850,7 @@ class State:
         with the `verdicts` table this raises `no such table`, not `[]` --
         whoever wires it into the console first should guard for that."""
         return self._read_rows(
-            "SELECT repo, number, head_sha, posted_at, review_url FROM verdicts "
+            "SELECT repo, number, head_sha, posted_at, review_url, readiness FROM verdicts "
             "ORDER BY posted_at DESC, number DESC",
             limit,
         )

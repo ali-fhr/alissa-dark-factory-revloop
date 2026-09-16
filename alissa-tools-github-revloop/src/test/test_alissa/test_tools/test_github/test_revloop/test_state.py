@@ -652,6 +652,63 @@ def test_an_unwritable_derived_set_never_raises_at_the_caller(tmp_path, caplog):
     assert "readonly database" in caplog.text
 
 
+# -- the Merge-Readiness observation flag (issue #134) -----------------------
+
+
+def test_readiness_flag_is_null_until_observed_then_once_per_head(ledger):
+    assert ledger.readiness_observed(REPO, 7, "abc123") is None
+    ledger.record_verdict(REPO, 7, "abc123", 1_000, "url")
+    assert ledger.readiness_observed(REPO, 7, "abc123") is None, "a verdict row alone is not an observation"
+
+    assert ledger.note_readiness(REPO, 7, "abc123", 1_000, "missing", "url") is True
+    assert ledger.readiness_observed(REPO, 7, "abc123") == "missing"
+    assert ledger.readiness_observed(REPO, 7, "def456") is None, "keyed by head"
+    assert ledger.read_verdicts()[0]["readiness"] == "missing"
+
+
+def test_readiness_flag_creates_the_verdict_row_when_github_showed_it_first(ledger):
+    """The observation can run before the round-admission read stamps the
+    row (a converged PR never reaches that read), so the flag write inserts
+    the row it flags."""
+    assert ledger.note_readiness(REPO, 7, "abc123", 2_000, "auto", "url") is True
+    assert ledger.last_verdict_at(REPO, 7, "abc123") == 2_000
+    assert ledger.readiness_observed(REPO, 7, "abc123") == "auto"
+    # The later telemetry stamp of the same review is the same row.
+    ledger.note_observed_verdict(REPO, 7, "abc123", 2_000, "url")
+    assert len([r for r in ledger.read_verdicts() if r["head_sha"] == "abc123"]) == 1
+    assert ledger.readiness_observed(REPO, 7, "abc123") == "auto"
+
+
+def test_readiness_flag_write_is_absorbed_telemetry(ledger, caplog):
+    """Like note_observed_verdict: a flag the ledger cannot take is a WARN,
+    never a raise -- the observation is telemetry about a review GitHub
+    already holds."""
+    ledger._db.execute("DROP TABLE verdicts")
+
+    with caplog.at_level("WARNING"):
+        assert ledger.note_readiness(REPO, 7, "abc123", 3_000, "missing") is False
+    assert "recording readiness=missing on acme/widgets#7 at abc123" in caplog.text
+
+
+def test_migrates_the_readiness_column_onto_a_pre_134_verdicts_table(tmp_path):
+    path = tmp_path / "state.db"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE verdicts (repo TEXT NOT NULL, number INTEGER NOT NULL, "
+        "head_sha TEXT NOT NULL, posted_at INTEGER NOT NULL, review_url TEXT, "
+        "PRIMARY KEY (repo, number, head_sha, posted_at))"
+    )
+    db.execute("INSERT INTO verdicts VALUES (?,?,?,?,?)", (REPO, 7, "abc123", 1_000, "u"))
+    db.commit()
+    db.close()
+
+    with State(path) as st:
+        assert st.readiness_observed(REPO, 7, "abc123") is None
+        assert st.note_readiness(REPO, 7, "abc123", 1_000, "operator") is True
+        assert st.readiness_observed(REPO, 7, "abc123") == "operator"
+        assert st.last_verdict_at(REPO, 7, "abc123") == 1_000
+
+
 def test_an_observed_verdict_write_back_is_absorbed_but_a_native_post_is_not(ledger, caplog):
     """Round-1 [minor]: the absorb lives in State. `note_observed_verdict` is
     telemetry (GitHub already holds the record) and swallows the database
