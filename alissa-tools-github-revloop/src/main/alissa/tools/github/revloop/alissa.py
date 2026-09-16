@@ -233,6 +233,53 @@ _VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The envelope's merge-readiness judgment (issue #130). The alissa-code-review
+# skill writes it as one list line in the verdict envelope:
+#   - **Merge-Readiness:** auto
+#   - **Merge-Readiness:** operator — touches convex/schema.ts
+# Tolerant of the markdown around the label -- an optional bullet, optional
+# `**` bold around the label (with the colon inside or outside it), optional
+# bold around the value -- but NOT of the value's case: `Auto` is not a
+# judgment this daemon will carry, so it reads as missing and fails closed to
+# `operator` downstream. Line-anchored, first match wins, like the consumer's
+# own grammar; the reason runs to the end of the line and no further.
+READINESS_AUTO = "auto"
+READINESS_OPERATOR = "operator"
+_READINESS_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*Merge-Readiness[ \t]*:?[ \t]*(?:\*\*)?"
+    r"[ \t]*:?[ \t]*(?:\*\*)?(auto|operator)\b(?:\*\*)?"
+    r"(?:[ \t]*[—–-][ \t]*(.*?))?[ \t]*$",
+    re.MULTILINE,
+)
+
+# The reason lands in a GitHub review body (as a line-anchored trailer) and in
+# a log line, so it is bounded and flattened at the parser: one line, no
+# backticks (a fence would swallow the trailer and everything after it), and
+# no more than this many characters.
+MAX_READINESS_REASON_CHARS = 200
+
+
+def clean_readiness_reason(text: object) -> str:
+    """Flatten a Merge-Readiness reason to one bounded, backtick-free line."""
+    if not isinstance(text, str):
+        return ""
+    flat = " ".join(text.replace("`", "").split())
+    return flat[:MAX_READINESS_REASON_CHARS].rstrip()
+
+
+def parse_readiness(blob: object) -> "tuple[str | None, str]":
+    """`(value, reason)` from the first Merge-Readiness line in `blob`.
+
+    `value` is READINESS_AUTO / READINESS_OPERATOR, or None when no line
+    parses; `reason` is the cleaned trailing text (empty when there is none).
+    """
+    if not isinstance(blob, str):
+        return (None, "")
+    match = _READINESS_RE.search(blob)
+    if match is None:
+        return (None, "")
+    return (match.group(1), clean_readiness_reason(match.group(2)))
+
 
 @dataclass(frozen=True)
 class Task:
@@ -387,6 +434,23 @@ def _task_from_row(row: object) -> "Task | None":
         title=title if isinstance(title, str) else "",
         status=status if isinstance(status, str) else "",
     )
+
+
+@dataclass(frozen=True)
+class VerdictEnvelope:
+    """One parsed CR6 verdict envelope: the verdict, plus the merge-readiness
+    judgment the same envelope carries (issue #130).
+
+    `readiness` is READINESS_AUTO / READINESS_OPERATOR, or None when the
+    envelope has no parseable `Merge-Readiness` line -- the case the native
+    post fails closed on. `readiness_reason` is already one bounded,
+    backtick-free line (see clean_readiness_reason); empty when the envelope
+    gave none.
+    """
+
+    verdict: str
+    readiness: "str | None" = None
+    readiness_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -774,15 +838,28 @@ class Alissa:
         return matches[0]
 
     def latest_verdict(self, task_ref: str) -> str | None:
-        """The newest CR6 verdict envelope on a review task, or None.
+        """The newest CR6 verdict envelope's verdict on a review task, or None.
 
         Returns VERDICT_APPROVE / VERDICT_REQUEST_CHANGES. This is the verdict
         of record: reviewers post comment-mode reviews, so the GitHub review
         state is always COMMENTED and cannot express approval at all.
 
+        The word alone; `latest_envelope` returns the whole record (verdict
+        plus merge-readiness) off the same read for the caller that posts it.
+
         Never raises. The daemon polls forever and this runs inside every pass,
         so absent, empty or malformed evidence degrades to "no verdict" rather
         than taking the loop down.
+        """
+        envelope = self.latest_envelope(task_ref)
+        return None if envelope is None else envelope.verdict
+
+    def latest_envelope(self, task_ref: str) -> "VerdictEnvelope | None":
+        """The newest CR6 verdict envelope on a review task, parsed, or None.
+
+        Same read and same tolerance as `latest_verdict`; this is the record
+        the native post carries onto GitHub (issue #130), so it needs the
+        envelope's Merge-Readiness line alongside the verdict word.
         """
         try:
             data = run_json(["alissa", "task", "get", task_ref, "--json"], timeout=90)
@@ -794,7 +871,7 @@ class Alissa:
             return None
 
         try:
-            return self._newest_verdict(data)
+            return self._newest_envelope(data)
         except Exception:  # pragma: no cover - defence in depth
             log.exception("could not parse verdict evidence for %s", task_ref)
             return None
@@ -839,10 +916,23 @@ class Alissa:
 
     @staticmethod
     def _newest_verdict(payload: object) -> str | None:
-        """Pick the newest parseable verdict out of a task's evidence array.
+        """The newest parseable verdict WORD out of a task's evidence array;
+        `_newest_envelope` with the readiness dropped, for the callers that
+        only decide on the word."""
+        envelope = Alissa._newest_envelope(payload)
+        return None if envelope is None else envelope.verdict
+
+    @staticmethod
+    def _newest_envelope(payload: object) -> "VerdictEnvelope | None":
+        """Pick the newest parseable verdict envelope out of a task's evidence
+        array, with the Merge-Readiness judgment it carries (issue #130).
 
         Every layer is optional by design -- the payload shape is whatever the
         CLI printed, and a task with no evidence is the normal round-1 case.
+
+        The readiness is read off the SAME evidence item as the verdict (its
+        body first, then its title), never off a neighbour: a stray line on an
+        older envelope must not decorate a newer round's verdict.
         """
         if not isinstance(payload, dict):
             return None
@@ -850,7 +940,7 @@ class Alissa:
         if not isinstance(evidence, list):
             return None
 
-        found: list[tuple[tuple[int, float], int, str]] = []
+        found: list[tuple[tuple[int, float], int, VerdictEnvelope]] = []
         for index, item in enumerate(evidence):
             if not isinstance(item, dict):
                 continue
@@ -861,10 +951,17 @@ class Alissa:
                     continue
                 match = _VERDICT_RE.search(blob)
                 if match:
+                    readiness, reason = parse_readiness(content)
+                    if readiness is None:
+                        readiness, reason = parse_readiness(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
-                         match.group(1).lower())
+                         VerdictEnvelope(
+                             verdict=match.group(1).lower(),
+                             readiness=readiness,
+                             readiness_reason=reason,
+                         ))
                     )
                     break
 
