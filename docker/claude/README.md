@@ -288,6 +288,25 @@ welcome / theme / bypass-mode / **"trust this folder?"** dialog (`"stuck — wai
 at a prompt"`); the trust dialog in particular is **not** suppressed by
 `--dangerously-skip-permissions`.
 
+**The skills dir is pinned to `$CLAUDE_CONFIG_DIR/skills`** (issue #132). Claude
+Code's rule: with `CLAUDE_CONFIG_DIR` set, personal skills are read from
+`$CLAUDE_CONFIG_DIR/skills/` *instead of* `~/.claude/skills/` — but the alissa
+CLI installs skills to `~/.claude/skills` unless its config key `skillsDir` says
+otherwise, so a relocated config dir alone means every session opens with
+`Skill(alissa-code-review)` → `Unknown skill` and hunts the file on disk. So
+whenever `CLAUDE_CONFIG_DIR` is non-blank the entrypoint merges
+`skillsDir=$CLAUDE_CONFIG_DIR/skills` into the CLI's `config.json` (load-then-
+update: the verified token and every other key are preserved; an unparseable
+file is left alone with a WARN), creates the directory as `alissa`, and logs
+`skills dir pinned to … (Claude reads personal skills there when
+CLAUDE_CONFIG_DIR is set)` once — before `alissa code workspace sync` installs
+the manifest's `skills:` (`ALISSA_REVIEW_SKILLS`, below). A hand-placed stop-gap
+**symlink** `$CLAUDE_CONFIG_DIR/skills → /home/alissa/.claude/skills` on the
+volume is converted into a real directory (the target's contents copied in) so
+it cannot shadow the pin; a real directory is left untouched. With
+`CLAUDE_CONFIG_DIR` blank nothing changes — the CLI default and Claude's default
+agree on `~/.claude/skills`. `tests-entrypoint-config.sh` pins these behaviours.
+
 So the setup is: two tokens in the env (gh + alissa), one `claude /login` on the
 volume, and the container self-configures git-over-HTTPS, the alissa session, and
 a headless claude. No `gh auth login`, no first-run prompts, no manual git config.
@@ -368,7 +387,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_REVIEW_BOW_OWNERS` | *(unset ⇒ the token's own actor)* | `bows` only: the Alissa actor **id(s)** whose Bodies of Work may enroll a repo, one `\|`- or `,`-separated string, rendered as a JSON array. Unset, the daemon resolves the authority to its own token's actor at boot (`GET /v1/ping`) and refuses to start if it cannot. Ids only — a username or display name is refused by the daemon at load. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through** |
 | `ALISSA_WORKSPACE` | `alissa-review` | workspace name in the generated manifest |
-| `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated |
+| `ALISSA_REVIEW_SKILLS` | `alissa-code-workspace\|alissa-code-review` | skills installed into every reviewer session (manifest `skills:`), `\|`-separated. They land in `$CLAUDE_CONFIG_DIR/skills`, the dir Claude reads with `CLAUDE_CONFIG_DIR` set — the entrypoint pins the CLI's `skillsDir` there (see [the claude login section](#claude-auth-log-in-once-persisted-on-the-volume-recommended) / issue #132) |
 | `ALISSA_POLL_INTERVAL` | *daemon default* (currently 60) | seconds between polls (≥10); **pass-through** — unset ⇒ library default |
 | `ALISSA_ROUND_CAP` | *daemon default* (currently 10) | CR9 round cap; **pass-through** — unset ⇒ library default |
 | `ALISSA_STABILITY_ROUNDS` | *daemon default* (currently 3) | **product-stability guard**: how many consecutive `request_changes` rounds with an *empty* shipped-product diff stop the loop. The first stable round is still queued, carrying a notice that tells the reviewer to approve or name the shipped `file:line` that is wrong; a `request_changes` on that round with the product still unmoved queues nothing further and pages the operator once per head, lifted by the same `alissa-review: re-enter +N` ack a cap-out uses. `0` disables the guard entirely. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.26.0` |
@@ -1051,6 +1070,12 @@ volumes:
    here** if `ALISSA_UI_PASSCODE` is empty (fail-closed, fail-fast); then resolve
    `ALISSA_AGENT_MODEL` into `agents.yaml` and log the effective command.
 2. Ensure a manifest + `revloop.config.json` exist (mount or generate).
+2b. Seed claude's first-run flags into `$HOME` and `$CLAUDE_CONFIG_DIR`, and —
+   when `CLAUDE_CONFIG_DIR` is non-blank — pin the alissa CLI's `skillsDir` to
+   `$CLAUDE_CONFIG_DIR/skills` (merged into its `config.json`, the directory
+   created, a stop-gap symlink converted into a real directory; one log line),
+   so the skills step 3 installs land where Claude reads them
+   ([why](#claude-auth-log-in-once-persisted-on-the-volume-recommended)).
 3. **`alissa code workspace sync`** — materialize the worktree hubs the manifest
    declares (create missing/half-built ones, fetch existing). Without this the
    daemon's on-demand `alissa code workspace add` no-ops on a repo already listed
