@@ -603,5 +603,202 @@ assert_no_log "${LOG5B}" "downgrade:" "...without the downgrade die (the file is
 assert_eq "$(cat "${WS5}/revloop.config.json")" '.repos' '["mounted/repo"]' "the operator's config is untouched"
 stop_boot "${PID5B}"
 
+# -----------------------------------------------------------------------------
+# The alissa skills-dir pin (issue #132): with CLAUDE_CONFIG_DIR set, Claude
+# reads personal skills from $CLAUDE_CONFIG_DIR/skills, so the entrypoint pins
+# the alissa CLI's `skillsDir` there — merged into the CLI's config.json (other
+# keys preserved), the directory created as the runtime user, a hand-placed
+# stop-gap symlink converted into a real directory, one log line. Blank
+# CLAUDE_CONFIG_DIR: nothing changes. Same stubbed-CLI boots as above.
+# -----------------------------------------------------------------------------
+echo "== entrypoint: alissa skillsDir pinned to \$CLAUDE_CONFIG_DIR/skills (#132) =="
+ALISSA_CFG="${FAKE_HOME}/.config/alissa/config.json"
+PIN_LINE="(Claude reads personal skills there when CLAUDE_CONFIG_DIR is set)"
+WS6="${TMPROOT}/ws-skills"
+
+# --- 1. pin written: skillsDir merged, other keys preserved, dir owned by us --
+CC1="${TMPROOT}/claude-config-1"; LOG6="${TMPROOT}/skills-pin.log"
+printf '{"token": "stub-alissa-token", "apiBase": "https://api.example.test", "autoUpdate": false}\n' > "${ALISSA_CFG}"
+chmod 0600 "${ALISSA_CFG}"     # the mode the CLI chose for its token file must survive the rewrite
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" \
+  CLAUDE_CONFIG_DIR="${CC1}"; PID6="${EP_PID}"
+if wait_for_log "${LOG6}" "alissa worker is running" 45; then
+  pass "boot with CLAUDE_CONFIG_DIR set reaches the worker-up milestone"
+else
+  bad "boot with CLAUDE_CONFIG_DIR set did not come up (see ${LOG6})"; sed 's/^/      | /' "${LOG6}" | tail -20 >&2
+fi
+stop_boot "${PID6}"
+assert_eq "$(cat "${ALISSA_CFG}")" '.skillsDir' "\"${CC1}/skills\"" "config.json carries skillsDir=\$CLAUDE_CONFIG_DIR/skills"
+assert_eq "$(cat "${ALISSA_CFG}")" '.token'      '"stub-alissa-token"'          "...the verified token is preserved (merge, not clobber)"
+assert_eq "$(cat "${ALISSA_CFG}")" '.apiBase'    '"https://api.example.test"'   "...apiBase is preserved"
+assert_eq "$(cat "${ALISSA_CFG}")" '.autoUpdate' 'false'                        "...a boolean key is preserved with its type"
+assert_eq "$(cat "${ALISSA_CFG}")" 'keys|length' '4'                            "...and no other key was added"
+if [ "$(stat -c %a "${ALISSA_CFG}")" = "600" ]; then pass "...and the file keeps its 0600 mode"; else bad "...config.json mode is now $(stat -c %a "${ALISSA_CFG}"), expected 600"; fi
+if [ -d "${CC1}/skills" ] && [ ! -L "${CC1}/skills" ]; then
+  pass "\$CLAUDE_CONFIG_DIR/skills exists as a real directory"
+else
+  bad "\$CLAUDE_CONFIG_DIR/skills missing or not a real directory"
+fi
+if [ "$(stat -c %U "${CC1}/skills")" = "$(id -un)" ]; then
+  pass "...owned by the user the entrypoint runs as (the runtime user after the drop)"
+else
+  bad "...owned by $(stat -c %U "${CC1}/skills"), expected $(id -un)"
+fi
+assert_log "${LOG6}" "skills dir pinned to ${CC1}/skills ${PIN_LINE}" "the pin is logged by path"
+if [ "$(grep -cF -- "${PIN_LINE}" "${LOG6}")" = "1" ]; then
+  pass "...exactly once"
+else
+  bad "the pin line appears $(grep -cF -- "${PIN_LINE}" "${LOG6}") times, expected 1"
+fi
+assert_no_log "${LOG6}" "converted the stop-gap symlink" "no symlink conversion is claimed when there was none"
+assert_no_log "${LOG6}" "installed-skill record" "no installed-skill record is dropped when the config carries none"
+
+# --- 2. CLAUDE_CONFIG_DIR unset (and blank): nothing changes --------------------
+printf '{"token": "stub-alissa-token", "apiBase": "https://api.example.test"}\n' > "${ALISSA_CFG}"
+CFG_BEFORE="$(cat "${ALISSA_CFG}")"
+for blank in unset "" "   "; do
+  LOG6B="${TMPROOT}/skills-unset-${#blank}.log"
+  rm -f "${MARKERS}"/*
+  if [ "${blank}" = "unset" ]; then
+    boot "${WS6}" "${LOG6B}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app"; PID6B="${EP_PID}"
+  else
+    boot "${WS6}" "${LOG6B}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${blank}"; PID6B="${EP_PID}"
+  fi
+  wait_for_log "${LOG6B}" "alissa worker is running" 45 || bad "boot with CLAUDE_CONFIG_DIR=${blank@Q} did not come up (see ${LOG6B})"
+  stop_boot "${PID6B}"
+  if [ "$(cat "${ALISSA_CFG}")" = "${CFG_BEFORE}" ]; then
+    pass "CLAUDE_CONFIG_DIR ${blank@Q}: config.json is byte-for-byte untouched (no skillsDir)"
+  else
+    bad "CLAUDE_CONFIG_DIR ${blank@Q}: config.json changed: $(cat "${ALISSA_CFG}")"
+  fi
+  assert_no_log "${LOG6B}" "skills dir pinned" "CLAUDE_CONFIG_DIR ${blank@Q}: no pin is logged"
+  if [ -e "${FAKE_HOME}/.claude/skills" ] || [ -e "${FAKE_HOME}/skills" ] || [ -e "${TMPROOT}/skills" ]; then
+    bad "CLAUDE_CONFIG_DIR ${blank@Q}: a skills dir was created somewhere it should not be"
+  else
+    pass "CLAUDE_CONFIG_DIR ${blank@Q}: no skills dir is created anywhere"
+  fi
+done
+
+# --- 3. a pre-existing stop-gap SYMLINK becomes a real dir, contents preserved -
+CC3="${TMPROOT}/claude-config-3"; LOG6C="${TMPROOT}/skills-symlink.log"
+LINK_TARGET="${TMPROOT}/home-skills"
+mkdir -p "${CC3}" "${LINK_TARGET}/alissa-code-review/references"
+printf 'name: alissa-code-review\n' > "${LINK_TARGET}/alissa-code-review/SKILL.md"
+printf 'verdict envelope\n' > "${LINK_TARGET}/alissa-code-review/references/verdict-envelope.md"
+ln -s "${LINK_TARGET}" "${CC3}/skills"
+rm -f "${ALISSA_CFG}"     # no config.json at all: a fresh install, the stub login wrote nothing
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6C}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${CC3}"; PID6C="${EP_PID}"
+wait_for_log "${LOG6C}" "alissa worker is running" 45 || { bad "symlink boot did not come up (see ${LOG6C})"; sed 's/^/      | /' "${LOG6C}" | tail -20 >&2; }
+stop_boot "${PID6C}"
+if [ -d "${CC3}/skills" ] && [ ! -L "${CC3}/skills" ]; then
+  pass "the stop-gap symlink was replaced by a real directory"
+else
+  bad "\$CLAUDE_CONFIG_DIR/skills is still a symlink (or missing)"
+fi
+if [ "$(cat "${CC3}/skills/alissa-code-review/SKILL.md" 2>/dev/null)" = "name: alissa-code-review" ] \
+   && [ "$(cat "${CC3}/skills/alissa-code-review/references/verdict-envelope.md" 2>/dev/null)" = "verdict envelope" ]; then
+  pass "...with the link target's contents copied in (nested files intact)"
+else
+  bad "...but the link target's contents were not carried over"
+fi
+if [ -f "${LINK_TARGET}/alissa-code-review/SKILL.md" ]; then
+  pass "...and the former target is left untouched"
+else
+  bad "...the former link target was modified"
+fi
+assert_log "${LOG6C}" "converted the stop-gap symlink ${CC3}/skills -> ${LINK_TARGET} into a real directory" "the conversion is logged by name"
+if [ -f "${ALISSA_CFG}" ]; then
+  assert_eq "$(cat "${ALISSA_CFG}")" '.skillsDir' "\"${CC3}/skills\"" "a missing config.json is created with the pin"
+  assert_eq "$(cat "${ALISSA_CFG}")" 'keys' '["skillsDir"]' "...and nothing else"
+else
+  bad "no config.json was created for the pin"
+fi
+assert_log "${LOG6C}" "skills dir pinned to ${CC3}/skills ${PIN_LINE}" "the pin is logged after the conversion"
+
+# --- 4. a pre-existing REAL directory is left alone --------------------------
+CC4="${TMPROOT}/claude-config-4"; LOG6D="${TMPROOT}/skills-realdir.log"
+mkdir -p "${CC4}/skills/alissa-code-workspace"
+printf 'name: alissa-code-workspace\n' > "${CC4}/skills/alissa-code-workspace/SKILL.md"
+INODE_BEFORE="$(stat -c %i "${CC4}/skills")"
+mkdir -p "${CC4}/skills.migrate.99999/alissa-code-review"   # left by a boot killed mid-conversion
+printf '{"token": "stub-alissa-token", "skillsDir": "/somewhere/stale"}\n' > "${ALISSA_CFG}"
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6D}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${CC4}"; PID6D="${EP_PID}"
+wait_for_log "${LOG6D}" "alissa worker is running" 45 || bad "real-dir boot did not come up (see ${LOG6D})"
+stop_boot "${PID6D}"
+if [ "$(stat -c %i "${CC4}/skills")" = "${INODE_BEFORE}" ] && [ ! -L "${CC4}/skills" ]; then
+  pass "a pre-existing real directory is the same inode after boot (untouched)"
+else
+  bad "the pre-existing real directory was replaced"
+fi
+if [ "$(cat "${CC4}/skills/alissa-code-workspace/SKILL.md" 2>/dev/null)" = "name: alissa-code-workspace" ]; then
+  pass "...its contents are intact"
+else
+  bad "...its contents were lost"
+fi
+assert_no_log "${LOG6D}" "converted the stop-gap symlink" "no conversion is logged for a real directory"
+if [ ! -e "${CC4}/skills.migrate.99999" ]; then
+  pass "an orphaned skills.migrate.<pid> staging dir from an interrupted boot is swept"
+else
+  bad "the orphaned skills.migrate.<pid> staging dir survived the boot"
+fi
+assert_eq "$(cat "${ALISSA_CFG}")" '.skillsDir' "\"${CC4}/skills\"" "a stale skillsDir is re-pinned to \$CLAUDE_CONFIG_DIR/skills"
+assert_eq "$(cat "${ALISSA_CFG}")" '.token' '"stub-alissa-token"' "...the token still preserved"
+if [ "$(grep -cF -- "${PIN_LINE}" "${LOG6D}")" = "1" ]; then pass "the pin line appears exactly once"; else bad "pin line count $(grep -cF -- "${PIN_LINE}" "${LOG6D}")"; fi
+
+# --- 5. a config.json that is not JSON is never overwritten ------------------
+CC5="${TMPROOT}/claude-config-5"; LOG6E="${TMPROOT}/skills-badjson.log"
+printf 'not json {\n' > "${ALISSA_CFG}"
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6E}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${CC5}"; PID6E="${EP_PID}"
+wait_for_log "${LOG6E}" "alissa worker is running" 45 || bad "bad-json boot did not come up (see ${LOG6E})"
+stop_boot "${PID6E}"
+if [ "$(cat "${ALISSA_CFG}")" = "not json {" ]; then pass "an unparseable config.json is left as it was"; else bad "an unparseable config.json was overwritten"; fi
+assert_log "${LOG6E}" "not pinning skillsDir over it" "...and the refusal is logged"
+assert_no_log "${LOG6E}" "skills dir pinned" "...no pin is claimed"
+assert_log "${LOG6E}" "WARN: could not write skillsDir=${CC5}/skills" "...the WARN names the manual fix"
+if [ -d "${CC5}/skills" ]; then pass "the directory is still created (it costs nothing and the CLI may pin later)"; else bad "the directory was not created"; fi
+rm -f "${ALISSA_CFG}"
+
+# --- 6. `installed` records without a SKILL.md under the pinned dir are dropped
+# The CLI's isSkillInstalled() trusts the config's `installed` map before it
+# looks at the disk. The executor keeps its config dir on the volume, so after
+# a redeploy the map still lists skills that lived in the ephemeral
+# ~/.claude/skills — and the freshly pinned (empty) dir would never be filled.
+CC6="${TMPROOT}/claude-config-6"; LOG6F="${TMPROOT}/skills-installed.log"
+mkdir -p "${CC6}/skills/alissa-code-workspace"
+printf 'name: alissa-code-workspace\n' > "${CC6}/skills/alissa-code-workspace/SKILL.md"
+mkdir -p "${CC6}/skills/alissa-code-git"                       # dir without a SKILL.md: not installed
+cat > "${ALISSA_CFG}" <<'JSON'
+{"token": "stub-alissa-token",
+ "installed": {"alissa-code-workspace": {"version": "2026-09-01", "installedAt": "2026-09-02T00:00:00.000Z"},
+               "alissa-code-review": {"version": "2026-09-01", "installedAt": "2026-09-02T00:00:00.000Z"},
+               "alissa-code-git": {"version": "2026-09-01"}}}
+JSON
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6F}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${CC6}"; PID6F="${EP_PID}"
+wait_for_log "${LOG6F}" "alissa worker is running" 45 || bad "installed-map boot did not come up (see ${LOG6F})"
+stop_boot "${PID6F}"
+assert_eq "$(cat "${ALISSA_CFG}")" '.installed|keys' '["alissa-code-workspace"]' "installed records without a SKILL.md under the pinned dir are dropped (the CLI reinstalls them)"
+assert_eq "$(cat "${ALISSA_CFG}")" '.installed["alissa-code-workspace"].version' '"2026-09-01"' "...the record of a skill present in the pinned dir is kept intact"
+assert_eq "$(cat "${ALISSA_CFG}")" '.installed["alissa-code-workspace"].installedAt' '"2026-09-02T00:00:00.000Z"' "...with every field"
+assert_eq "$(cat "${ALISSA_CFG}")" '.skillsDir' "\"${CC6}/skills\"" "...and the pin is written in the same rewrite"
+assert_eq "$(cat "${ALISSA_CFG}")" '.token' '"stub-alissa-token"' "...token preserved"
+assert_log "${LOG6F}" "dropped 2 installed-skill record(s) not present under ${CC6}/skills: alissa-code-git, alissa-code-review" "the dropped slugs are logged by name"
+
+# 6b. an `installed` value that is not an object is left exactly as it is
+LOG6G="${TMPROOT}/skills-installed-odd.log"
+printf '{"token": "stub-alissa-token", "installed": ["alissa-code-review"]}\n' > "${ALISSA_CFG}"
+rm -f "${MARKERS}"/*
+boot "${WS6}" "${LOG6G}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app" CLAUDE_CONFIG_DIR="${CC6}"; PID6G="${EP_PID}"
+wait_for_log "${LOG6G}" "alissa worker is running" 45 || bad "odd-installed boot did not come up (see ${LOG6G})"
+stop_boot "${PID6G}"
+assert_eq "$(cat "${ALISSA_CFG}")" '.installed' '["alissa-code-review"]' "an installed value that is not an object is preserved untouched"
+assert_eq "$(cat "${ALISSA_CFG}")" '.skillsDir' "\"${CC6}/skills\"" "...and the pin is still written"
+assert_no_log "${LOG6G}" "installed-skill record" "...with no drop logged"
+rm -f "${ALISSA_CFG}"
+
 echo
 [ "${fail}" = "0" ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

@@ -955,6 +955,120 @@ print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} re
 PY
 
 # -----------------------------------------------------------------------------
+# 3a-ii. Pin the alissa CLI's skills dir to $CLAUDE_CONFIG_DIR/skills (issue #132).
+#
+# Claude Code's rule: with CLAUDE_CONFIG_DIR set, personal skills are read from
+# $CLAUDE_CONFIG_DIR/skills/ INSTEAD of ~/.claude/skills/. The alissa CLI installs
+# skills to ~/.claude/skills unless its config key `skillsDir` says otherwise —
+# so with the config dir relocated (3a above, for the persisted login) every
+# session started with `Skill(alissa-code-review)` -> "Unknown skill" and burned
+# its first minutes hunting the file on disk. The CLI may learn to honour
+# CLAUDE_CONFIG_DIR itself; the image must not depend on the CLI version it
+# happens to pull, so the pin is written here, before 3c installs anything.
+#
+# Same load-then-update merge as the settings block: only `skillsDir` is set,
+# every other key (the verified token, apiBase, ...) is preserved. A config file
+# that exists but does not parse is left alone (WARN), never overwritten.
+#
+# One more key IS touched: the CLI's `installed` map. isSkillInstalled() trusts
+# that map before it looks at the disk, so a slug recorded there but absent from
+# the newly pinned directory would never be reinstalled — the executor role
+# keeps its config dir on the persistent volume, so after a redeploy the map
+# still lists skills that were installed into the ephemeral ~/.claude/skills.
+# Entries whose SKILL.md is not under the pinned dir are dropped; the CLI then
+# sees them as missing and installs them in 3c, into the pinned dir.
+#
+# Migration: the live containers carried a hand-placed symlink
+# $CLAUDE_CONFIG_DIR/skills -> /home/<user>/.claude/skills as a stop-gap. It
+# lives on the volume, so it outlives redeploys, and it would shadow this pin
+# (the CLI would install THROUGH it into the home dir). A symlink is replaced
+# by a real directory carrying a copy of the target's contents; a real
+# directory is left as it is. Blank CLAUDE_CONFIG_DIR: nothing changes — the CLI
+# default and Claude's default already agree on ~/.claude/skills.
+#
+# Runs after the privilege drop, so the directory is created by (and owned by)
+# ${RUNTIME_USER}. Never fatal: a skills dir that cannot be pinned is a slower
+# first session, not a dead daemon.
+# -----------------------------------------------------------------------------
+CLAUDE_SKILLS_DIR=""
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -n "${CLAUDE_CONFIG_DIR//[[:space:]]/}" ]; then
+  CLAUDE_SKILLS_DIR="${CLAUDE_CONFIG_DIR}/skills"
+  # A boot killed mid-conversion (below) leaves a skills.migrate.<pid> staging
+  # dir on the volume, and the next boot no longer sees a symlink, so the sweep
+  # runs here, outside the symlink branch.
+  rm -rf "${CLAUDE_SKILLS_DIR}".migrate.* 2>/dev/null || true
+  if [ -L "${CLAUDE_SKILLS_DIR}" ]; then
+    SKILLS_LINK_TARGET="$(readlink -f "${CLAUDE_SKILLS_DIR}" 2>/dev/null || true)"
+    SKILLS_MIGRATE_TMP="${CLAUDE_SKILLS_DIR}.migrate.$$"
+    if mkdir -p "${SKILLS_MIGRATE_TMP}"; then
+      # Copy first, unlink last: a copy that fails leaves the link in place
+      # (the stop-gap keeps working) rather than an empty directory that
+      # would hide every installed skill.
+      SKILLS_COPY_OK=1
+      if [ -n "${SKILLS_LINK_TARGET}" ] && [ -d "${SKILLS_LINK_TARGET}" ]; then
+        cp -a "${SKILLS_LINK_TARGET}/." "${SKILLS_MIGRATE_TMP}/" || SKILLS_COPY_OK=0
+      fi
+      # Each failure logs what is actually on disk at that point: the link is
+      # still there until the rm, and gone (but not yet replaced) after it.
+      if [ "${SKILLS_COPY_OK}" != "1" ]; then
+        rm -rf "${SKILLS_MIGRATE_TMP}"
+        log "WARN: could not copy ${SKILLS_LINK_TARGET} into ${SKILLS_MIGRATE_TMP} — leaving the symlink ${CLAUDE_SKILLS_DIR} in place; the alissa CLI will install through it"
+      elif ! rm -f "${CLAUDE_SKILLS_DIR}"; then
+        rm -rf "${SKILLS_MIGRATE_TMP}"
+        log "WARN: could not remove the symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} — leaving it in place; the alissa CLI will install through it"
+      elif mv "${SKILLS_MIGRATE_TMP}" "${CLAUDE_SKILLS_DIR}"; then
+        log "converted the stop-gap symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} into a real directory (contents copied)"
+      else
+        rm -rf "${SKILLS_MIGRATE_TMP}"
+        log "WARN: removed the symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} but could not move the staged copy into place — recreating it as an empty directory; the alissa CLI will reinstall the skills there (the former link target is untouched)"
+      fi
+    else
+      log "WARN: could not create ${SKILLS_MIGRATE_TMP} — leaving the symlink ${CLAUDE_SKILLS_DIR} in place"
+    fi
+  fi
+  mkdir -p "${CLAUDE_SKILLS_DIR}" 2>/dev/null \
+    || log "WARN: could not create ${CLAUDE_SKILLS_DIR} (the alissa CLI will try again when it installs skills)"
+  if python3 - "${ALISSA_CONFIG_DIR}/config.json" "${CLAUDE_SKILLS_DIR}" <<'PY'
+import json, os, sys
+path, skills_dir = sys.argv[1], sys.argv[2]
+d = {}
+if os.path.exists(path):
+    try:
+        d = json.load(open(path))
+    except Exception as e:
+        print(f"[entrypoint] WARN: {path} is not readable JSON ({e}) — not pinning skillsDir over it", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(d, dict):
+        print(f"[entrypoint] WARN: {path} is not a JSON object — not pinning skillsDir over it", file=sys.stderr)
+        sys.exit(1)
+d["skillsDir"] = skills_dir
+# A slug recorded as installed but absent from the pinned dir would never be
+# reinstalled: the CLI's isSkillInstalled() trusts this map over the disk.
+installed = d.get("installed")
+if isinstance(installed, dict):
+    present = {s: m for s, m in installed.items() if os.path.exists(os.path.join(skills_dir, s, "SKILL.md"))}
+    dropped = sorted(set(installed) - set(present))
+    if dropped:
+        d["installed"] = present
+        print(f"[entrypoint] dropped {len(dropped)} installed-skill record(s) not present under {skills_dir}: "
+              f"{', '.join(dropped)} (the alissa CLI reinstalls them there)", file=sys.stderr)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+if os.path.exists(path):  # keep whatever mode the CLI chose for its token file
+    os.chmod(tmp, os.stat(path).st_mode & 0o777)
+os.replace(tmp, path)
+PY
+  then
+    log "skills dir pinned to ${CLAUDE_SKILLS_DIR} (Claude reads personal skills there when CLAUDE_CONFIG_DIR is set)"
+  else
+    log "WARN: could not write skillsDir=${CLAUDE_SKILLS_DIR} into ${ALISSA_CONFIG_DIR}/config.json — sessions may start with 'Unknown skill' until it is pinned by hand (alissa config set skillsDir ${CLAUDE_SKILLS_DIR})"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 # 3b. Reset the stale in-flight ledger.
 #
 # The daemon's spawn ledger persists on the /workspace volume, but the tmux
