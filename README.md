@@ -382,9 +382,10 @@ who writes the line (issue #134):
   backticks, not bold, not mid-sentence — and byte-equal in value and reason
   to the envelope's line. The daemon **verifies and warns**: the first poll
   that sees a reviewer-identity `APPROVE` on the current head reads the body
-  with that same grammar and logs `readiness=auto|operator` (log line and an
-  activity-comment row) when it parses. When it does not, it logs **one
-  `WARNING` per (PR, head)** —
+  of the **newest such approve** — the review the merge edge reads, whatever
+  the identity posted after it — with that same grammar and logs
+  `readiness=auto|operator` (log line and an activity-comment row) when it
+  parses. When it does not, it logs **one `WARNING` per (PR, head)** —
 
   ```
   <owner>/<repo>#<n> approve at <head7> by <login> carries no Merge-Readiness trailer — the merge edge will hold it; the session must end its review body with the line (see directive)
@@ -396,8 +397,10 @@ who writes the line (issue #134):
   trailer is a **hold on the merge edge**, not a review failure — the approve
   stands, the PR converges, and the merge waits for an operator. The
   observation is made once per head (a flag beside the verdict's row in the
-  `verdicts` ledger table); a push re-arms it, a re-poll of the same head is
-  silent. `REQUEST_CHANGES` and `COMMENT` reviews are never checked — `auto`
+  `verdicts` ledger table, written only after the activity row landed, so a
+  failed row is retried next poll rather than lost — and never under
+  `--dry-run`, which reports but touches no ledger); a push re-arms it, a
+  re-poll of the same head is silent. `REQUEST_CHANGES` and `COMMENT` reviews are never checked — `auto`
   on anything but an `APPROVE` is nothing a consumer should see, so nothing
   but an `APPROVE` owes the line;
 - **daemon-posted** — the rounds where the session did not submit its own

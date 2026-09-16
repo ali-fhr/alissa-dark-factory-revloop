@@ -24,9 +24,15 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
   session must end its review body with the line (see directive)`) and a
   `readiness=missing` activity row. Observation only: no review is posted or
   edited and no round re-runs; a missing trailer is a hold on the merge edge,
-  not a review failure. `REQUEST_CHANGES` never warns. The once-per-head guard
-  is a nullable `readiness` column on the `verdicts` ledger row, migrated in
-  place. The trailer grammar (`parse_trailer`, `alissa.py`) is one regex shared
+  not a review failure. `REQUEST_CHANGES` never warns. The observer reads the
+  newest reviewer-identity APPROVE on the head (a later `--comment` write-up
+  by the same login does not hide it), emits before it records — the
+  once-per-head flag lands only after the activity row did, so a failed row
+  is retried next poll — and writes nothing under `--dry-run`. The guard is a
+  nullable `readiness` column on the `verdicts` ledger row, migrated in
+  place, stamped only with the review's own GitHub time (an unreadable stamp
+  keeps the WARNING and skips the row rather than inventing a verdict at
+  "now"). The trailer grammar (`parse_trailer`, `alissa.py`) is one regex shared
   by the emitter and the check; the daemon-posted path is otherwise unchanged.
   No config key.
 

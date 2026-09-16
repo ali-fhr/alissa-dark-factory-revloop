@@ -4153,16 +4153,104 @@ def test_the_daemon_posted_approve_is_not_observed_a_second_time(config, no_post
 
 
 def test_a_missing_trailer_is_still_reported_when_the_activity_post_fails(config, caplog):
-    """The activity row is telemetry and may fail; the WARNING and the ledger
-    flag do not depend on it (and the flag still dedupes the next poll)."""
+    """Emit, then record: the WARNING does not depend on the activity row,
+    but the once-per-head flag does -- a row that did not land is retried on
+    the next poll (like `_note_checks_hold`), not lost behind a flag."""
     w, gh, _ = watcher(config, make_pr(), [session_approve()])
+    working = gh.issue_comments
     gh.issue_comments = lambda *a: (_ for _ in ()).throw(RuntimeError("503"))
 
     with caplog.at_level(logging.INFO):
         assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
 
     assert len(readiness_warnings(caplog)) == 1
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") is None, "not flagged yet"
+
+    # GitHub is back: the same poll shape warns again, lands the row, then flags.
+    gh.issue_comments = working
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert len(readiness_warnings(caplog)) == 1
+    (row,) = readiness_rows(gh)
+    assert "readiness=missing" in row
     assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_MISSING
+
+    # And now the flag holds.
+    caplog.clear()
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert readiness_records(caplog) == []
+    assert len(readiness_rows(gh)) == 1
+
+
+def test_a_dry_run_pass_reports_the_missing_trailer_but_never_touches_the_ledger(
+    config, caplog
+):
+    """`--dry-run` writes nothing durable (`_warn_identity_drift`): the row
+    cannot land, so the flag must not either -- a diagnostic pass over a
+    trailer-less approve would otherwise silence the live daemon for that
+    head. The WARNING still prints, on every dry-run poll."""
+    dry = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = watcher(dry, make_pr(), [session_approve()])
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert len(readiness_warnings(caplog)) == 2, "no durable dedupe in dry-run"
+    assert readiness_rows(gh) == []
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") is None
+    assert w.state.last_verdict_at(SLUG, NUMBER, "abc123") is None, "no verdict row either"
+
+    # The live daemon on the same ledger still observes -- once.
+    live, gh2, _ = watcher(config, make_pr(), [session_approve()], state=w.state)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        live.evaluate(OWNER, REPO, NUMBER)
+    assert len(readiness_warnings(caplog)) == 1
+    assert live.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_MISSING
+
+
+def test_a_later_comment_review_by_the_reviewer_does_not_hide_the_approve(config, caplog):
+    """The merge edge reads the APPROVE on the head, not the newest review by
+    the identity -- so a later substantive non-approve record by the same
+    login (a round-k reviewer that fell back to `--comment`, a follow-up
+    write-up) must not hide a trailer-less approve from the observer."""
+    w, gh, _ = watcher(
+        config, make_pr(),
+        [
+            session_approve(),
+            review("COMMENTED", at="2026-07-18T10:30:00Z", body="Follow-up: one note."),
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    (warning,) = readiness_warnings(caplog)
+    assert "approve at abc123" in warning.getMessage()
+    (row,) = readiness_rows(gh)
+    assert "readiness=missing" in row
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_MISSING
+
+
+def test_an_approve_with_an_unreadable_stamp_warns_without_inventing_a_verdict_row(
+    config, caplog
+):
+    """The flag rides a verdict row `last_verdict_at` reads for the cooldown,
+    so it is stamped only with the review's own time: no readable stamp, no
+    row (and no activity line to grow unbounded behind a flag that cannot be
+    set) -- the WARNING alone, each poll."""
+    w, gh, _ = watcher(config, make_pr(), [session_approve(at="not-a-timestamp")])
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert len(readiness_warnings(caplog)) == 2
+    assert readiness_rows(gh) == []
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") is None
+    assert w.state.last_verdict_at(SLUG, NUMBER, "abc123") is None
 
 
 def _envelope(readiness=None, reason=""):

@@ -810,7 +810,11 @@ class State:
         list showed the review before the ledger did (issue #134). Absorbed
         like note_observed_verdict: a flag the ledger cannot take costs one
         repeated WARNING on the next poll, not a wrong decision -- nothing
-        downstream reads it but the dedupe. True on success."""
+        downstream reads the `readiness` column but the dedupe. The ROW is
+        another matter: it is a verdict row, and `last_verdict_at` reads its
+        `posted_at` for the post-verdict cooldown, so `posted_at` must be the
+        review's own GitHub stamp -- never a synthetic "now". The caller skips
+        the write when it has no such stamp. True on success."""
         def write() -> None:
             self._db.execute(
                 "INSERT OR IGNORE INTO verdicts "

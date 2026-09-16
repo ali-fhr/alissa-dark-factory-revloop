@@ -4086,59 +4086,77 @@ class ReviewWatcher:
 
         Observation only, by contract: never a review posted, never the
         session's review edited, never a round re-run. Scoped to the newest
-        reviewer-identity review, APPROVED, on the current head, and NOT the
-        daemon's own post -- that one is emitter-built and already reported
-        `readiness=` at post time (a second row for it would be noise). Once
-        per (PR, head) via the ledger flag beside the verdicts row: a new
-        head re-arms, a re-poll of the same head is silent.
+        reviewer-identity APPROVED review on the current head -- the review the
+        merge edge reads, whatever the identity wrote after it (a round-k
+        reviewer that fell back to `--comment`, a follow-up write-up) -- and
+        NOT the daemon's own post: that one is emitter-built and already
+        reported `readiness=` at post time (a second row for it would be
+        noise). Once per (PR, head) via the ledger flag beside the verdicts
+        row: a new head re-arms, a re-poll of the same head is silent.
+
+        Emit, then record, like every other activity note here: the ledger
+        flag lands only after the activity row did, so a transient comment
+        failure retries next poll instead of losing the row; and never under
+        `--dry-run`, where the row cannot land and a durable flag would let a
+        diagnostic pass silence the daemon it was run to diagnose (see
+        `_warn_identity_drift`). The flag rides a verdict row that
+        `last_verdict_at` also reads, so it is stamped only with the review's
+        own time -- an unreadable GitHub stamp keeps the log line and skips
+        both the row and the flag rather than inventing a verdict at "now".
         """
-        newest = my_reviews[-1] if my_reviews else None
-        if (
-            newest is None
-            or newest.state != "APPROVED"
-            or not newest.commit_id
-            or newest.commit_id != pr.head_sha
-            or newest.verdict_round is not None
-        ):
+        approves = [
+            r for r in my_reviews
+            if r.state == "APPROVED" and r.commit_id and r.commit_id == pr.head_sha
+        ]
+        newest = approves[-1] if approves else None
+        if newest is None or newest.verdict_round is not None:
             return
         if self.state.readiness_observed(pr.full_name, pr.number, pr.head_sha) is not None:
             return
 
         value, reason = parse_trailer(newest.body)
-        readiness = value if value is not None else READINESS_MISSING
-        posted_at = _epoch(newest.submitted_at)
-        self.state.note_readiness(
-            pr.full_name, pr.number, pr.head_sha,
-            int(posted_at if posted_at is not None else time.time()),
-            readiness, newest.url,
-        )
-
         head7 = pr.head_sha[:7]
         if value is None:
+            readiness = READINESS_MISSING
             log.warning(
                 "%s approve at %s by %s carries no Merge-Readiness trailer — the "
                 "merge edge will hold it; the session must end its review body "
                 "with the line (see directive)",
                 pr.slug, head7, self.github.login,
             )
-            self._append_activity(
-                pr,
+            line = (
                 f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
                 f"`{self.github.login}` at `{head7}` — readiness=missing (no "
                 f"`{READINESS_TRAILER_LABEL}` trailer on the review body; the merge "
-                f"edge will hold it)",
+                f"edge will hold it)"
+            )
+        else:
+            readiness = value
+            term = f"{value} — {reason}" if reason else value
+            log.info(
+                "%s approve at %s by %s carries readiness=%s",
+                pr.slug, head7, self.github.login, term,
+            )
+            line = (
+                f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
+                f"`{self.github.login}` at `{head7}` — readiness={term}"
+            )
+
+        posted_at = _epoch(newest.submitted_at)
+        if posted_at is None:
+            # No stamp to key a verdict row on; the log line above is the
+            # whole report for this poll, and the next poll says it again.
+            log.debug(
+                "%s: approve at %s has no readable submitted_at; readiness row "
+                "and flag skipped", pr.slug, head7,
             )
             return
-
-        term = f"{value} — {reason}" if reason else value
-        log.info(
-            "%s approve at %s by %s carries readiness=%s",
-            pr.slug, head7, self.github.login, term,
-        )
-        self._append_activity(
-            pr,
-            f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
-            f"`{self.github.login}` at `{head7}` — readiness={term}",
+        if not self._append_activity(pr, line):
+            return  # retried next poll, like every other activity note
+        if self.config.dry_run:
+            return
+        self.state.note_readiness(
+            pr.full_name, pr.number, pr.head_sha, int(posted_at), readiness, newest.url,
         )
 
     def _convergence_reason(
