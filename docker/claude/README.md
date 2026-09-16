@@ -303,7 +303,16 @@ CLAUDE_CONFIG_DIR is set)` once — before `alissa code workspace sync` installs
 the manifest's `skills:` (`ALISSA_REVIEW_SKILLS`, below). A hand-placed stop-gap
 **symlink** `$CLAUDE_CONFIG_DIR/skills → /home/alissa/.claude/skills` on the
 volume is converted into a real directory (the target's contents copied in) so
-it cannot shadow the pin; a real directory is left untouched. With
+it cannot shadow the pin; a real directory is left untouched. The same rewrite
+drops every entry of the CLI's `installed` map whose `SKILL.md` is not under the
+pinned directory: the CLI trusts that map before it looks at the disk, and the
+executor role keeps its config dir on the volume, so after a redeploy the map
+would still vouch for skills that lived in the ephemeral `~/.claude/skills` and
+the freshly pinned directory would never be filled — dropped entries are logged
+by slug and reinstalled by the CLI on the same boot. The pin is unconditional:
+it is rewritten on every boot and wins over a `skillsDir` set by hand with
+`alissa config set skillsDir …` (there is no opt-out env knob — with
+`CLAUDE_CONFIG_DIR` set, any other value is where Claude does *not* look). With
 `CLAUDE_CONFIG_DIR` blank nothing changes — the CLI default and Claude's default
 agree on `~/.claude/skills`. `tests-entrypoint-config.sh` pins these behaviours.
 
@@ -1073,7 +1082,8 @@ volumes:
 2b. Seed claude's first-run flags into `$HOME` and `$CLAUDE_CONFIG_DIR`, and —
    when `CLAUDE_CONFIG_DIR` is non-blank — pin the alissa CLI's `skillsDir` to
    `$CLAUDE_CONFIG_DIR/skills` (merged into its `config.json`, the directory
-   created, a stop-gap symlink converted into a real directory; one log line),
+   created, a stop-gap symlink converted into a real directory, `installed`
+   records with no `SKILL.md` under the pinned dir dropped; one log line),
    so the skills step 3 installs land where Claude reads them
    ([why](#claude-auth-log-in-once-persisted-on-the-volume-recommended)).
 3. **`alissa code workspace sync`** — materialize the worktree hubs the manifest

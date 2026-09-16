@@ -96,7 +96,8 @@ personal skills from `$CLAUDE_CONFIG_DIR/skills/` *instead of* `~/.claude/skills
 — where the alissa CLI installs them by default. The entrypoint therefore pins
 the CLI's `skillsDir` to `$CLAUDE_CONFIG_DIR/skills` at boot (merged into the
 CLI config, the directory created, a stop-gap symlink converted into a real
-directory), so `Skill(alissa-code-review)` resolves on the first call instead of
+directory, stale `installed` records dropped so the CLI reinstalls there), so
+`Skill(alissa-code-review)` resolves on the first call instead of
 failing with `Unknown skill`. Details and the test suite that pins it:
 [the image README](./docker/claude/README.md#claude-auth-log-in-once-persisted-on-the-volume-recommended).
 

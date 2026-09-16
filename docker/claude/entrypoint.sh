@@ -970,6 +970,14 @@ PY
 # every other key (the verified token, apiBase, ...) is preserved. A config file
 # that exists but does not parse is left alone (WARN), never overwritten.
 #
+# One more key IS touched: the CLI's `installed` map. isSkillInstalled() trusts
+# that map before it looks at the disk, so a slug recorded there but absent from
+# the newly pinned directory would never be reinstalled — the executor role
+# keeps its config dir on the persistent volume, so after a redeploy the map
+# still lists skills that were installed into the ephemeral ~/.claude/skills.
+# Entries whose SKILL.md is not under the pinned dir are dropped; the CLI then
+# sees them as missing and installs them in 3c, into the pinned dir.
+#
 # Migration: the live containers carried a hand-placed symlink
 # $CLAUDE_CONFIG_DIR/skills -> /home/<user>/.claude/skills as a stop-gap. It
 # lives on the volume, so it outlives redeploys, and it would shadow this pin
@@ -985,10 +993,13 @@ PY
 CLAUDE_SKILLS_DIR=""
 if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -n "${CLAUDE_CONFIG_DIR//[[:space:]]/}" ]; then
   CLAUDE_SKILLS_DIR="${CLAUDE_CONFIG_DIR}/skills"
+  # A boot killed mid-conversion (below) leaves a skills.migrate.<pid> staging
+  # dir on the volume, and the next boot no longer sees a symlink, so the sweep
+  # runs here, outside the symlink branch.
+  rm -rf "${CLAUDE_SKILLS_DIR}".migrate.* 2>/dev/null || true
   if [ -L "${CLAUDE_SKILLS_DIR}" ]; then
     SKILLS_LINK_TARGET="$(readlink -f "${CLAUDE_SKILLS_DIR}" 2>/dev/null || true)"
     SKILLS_MIGRATE_TMP="${CLAUDE_SKILLS_DIR}.migrate.$$"
-    rm -rf "${SKILLS_MIGRATE_TMP}"
     if mkdir -p "${SKILLS_MIGRATE_TMP}"; then
       # Copy first, unlink last: a copy that fails leaves the link in place
       # (the stop-gap keeps working) rather than an empty directory that
@@ -997,11 +1008,19 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -n "${CLAUDE_CONFIG_DIR//[[:space:]]/}" 
       if [ -n "${SKILLS_LINK_TARGET}" ] && [ -d "${SKILLS_LINK_TARGET}" ]; then
         cp -a "${SKILLS_LINK_TARGET}/." "${SKILLS_MIGRATE_TMP}/" || SKILLS_COPY_OK=0
       fi
-      if [ "${SKILLS_COPY_OK}" = "1" ] && rm -f "${CLAUDE_SKILLS_DIR}" && mv "${SKILLS_MIGRATE_TMP}" "${CLAUDE_SKILLS_DIR}"; then
+      # Each failure logs what is actually on disk at that point: the link is
+      # still there until the rm, and gone (but not yet replaced) after it.
+      if [ "${SKILLS_COPY_OK}" != "1" ]; then
+        rm -rf "${SKILLS_MIGRATE_TMP}"
+        log "WARN: could not copy ${SKILLS_LINK_TARGET} into ${SKILLS_MIGRATE_TMP} — leaving the symlink ${CLAUDE_SKILLS_DIR} in place; the alissa CLI will install through it"
+      elif ! rm -f "${CLAUDE_SKILLS_DIR}"; then
+        rm -rf "${SKILLS_MIGRATE_TMP}"
+        log "WARN: could not remove the symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} — leaving it in place; the alissa CLI will install through it"
+      elif mv "${SKILLS_MIGRATE_TMP}" "${CLAUDE_SKILLS_DIR}"; then
         log "converted the stop-gap symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} into a real directory (contents copied)"
       else
         rm -rf "${SKILLS_MIGRATE_TMP}"
-        log "WARN: could not convert the symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} into a real directory — leaving the link in place; the alissa CLI will install through it"
+        log "WARN: removed the symlink ${CLAUDE_SKILLS_DIR} -> ${SKILLS_LINK_TARGET:-<dangling>} but could not move the staged copy into place — recreating it as an empty directory; the alissa CLI will reinstall the skills there (the former link target is untouched)"
       fi
     else
       log "WARN: could not create ${SKILLS_MIGRATE_TMP} — leaving the symlink ${CLAUDE_SKILLS_DIR} in place"
@@ -1023,6 +1042,16 @@ if os.path.exists(path):
         print(f"[entrypoint] WARN: {path} is not a JSON object — not pinning skillsDir over it", file=sys.stderr)
         sys.exit(1)
 d["skillsDir"] = skills_dir
+# A slug recorded as installed but absent from the pinned dir would never be
+# reinstalled: the CLI's isSkillInstalled() trusts this map over the disk.
+installed = d.get("installed")
+if isinstance(installed, dict):
+    present = {s: m for s, m in installed.items() if os.path.exists(os.path.join(skills_dir, s, "SKILL.md"))}
+    dropped = sorted(set(installed) - set(present))
+    if dropped:
+        d["installed"] = present
+        print(f"[entrypoint] dropped {len(dropped)} installed-skill record(s) not present under {skills_dir}: "
+              f"{', '.join(dropped)} (the alissa CLI reinstalls them there)", file=sys.stderr)
 os.makedirs(os.path.dirname(path), exist_ok=True)
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
