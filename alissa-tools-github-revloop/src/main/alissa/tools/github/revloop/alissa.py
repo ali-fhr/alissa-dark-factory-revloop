@@ -267,6 +267,43 @@ def clean_readiness_reason(text: object) -> str:
     return flat[:MAX_READINESS_REASON_CHARS].rstrip()
 
 
+# The trailer's own grammar (issue #134) -- the bare-line sibling of
+# _READINESS_RE. This is the line a native review ENDS with, whoever wrote
+# it: the daemon's emitter (loop.readiness_trailer) when it posts the verdict
+# itself, or the reviewer session's own `gh pr review` on the normal path.
+# It is the consumer's grammar verbatim (README, "The `Merge-Readiness`
+# trailer"): line-anchored, no bullet, no bold, no backticks, first match
+# wins, value case-sensitive. The label is the ONE constant the emitter
+# builds from, so the two cannot drift: a line the emitter writes is, by
+# construction, a line this regex reads.
+READINESS_TRAILER_LABEL = "Merge-Readiness:"
+READINESS_MISSING = "missing"
+_TRAILER_RE = re.compile(
+    r"^" + re.escape(READINESS_TRAILER_LABEL)
+    + r"[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def parse_trailer(body: object) -> "tuple[str | None, str]":
+    """`(value, reason)` from the first bare `Merge-Readiness:` line in a
+    review body, or `(None, "")` when no line matches the trailer grammar.
+
+    Strict where parse_readiness is tolerant: the line inside backticks
+    mid-sentence (studio #1258) and the envelope's `- **Merge-Readiness:**`
+    bullet both read as MISSING here, because the consumer's regex is what
+    decides whether the merge edge sees the judgment at all. CRLF bodies (a
+    review typed into the web form) are normalised first; the grammar itself
+    is unchanged.
+    """
+    if not isinstance(body, str):
+        return (None, "")
+    match = _TRAILER_RE.search(body.replace("\r\n", "\n"))
+    if match is None:
+        return (None, "")
+    return (match.group(1), clean_readiness_reason(match.group(2)))
+
+
 def parse_readiness(blob: object) -> "tuple[str | None, str]":
     """`(value, reason)` from the first Merge-Readiness line in `blob`.
 

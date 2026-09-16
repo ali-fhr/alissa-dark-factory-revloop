@@ -36,12 +36,16 @@ from alissa.tools.github.revloop.config import (
 from alissa.tools.github.revloop.alissa import (
     MAX_READINESS_REASON_CHARS,
     READINESS_AUTO,
+    READINESS_MISSING,
     READINESS_OPERATOR,
+    READINESS_TRAILER_LABEL,
     VERDICT_APPROVE,
     VERDICT_REQUEST_CHANGES,
     Alissa,
     VerdictEnvelope,
+    _TRAILER_RE,
     parse_readiness,
+    parse_trailer,
     ManagedSession,
     SessionRef,
     Task,
@@ -104,6 +108,7 @@ from alissa.tools.github.revloop.loop import (
     Decision,
     ResolvedTask,
     ReviewWatcher,
+    readiness_trailer,
     checks_hold_kind,
     checks_unsettled_kind,
     deferral_activity_kind,
@@ -3972,6 +3977,260 @@ def test_the_round_close_log_and_activity_row_name_the_readiness(config, no_post
     rows = activity_comments(gh)
     assert len(rows) == 1
     assert "merge-readiness: `operator — touches convex/schema.ts`" in rows[0].body
+
+
+# -- the session-posted trailer (issue #134) ---------------------------------
+#
+# The normal path: the reviewer session submits its OWN native review, which
+# passes through nothing here, so the trailer is the session's to write. The
+# daemon verifies and reports -- one WARNING per (PR, head) and a
+# `readiness=missing` activity row when the bare line is absent, the
+# `readiness=auto|operator` term when it parses. Observation only: no review
+# is posted, none edited, no round re-run.
+
+SESSION_APPROVE = "## Review verdict: acme/widgets#7 — approve\n\nClean.\n"
+
+
+def session_approve(trailer=None, **kw):
+    """A session-posted APPROVE on the head; `trailer` is the body's last line."""
+    body = SESSION_APPROVE + (f"\n{trailer}\n" if trailer else "")
+    return review("APPROVED", body=body, **kw)
+
+
+def readiness_records(caplog):
+    return [
+        r for r in caplog.records
+        if "carries readiness=" in r.getMessage()
+        or "carries no Merge-Readiness trailer" in r.getMessage()
+    ]
+
+
+def readiness_warnings(caplog):
+    return [r for r in readiness_records(caplog) if r.levelno == logging.WARNING]
+
+
+def readiness_rows(gh):
+    rows = activity_comments(gh)
+    return [
+        line for c in rows for line in c.body.splitlines()
+        if "session-posted `APPROVE`" in line
+    ]
+
+
+def test_a_session_approve_ending_with_auto_logs_readiness_auto(config, caplog):
+    w, gh, _ = watcher(config, make_pr(), [session_approve("Merge-Readiness: auto")])
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert readiness_warnings(caplog) == []
+    (record,) = readiness_records(caplog)
+    assert record.levelno == logging.INFO
+    assert "acme/widgets#7 approve at abc123 by alissa-app carries readiness=auto" in (
+        record.getMessage()
+    )
+    (row,) = readiness_rows(gh)
+    assert "readiness=auto" in row and "round 1" in row
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_AUTO
+    assert gh.submitted == [], "observation only: nothing posted"
+
+
+def test_a_session_approve_ending_with_operator_logs_readiness_operator(config, caplog):
+    w, gh, _ = watcher(
+        config, make_pr(),
+        [session_approve("Merge-Readiness: operator — touches convex/schema.ts")],
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert readiness_warnings(caplog) == []
+    (record,) = readiness_records(caplog)
+    assert "readiness=operator — touches convex/schema.ts" in record.getMessage()
+    (row,) = readiness_rows(gh)
+    assert "readiness=operator — touches convex/schema.ts" in row
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_OPERATOR
+
+
+def test_a_session_approve_with_the_line_in_backticks_warns_once_per_head(config, caplog):
+    """The studio #1258 shape: the line is there, inside backticks, mid-
+    sentence -- and the consumer's grammar does not see it. One WARNING and
+    one `readiness=missing` row on the first poll; nothing new on the next
+    poll of the same head; a new head re-arms."""
+    body = (
+        SESSION_APPROVE
+        + "\nMerge readiness is `Merge-Readiness: auto` per the envelope.\n"
+    )
+    w, gh, _ = watcher(config, make_pr(), [review("APPROVED", body=body)])
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    (warning,) = readiness_warnings(caplog)
+    assert warning.getMessage() == (
+        "acme/widgets#7 approve at abc123 by alissa-app carries no Merge-Readiness "
+        "trailer — the merge edge will hold it; the session must end its review "
+        "body with the line (see directive)"
+    )
+    assert readiness_records(caplog) == [warning], "no readiness=… term for a miss"
+    (row,) = readiness_rows(gh)
+    assert "readiness=missing" in row and "round 1" in row
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_MISSING
+    assert gh.submitted == [], "never posts a review on the session's behalf"
+    assert gh._reviews[0].body == body, "never edits the session's review"
+
+    # Second poll, same head: silent, and the activity comment does not grow.
+    caplog.clear()
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert readiness_records(caplog) == []
+    assert len(readiness_rows(gh)) == 1
+
+    # A push re-arms: the next approve on the new head is looked at afresh.
+    gh._pr = dataclasses.replace(gh._pr, head_sha="def456")
+    gh._reviews.append(
+        review("APPROVED", sha="def456", at="2026-07-18T11:00:00Z", body=body)
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    (again,) = readiness_warnings(caplog)
+    assert "approve at def456" in again.getMessage()
+    assert len(readiness_rows(gh)) == 2
+    assert w.state.readiness_observed(SLUG, NUMBER, "def456") == READINESS_MISSING
+
+
+def test_a_session_approve_with_a_bold_line_is_missing_too(config, caplog):
+    body = SESSION_APPROVE + "\n**Merge-Readiness:** auto\n"
+    w, gh, _ = watcher(config, make_pr(), [review("APPROVED", body=body)])
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert len(readiness_warnings(caplog)) == 1
+    assert "readiness=missing" in readiness_rows(gh)[0]
+
+
+def test_a_session_request_changes_without_a_trailer_never_warns(config, caplog):
+    w, gh, _ = watcher(
+        config, make_pr(), [review("CHANGES_REQUESTED", body=SESSION_APPROVE)],
+    )
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert readiness_records(caplog) == []
+    assert readiness_rows(gh) == []
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") is None
+
+
+def test_a_session_approve_on_an_older_head_is_not_observed(config, caplog):
+    """Head-bound like the verdict it is about: an approve of an earlier
+    commit is not the approve the merge edge reads, so it is not the one
+    whose trailer matters."""
+    w, gh, _ = watcher(config, make_pr(sha="new"), [session_approve(sha="old")])
+
+    with caplog.at_level(logging.INFO):
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    assert readiness_records(caplog) == []
+    assert readiness_rows(gh) == []
+
+
+def test_the_daemon_posted_approve_is_not_observed_a_second_time(config, no_post_grace, caplog):
+    """The daemon-posted path is unchanged: its trailer is emitter-built and
+    reported at post time. The next poll sees that review as the newest
+    APPROVED on the head and must not report it again."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert readiness_records(caplog) == []
+    assert readiness_rows(gh) == []
+    assert len(activity_comments(gh)) == 1
+    assert activity_comments(gh)[0].body.count("merge-readiness") == 1
+
+
+def test_a_missing_trailer_is_still_reported_when_the_activity_post_fails(config, caplog):
+    """The activity row is telemetry and may fail; the WARNING and the ledger
+    flag do not depend on it (and the flag still dedupes the next poll)."""
+    w, gh, _ = watcher(config, make_pr(), [session_approve()])
+    gh.issue_comments = lambda *a: (_ for _ in ()).throw(RuntimeError("503"))
+
+    with caplog.at_level(logging.INFO):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    assert len(readiness_warnings(caplog)) == 1
+    assert w.state.readiness_observed(SLUG, NUMBER, "abc123") == READINESS_MISSING
+
+
+def _envelope(readiness=None, reason=""):
+    return VerdictEnvelope(VERDICT_APPROVE, readiness=readiness, readiness_reason=reason)
+
+
+@pytest.mark.parametrize(
+    "envelope, expected",
+    [
+        (_envelope(READINESS_AUTO), (READINESS_AUTO, "")),
+        (_envelope(READINESS_OPERATOR), (READINESS_OPERATOR, "")),
+        (_envelope(READINESS_OPERATOR, "touches convex/schema.ts"),
+         (READINESS_OPERATOR, "touches convex/schema.ts")),
+        (_envelope(), (READINESS_OPERATOR, "envelope carries no Merge-Readiness line")),
+        (None, (READINESS_OPERATOR, "envelope carries no Merge-Readiness line")),
+    ],
+)
+def test_the_emitter_and_the_shared_trailer_regex_agree(envelope, expected):
+    """One grammar, two writers: every line the daemon's emitter writes is a
+    line the check (and the consumer) reads back, value and reason intact."""
+    line = readiness_trailer(envelope)
+    assert line.startswith(READINESS_TRAILER_LABEL)
+    assert _TRAILER_RE.match(line)
+    assert parse_trailer(line) == expected
+    assert CONSUMER_READINESS_RE.match(line), "and the consumer's own grammar"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "see `Merge-Readiness: auto` above",
+        "`Merge-Readiness: auto`",
+        "**Merge-Readiness:** auto",
+        "- **Merge-Readiness:** auto",
+        "- Merge-Readiness: auto",
+        "Merge-Readiness: Auto",
+        "Merge-Readiness: automatic",
+        "merge-readiness: auto",
+        "the trailer Merge-Readiness: auto goes at the end",
+    ],
+)
+def test_the_trailer_regex_rejects_the_backticked_bold_and_bulleted_shapes(body):
+    assert parse_trailer(f"verdict\n{body}\nmore\n") == (None, "")
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("Merge-Readiness: auto", ("auto", "")),
+        ("Merge-Readiness:auto", ("auto", "")),
+        ("Merge-Readiness: operator", ("operator", "")),
+        ("Merge-Readiness: operator — touches convex/schema.ts", ("operator", "touches convex/schema.ts")),
+        ("Merge-Readiness: operator - hyphen", ("operator", "hyphen")),
+        ("Merge-Readiness: auto   ", ("auto", "")),
+    ],
+)
+def test_the_trailer_regex_reads_the_bare_line(body, expected):
+    # A CRLF body (a review typed into the web form) reads the same.
+    assert parse_trailer(f"verdict\r\n\r\n{body}\r\n") == expected
+    assert parse_trailer(f"verdict\n\n{body}\n") == expected
+
+
+def test_parse_trailer_takes_the_first_bare_line_and_flattens_the_reason():
+    assert parse_trailer(
+        "Merge-Readiness: operator — `first`  reason\nMerge-Readiness: auto\n"
+    ) == ("operator", "first reason")
+    assert parse_trailer(None) == (None, "")
+    assert parse_trailer("") == (None, "")
 
 
 def test_a_non_approve_close_names_no_readiness(config, no_post_grace, caplog):
