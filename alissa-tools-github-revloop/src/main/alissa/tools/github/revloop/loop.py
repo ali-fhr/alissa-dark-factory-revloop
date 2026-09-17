@@ -4468,7 +4468,9 @@ class ReviewWatcher:
 
         The two backing stores are not interchangeable and the split is the
         whole point: durable in production, process-lifetime in dry-run, so
-        neither mode can ever silence the other. See _warn_identity_drift.
+        neither mode can ever silence the other. See _warn_identity_drift;
+        the first-run-dialog wedge (_wedged_on_first_run_dialog) keys its
+        one-WARNING-per-episode gate through the same pair.
         """
         if record:
             return self.state.pinged(pr.full_name, pr.number, kind)
@@ -5262,7 +5264,7 @@ class ReviewWatcher:
         Reads the pane (`alissa tmux tail`, 40 lines) and asks
         `trust.pane_shows_first_run_dialog` whether the session is PARKED on
         a gate -- the gate's accept option among the last lines with nothing
-        but the gate's own chrome below it, its question above -- not merely
+        but the gate's own chrome below it, its question strictly above -- not merely
         whether the gate's words appear: this repo's own README, CHANGELOG,
         `trust.py` and issue #136 quote them, so a session that cats or
         diffs any of them has them on screen while at work, and a kill here
@@ -5273,8 +5275,11 @@ class ReviewWatcher:
         deliberately NOT classified here).
 
         A match is `wedged:first-run-dialog`: ONE WARNING per episode (keyed
-        first_run_dialog_kind(session) in the ping ledger; a kill that fails
-        and is retried next poll logs at INFO), then the row's own session is
+        first_run_dialog_kind(session) -- in the durable ping ledger in
+        production, in the process-lifetime `_dry_run_drift` set under
+        dry-run, the `_warn_identity_drift` split, so a diagnostic pass can
+        never silence production nor production the diagnostic; a kill that
+        fails and is retried next poll logs at INFO), then the row's own session is
         killed (`alissa tmux kill <name>`, never a sweep), the hub it started
         in is trusted (root, main/, the review checkout -- the very entries
         the gate was asking for, so the re-queued round does not meet it
@@ -5282,8 +5287,9 @@ class ReviewWatcher:
         the caller to re-queue the round NOW, exactly as a dead session
         would (the respawn is `reenqueued`, lands in the `stale_reenqueued`
         bucket, and burns the round's attempt the same way). Dry-run
-        classifies and logs but kills nothing and answers False (the defer
-        holds). A kill that fails answers False too: the defer holds and the
+        classifies and logs (once per episode, in memory) but writes no
+        ledger row, kills nothing and answers False (the defer holds). A
+        kill that fails answers False too: the defer holds and the
         next poll, reading the same pane, tries again -- the remedy for a
         session that will not die, not a loop to guard against.
 
@@ -5300,7 +5306,11 @@ class ReviewWatcher:
         cwd = self.config.hub_for(pr.owner, pr.repo)
         hub = hub_root_of(cwd)
         kind = first_run_dialog_kind(session)
-        if self.state.pinged(pr.full_name, pr.number, kind):
+        # Durable in production, process-lifetime in dry-run (review round 1
+        # of PR #137): the two stores never meet, so a `--once --dry-run`
+        # pass over the default state path cannot eat production's WARNING.
+        record = not self.config.dry_run
+        if self._drift_gated(pr, kind, record):
             log.info(
                 "%s: session %s (%s round %d) is still on claude's first-run "
                 "dialog — retrying the kill",
@@ -5321,7 +5331,7 @@ class ReviewWatcher:
                 " / ".join(repr(m) for m in FIRST_RUN_DIALOG_MARKERS), hub,
                 round_,
             )
-            self.state.record_ping(pr.full_name, pr.number, kind)
+            self._note_drift_gate(pr, kind, record)
         if self.config.dry_run:
             log.info(
                 "[dry-run] would kill %s, pre-trust %s and re-queue round %d",

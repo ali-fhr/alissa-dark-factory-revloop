@@ -10798,6 +10798,66 @@ def test_dry_run_classifies_the_dialog_but_kills_nothing(config, caplog, isolate
     assert al.killed == [] and al.enqueued == []
     assert not (home / ".claude.json").exists()
     assert any("[dry-run] would kill" in r.message for r in caplog.records)
+    assert not st.pinged(SLUG, NUMBER, first_run_dialog_kind(session)), \
+        "dry-run touches no ledger (PR #137 review round 1)"
+
+
+def test_a_dry_run_pass_cannot_silence_the_production_warning(config, caplog, isolated_claude_home):
+    """PR #137 review round 1: `alissa-revloop --once --dry-run` runs against
+    the default state path, so the two modes share a ledger in practice. A
+    dry-run pass over a wedged session must leave the episode's row unwritten:
+    the real pass that follows over the SAME state_db still owes -- and emits
+    -- its one WARNING, and clears the lane."""
+    home, _ = isolated_claude_home
+    dry = dataclasses.replace(config, dry_run=True)
+    st = State(dry.state_db)
+    w_dry, _, al_dry = watcher(dry, make_pr(), [], state=st)
+    session = _record(w_dry, make_pr(), 1)
+    _live(al_dry, session, status="busy", last_activity=time.time())
+    _backdate(st, PAST_STALE)
+    al_dry.tails[session] = TRUST_DIALOG_PANE
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github.revloop.loop"):
+        assert w_dry.evaluate(OWNER, REPO, NUMBER).action is Action.IN_FLIGHT
+        dry_warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        caplog.clear()
+
+        w, _, al = watcher(config, make_pr(), [], state=State(config.state_db))
+        _live(al, session, status="busy", last_activity=time.time())
+        al.tails[session] = TRUST_DIALOG_PANE
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert len(dry_warnings) == 1 and WEDGE_FIRST_RUN_DIALOG in dry_warnings[0].message, \
+        "dry-run still reports the classification once"
+    assert d.action is Action.SPAWNED and al.killed == [session]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [r.message for r in warnings]
+    assert "pane shows claude's first-run dialog" in warnings[0].message
+    assert not any("retrying the kill" in r.message for r in caplog.records)
+    assert w.state.pinged(SLUG, NUMBER, first_run_dialog_kind(session))
+
+
+def test_dry_run_reports_the_wedge_once_per_process(config, caplog, isolated_claude_home):
+    """The in-memory twin: a daemon left running in dry-run says it once per
+    episode (WARNING, then INFO), still writing nothing durable."""
+    dry = dataclasses.replace(config, dry_run=True)
+    st = State(dry.state_db)
+    w, _, al = watcher(dry, make_pr(), [], state=st)
+    session = _record(w, make_pr(), 1)
+    _live(al, session, status="busy", last_activity=time.time())
+    _backdate(st, PAST_STALE)
+    al.tails[session] = TRUST_DIALOG_PANE
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github.revloop.loop"):
+        w.evaluate(OWNER, REPO, NUMBER)
+        w.evaluate(OWNER, REPO, NUMBER)
+
+    wedges = [r for r in caplog.records if "pane shows claude's first-run dialog" in r.message]
+    assert len(wedges) == 1 and wedges[0].levelno == logging.WARNING
+    assert len([r for r in caplog.records if "retrying the kill" in r.message]) == 1
+    assert len([r for r in caplog.records if "[dry-run] would kill" in r.message]) == 2
+    assert al.killed == []
+    assert not st.pinged(SLUG, NUMBER, first_run_dialog_kind(session))
 
 
 # -- issue #136: the derived allowlist is recorded and its hubs trusted --------

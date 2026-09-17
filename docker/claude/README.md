@@ -304,8 +304,10 @@ writes after every successful feed refresh, one `owner/repo` per line
 before every spawn (root, `main/`, the `REVIEW-<task>` checkout), so the
 entrypoint's file only has to cover the boot the daemon has not run yet. A
 stale round whose session's pane is *parked* on the dialog (the accept option
-among its last lines, nothing but the dialog's own chrome below it — a pane
-that merely quotes the words is not one) is classified
+among its last lines, nothing but the dialog's own chrome below it, the
+dialog's question — `Quick safety check` / `Is this a project you created` /
+`Bypass Permissions mode` — strictly above it; a pane that merely quotes the
+words is not one) is classified
 `wedged:first-run-dialog`, killed, its hub seeded and the round re-queued (one
 WARNING; see the revloop README, *Sitting on the first-run dialog*).
 **Operator lever** for a pane you find on the dialog: `alissa tmux tail

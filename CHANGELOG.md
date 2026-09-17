@@ -37,8 +37,9 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     the pane is read (`alissa tmux tail`, 40 lines; new
     `Alissa.tail_session`). A pane *parked* on a gate — the accept option
     among the last non-blank lines, nothing but the gate's chrome below it,
-    the question above — is one WARNING per episode (ping kind
-    `first-run-dialog:<session>`; a failed kill retries next poll at INFO),
+    the question strictly above — is one WARNING per episode (ping kind
+    `first-run-dialog:<session>` in production, a process-lifetime set under
+    dry-run; a failed kill retries next poll at INFO),
     the round's own session killed, its hub seeded, one activity-comment
     line, and the round re-queued in the same pass exactly as a dead
     session's is (`reenqueued`, the `stale_reenqueued` bucket; the respawn
@@ -65,6 +66,19 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     image contract runs the shipped seeding with one derived repo. A
     `conftest.py` autouse fixture points `HOME` / `CLAUDE_CONFIG_DIR` at
     scratch dirs for every test.
+  - **Review round 1 (PR #137).** The wedge's one-WARNING gate recorded its
+    ping-ledger row *before* the dry-run guard, so a `--once --dry-run` pass
+    over the default state path silenced the WARNING production owed for the
+    same episode; it now takes the identity-drift split (durable in
+    production, process-lifetime in dry-run). The classifier's third leg read
+    the option line itself and `Yes, I trust this folder` contains the old
+    `trust this folder` marker, so for the trust gate the leg was
+    self-satisfied; the markers are now the gates' question text (`quick
+    safety check` / `is this a project you created` / the older `trust the
+    files in this folder` / `bypass permissions mode`) and must stand
+    strictly above the option line — stricter than devloop's `hubs.py`
+    until devloop follows. `trust.read_derived_repos` (no production caller;
+    the entrypoint parses the file inline) is dropped.
 
 ## 0.31.1
 

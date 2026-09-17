@@ -20,7 +20,6 @@ from alissa.tools.github.revloop.trust import (
     hub_root,
     hub_trust_paths,
     pane_shows_first_run_dialog,
-    read_derived_repos,
     review_checkout_name,
     seed_trust,
     write_derived_repos,
@@ -332,11 +331,13 @@ def test_one_unwritable_target_does_not_stop_the_other(tmp_path, caplog):
 # -- the derived-repos record ------------------------------------------------
 
 
-def test_write_and_read_derived_repos_round_trip(tmp_path):
+def test_write_derived_repos_is_one_repo_per_line(tmp_path):
+    """The file body IS the contract: the entrypoint's 3a seeding parses it
+    inline (one `owner/repo` per line, case kept; `tests-entrypoint-config.sh`
+    section 1d boots that reader against a file written in this shape)."""
     written = write_derived_repos(tmp_path, ["acme/widgets", "Acme/Gadgets"])
     assert written == tmp_path / DERIVED_REPOS_FILENAME
     assert written.read_text() == "acme/widgets\nAcme/Gadgets\n"
-    assert read_derived_repos(tmp_path) == ("acme/widgets", "Acme/Gadgets")
 
 
 def test_write_derived_repos_skips_an_unchanged_file(tmp_path):
@@ -344,20 +345,11 @@ def test_write_derived_repos_skips_an_unchanged_file(tmp_path):
     assert write_derived_repos(tmp_path, ["acme/widgets"]) is None
 
 
-def test_read_derived_repos_ignores_comments_blanks_and_non_repos(tmp_path):
-    (tmp_path / DERIVED_REPOS_FILENAME).write_text("# header\n\nacme/widgets\nnot-a-repo\n  acme/x  \n")
-    assert read_derived_repos(tmp_path) == ("acme/widgets", "acme/x")
-
-
-def test_read_derived_repos_is_empty_when_absent(tmp_path):
-    assert read_derived_repos(tmp_path) == ()
-
-
 def test_the_derived_repos_file_honours_the_env_override(tmp_path, monkeypatch):
     elsewhere = tmp_path / "elsewhere" / "repos.txt"
     monkeypatch.setenv("ALISSA_DERIVED_REPOS_FILE", str(elsewhere))
     assert write_derived_repos(tmp_path / "root", ["acme/widgets"]) == elsewhere
-    assert read_derived_repos(tmp_path / "root") == ("acme/widgets",)
+    assert elsewhere.read_text() == "acme/widgets\n"
     assert not (tmp_path / "root" / DERIVED_REPOS_FILENAME).exists()
 
 
@@ -377,8 +369,10 @@ def test_write_derived_repos_failure_is_a_warning(tmp_path, caplog, monkeypatch)
 # PR #124 review round 1): a session that cats any of them has them on screen
 # while at work, and a match kills the session. The classifier asks for the
 # gate's SHAPE -- the accept option among the last lines, only the gate's
-# chrome below it, the question above -- and these fixtures (devloop PR #124's,
-# verbatim: boxed, numbered, accept-first, footer variants) pin both sides.
+# chrome below it, the question STRICTLY above it (PR #137 review round 1:
+# the option line itself never corroborates) -- and these fixtures (devloop
+# PR #124's, verbatim: boxed, numbered, accept-first, footer variants) pin
+# both sides.
 
 TRUST_DIALOG = """\
  Quick safety check: Is this a project you created or one you trust?
@@ -464,14 +458,27 @@ DIFF_PANE = """\
 TOOL_CALL_AFTER_THE_GATE = TRUST_DIALOG + "● Bash(cat README.md)\n  ⎿  # revloop\n"
 SHELL_PROMPT_AFTER_CLAUDE_EXITED = TRUST_DIALOG + "alissa@box:~/hub/main$ \n"
 GATE_TOO_FAR_UP = TRUST_DIALOG + "".join(f"progress {i}\n" for i in range(6))
-QUESTION_WITHOUT_OPTIONS = "the trust this folder dialog is what the seeding pre-answers\n"
+QUESTION_WITHOUT_OPTIONS = "quick safety check: is this a project you created or one you trust?\n"
 ACCEPT_WITHOUT_ITS_QUESTION = " ❯ No, exit\n   Yes, I accept\n"
+# The accept option alone -- what a pane echoing the option (a `send-keys`
+# transcript, a grep hit) shows: it contains the words `trust this folder`
+# and it is NOT a gate, because no question stands above it.
+TRUST_ACCEPT_WITHOUT_ITS_QUESTION = " ❯ No, exit\n   Yes, I trust this folder\n"
+BARE_ACCEPT_LINE = "YES, I TRUST THIS FOLDER"
+# The older trust dialog wording, which a pinned Claude Code may still draw.
+OLDER_TRUST_DIALOG = """\
+ Do you trust the files in this folder?
+
+ ❯ Yes, proceed
+   Yes, I trust this folder
+   No, exit
+"""
 
 
 @pytest.mark.parametrize("pane", [
     TRUST_DIALOG,
     BYPASS_GATE,
-    "YES, I TRUST THIS FOLDER",
+    OLDER_TRUST_DIALOG,
     TRUST_DIALOG_BOXED,
     BYPASS_GATE_NUMBERED,
     EARLIER_OUTPUT + TRUST_DIALOG,
@@ -504,6 +511,8 @@ def test_other_panes_including_other_wedges_are_not_the_dialog(pane):
     GATE_TOO_FAR_UP,
     QUESTION_WITHOUT_OPTIONS,
     ACCEPT_WITHOUT_ITS_QUESTION,
+    TRUST_ACCEPT_WITHOUT_ITS_QUESTION,
+    BARE_ACCEPT_LINE,
 ])
 def test_a_pane_that_merely_mentions_a_gate_is_not_the_gate(pane):
     """A reviewer that cats this README or issue #136, greps the tree or
@@ -512,3 +521,15 @@ def test_a_pane_that_merely_mentions_a_gate_is_not_the_gate(pane):
     call, the input prompt, a shell prompt), or the words are not shaped
     like a gate at all. Killing such a session would double the round."""
     assert not pane_shows_first_run_dialog(pane)
+
+
+def test_the_option_line_never_corroborates_itself():
+    """PR #137 review round 1: the third leg reads STRICTLY above the option
+    line, so the words the accept option carries (`trust this folder`)
+    cannot stand in for the gate's question. The same pane with the question
+    one line up is the gate."""
+    assert not pane_shows_first_run_dialog(TRUST_ACCEPT_WITHOUT_ITS_QUESTION)
+    assert pane_shows_first_run_dialog(
+        "Quick safety check: Is this a project you created or one you trust?\n"
+        + TRUST_ACCEPT_WITHOUT_ITS_QUESTION
+    )

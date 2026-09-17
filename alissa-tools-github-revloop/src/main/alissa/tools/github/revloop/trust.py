@@ -107,8 +107,12 @@ REVIEW_CHECKOUT_PREFIX = "REVIEW-"
 #   a session that printed ANYTHING after the text -- a spinner, a tool
 #   call, the `>` input prompt an idle session sits at, a shell prompt --
 #   is not on the gate;
-# * the gate's QUESTION (`FIRST_RUN_DIALOG_MARKERS`) appears at or above
-#   the option line.
+# * the gate's QUESTION (`FIRST_RUN_DIALOG_MARKERS`) appears STRICTLY above
+#   the option line -- the markers are the questions' own words, none of
+#   which the accept options contain, so the option line can never stand
+#   in for its question (PR #137 review round 1: with `trust this folder`
+#   as the marker and the option line counted, `Yes, I trust this folder`
+#   alone satisfied this leg).
 #
 # The trust dialog reads "Quick safety check: Is this a project you created
 # or one you trust? … ❯ No, exit / Yes, I trust this folder"; the
@@ -117,10 +121,16 @@ REVIEW_CHECKOUT_PREFIX = "REVIEW-"
 # or without numbering, an optional "Enter to confirm · Esc to exit" footer
 # and box drawing). Both are gates the entrypoint's seeding is meant to
 # pre-answer, so a pane parked on either is a session the seeding missed,
-# not a session at work. Identical to devloop's so the two seats agree on
-# the shape check; the fixtures are shared verbatim.
+# not a session at work. devloop's `hubs.py` checks the same first two legs
+# on the same fixtures (shared verbatim); its third leg still counts the
+# option line and carries `trust this folder` as the marker, which this
+# module tightened -- a devloop follow-up, so the two seats agree again.
+# The trust gate's older wording ("Do you trust the files in this folder?")
+# is kept so a pinned Claude Code that still draws it is a gate too.
 FIRST_RUN_DIALOG_MARKERS = (
-    "trust this folder",
+    "quick safety check",
+    "is this a project you created",
+    "trust the files in this folder",
     "bypass permissions mode",
 )
 FIRST_RUN_DIALOG_OPTIONS = (
@@ -401,7 +411,9 @@ def derived_repos_path(root: "Path | str") -> Path:
 
 def write_derived_repos(root: "Path | str", repos: "Sequence[str]") -> "Path | None":
     """Record the derived allowlist, one `owner/repo` per line, for the next
-    boot's entrypoint seeding. Rewritten only when the content differs.
+    boot's entrypoint seeding (the entrypoint's 3a block is the only reader:
+    it skips blank lines, `#` comments and lines without a `/`). Rewritten
+    only when the content differs.
     Returns the path written, or None when nothing changed or the write
     failed (logged; never raised -- the daemon has already trusted the hubs
     itself, so this file only matters to a future boot)."""
@@ -424,22 +436,6 @@ def write_derived_repos(root: "Path | str", repos: "Sequence[str]") -> "Path | N
     return path
 
 
-def read_derived_repos(root: "Path | str") -> "tuple[str, ...]":
-    """The recorded derived allowlist (`owner/repo` per line; blank lines and
-    `#` comments ignored), or `()` when absent or unreadable."""
-    path = derived_repos_path(root)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return ()
-    out = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "/" in line:
-            out.append(line)
-    return tuple(out)
-
-
 def _dialog_line(line: str) -> str:
     """A pane line reduced to the text a gate would render there (see
     _DIALOG_DECORATION), casefolded."""
@@ -456,7 +452,7 @@ def pane_shows_first_run_dialog(pane: str) -> bool:
     """Whether a session's terminal tail is PARKED on one of Claude Code's
     first-run gates: the gate's accept option among the last
     FIRST_RUN_DIALOG_TAIL_LINES non-blank lines, nothing but the gate's own
-    chrome below it, and the gate's question at or above it (the notes on
+    chrome below it, and the gate's question strictly above it (the notes on
     FIRST_RUN_DIALOG_MARKERS say why each leg is there). An empty capture
     (the CLI could not tail) is never a dialog -- absence of evidence keeps
     the defer -- and neither is a pane that merely MENTIONS a gate: a
@@ -473,5 +469,5 @@ def pane_shows_first_run_dialog(pane: str) -> bool:
         return False
     if not all(_is_dialog_chrome(t) for t in tail[offset + 1:]):
         return False
-    above = lines[:len(lines) - len(tail) + offset + 1]
+    above = lines[:len(lines) - len(tail) + offset]
     return any(m in t for t in above for m in FIRST_RUN_DIALOG_MARKERS)

@@ -806,12 +806,17 @@ session's terminal (`alissa tmux tail`, 40 lines) and, when the pane is
 **parked on the gate** — its accept option (`Yes, I trust this folder` /
 `Yes, I accept`) among the last non-blank lines with nothing below it but the
 gate's own chrome (`No, exit`, `Enter to confirm …`), and the gate's question
-(`trust this folder` / `bypass permissions mode`) above it — classifies the
-round `wedged:first-run-dialog`:
+(`Quick safety check` / `Is this a project you created` / `Bypass Permissions
+mode`) *strictly* above it — the accept option's own words never corroborate
+it — classifies the round `wedged:first-run-dialog`:
 
 - **one WARNING per episode** (keyed `first-run-dialog:<session>` in the ping
   ledger; a kill that fails is retried next poll at INFO), naming the session,
-  the hub being trusted, the round it re-queues and the operator lever;
+  the hub being trusted, the round it re-queues and the operator lever. Under
+  `--dry-run` the classification is logged once per process lifetime and
+  nothing is killed, seeded or re-queued — and **no ledger row is written**,
+  the identity-drift split, so a diagnostic pass cannot silence the WARNING a
+  production pass owes for the same episode;
 - **kill** the round's own session (`alissa tmux kill <name>`, never a sweep);
 - **seed trust** for the hub the session started in — the hub root, `main/`
   (the reviewer's cwd) and the `REVIEW-<task>` checkout the review skill may
