@@ -40,6 +40,15 @@ from .alissa import (
 )
 from .alissa_client import AlissaClient
 from .bows import EMPTY_SET_WARNING, FEED_PREFIX, BowRepoSource
+from .trust import (
+    FIRST_RUN_DIALOG_MARKERS,
+    WEDGE_FIRST_RUN_DIALOG,
+    hub_root as hub_root_of,
+    hub_trust_paths,
+    pane_shows_first_run_dialog,
+    seed_trust,
+    write_derived_repos,
+)
 from .config import (
     HUB_ADD,
     REPOS_BOWS,
@@ -1240,6 +1249,39 @@ def stalled_kind(session: str) -> str:
     return f"{ESCALATION_STALLED}:{session}"
 
 
+# The first-run-dialog wedge's ping-ledger kind prefix (issue #136; see
+# ReviewWatcher._wedged_on_first_run_dialog). Like the stalled ping it recurs
+# per EPISODE, and the episode identity is the session name: the daemon
+# killed a session whose pane sat on one of Claude Code's first-run gates,
+# seeded the trust the gate was asking for, and re-queued the round itself.
+# The row dedupes the WARNING (one per episode -- a kill that fails and is
+# retried next poll logs its retry at INFO) and, under its own kind, the
+# activity-comment line.
+ESCALATION_FIRST_RUN_DIALOG = "first-run-dialog"
+
+# How many pane lines the first-run-dialog check reads. The trust dialog is a
+# ~12-line box and the bypass-permissions gate ~20; a session sitting on
+# either has printed nothing since, so the last 40 lines hold the whole
+# prompt with room for the banner above it.
+FIRST_RUN_PANE_TAIL_LINES = 40
+
+
+def first_run_dialog_kind(session: str) -> str:
+    """The ping-ledger kind that dedupes ONE first-run-dialog wedge episode's
+    WARNING. stalled_kind's episode reasoning: every spawn of every round can
+    meet the dialog (a hub trusted after session k was killed is trusted for
+    session k+1, but a seeding that failed to land leaves the next session
+    on the same prompt), and episode k's row must not silence episode
+    k+1's. The session name is nonce-unique per spawn, so it is the key."""
+    return f"{ESCALATION_FIRST_RUN_DIALOG}:{session}"
+
+
+def first_run_dialog_activity_kind(session: str) -> str:
+    """The ping-ledger kind that dedupes the episode's activity-comment line;
+    recorded only after the append lands, so a transient failure retries."""
+    return f"activity-{ESCALATION_FIRST_RUN_DIALOG}:{session}"
+
+
 def capout_kind(head_sha: str, granted: int) -> str:
     """The ping-ledger kind that dedupes ONE cap-out page.
 
@@ -1815,6 +1857,13 @@ class ReviewWatcher:
         # has listed this pass (the preflight refresh, or a sweep whose list
         # failed), and the refresh lists for itself.
         self._pass_roster: list[ManagedSession] | None = None
+        # The (repo, number, round) whose alive session the stale-round probe
+        # just killed as `wedged:first-run-dialog` (issue #136), so the
+        # respawn site logs its re-enqueue at INFO instead of a second
+        # WARNING: the classifier's WARNING already said everything the
+        # "presumed dead" line would, and the issue's contract is ONE.
+        # Consumed by the respawn that follows in the same evaluate().
+        self._dialog_wedge_cleared: "tuple[str, int, int] | None" = None
         # (repo full name, PR number) -> when the reviewer login was most
         # recently asked to review that PR, per the issue timeline (an ISO
         # stamp, or None for never) -- the round-admission gate's one GitHub
@@ -1954,6 +2003,39 @@ class ReviewWatcher:
             # Telemetry-class: the console's window onto the derived set.
             # Best-effort inside State, like every other telemetry write.
             self.state.record_derived_repos(source.sources())
+        self._record_derived(source.derived)
+
+    def _record_derived(self, derived: "tuple[str, ...]") -> None:
+        """Issue #136: make the derived allowlist visible to the entrypoint's
+        boot-time trust seeding (`{root}/.alissa-derived-repos`) and trust
+        the derived hubs NOW -- hub-ified or not, exactly as the entrypoint
+        trusts a static allowlist's hubs before they exist. Both are
+        best-effort and idempotent; dry-run writes nothing. Called after
+        every refresh, so a retained set (a refresh that failed keeps the
+        last derived set) is re-asserted too, at no cost when nothing
+        changed."""
+        if not derived:
+            return
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would record %d derived repo(s) and pre-trust "
+                "their hubs for claude", len(derived),
+            )
+            return
+        write_derived_repos(self.config.workspace_root, derived)
+        paths: "list[Path]" = []
+        for full_name in derived:
+            owner, _, repo = full_name.partition("/")
+            if not owner or not repo:
+                continue
+            paths.extend(hub_trust_paths(self.config.hub_for(owner, repo)))
+        changed = seed_trust(paths)
+        if changed:
+            log.info(
+                "repos_source=bows: pre-trusted the hubs of %d derived "
+                "repo(s) for claude (root and main/ each) in %s",
+                len(derived), ", ".join(str(t) for t in changed),
+            )
 
     def _search_allowlist(self) -> "tuple[str, ...] | None":
         """The allowlist the review-requested search runs over, or None when
@@ -2371,14 +2453,28 @@ class ReviewWatcher:
         if age is not None:
             # Logged only once the gate has let the respawn through, so the
             # line cannot claim a re-enqueue that back-pressure then deferred.
-            log.warning(
-                "%s round %d has been in flight %.0f min with no submitted review "
-                "and its session is gone or finished — re-enqueuing (reviewer "
-                "session presumed dead)",
-                pr.slug,
-                round_,
-                age / 60,
-            )
+            # A round whose session the probe killed as wedged on the
+            # first-run dialog was already WARNED once by the classifier, so
+            # its re-enqueue is INFO (issue #136: one WARNING per episode).
+            wedged = self._dialog_wedge_cleared == (pr.full_name, number, round_)
+            self._dialog_wedge_cleared = None
+            if wedged:
+                log.info(
+                    "%s round %d re-enqueuing after its session was killed "
+                    "(%s)",
+                    pr.slug,
+                    round_,
+                    WEDGE_FIRST_RUN_DIALOG,
+                )
+            else:
+                log.warning(
+                    "%s round %d has been in flight %.0f min with no submitted "
+                    "review and its session is gone or finished — re-enqueuing "
+                    "(reviewer session presumed dead)",
+                    pr.slug,
+                    round_,
+                    age / 60,
+                )
 
         return self._spawn(
             pr,
@@ -4041,6 +4137,22 @@ class ReviewWatcher:
         if ses.is_idle and quiet_for >= self.config.reap_grace_seconds:
             return None  # idle-finished: it died without submitting -> respawn
 
+        # Issue #136: alive is a process, not a reviewer. A session sitting
+        # on Claude Code's first-run "trust this folder?" (or the
+        # bypass-permissions) gate is listed, registers activity, and will
+        # never submit anything -- the directive typed into the pane was
+        # swallowed by the prompt. Only here, on a SUCCESSFUL listing that
+        # names the row, and only when the pane SHOWS the gate: every other
+        # alive-but-idle case keeps the floored defer below, exactly as
+        # before. A match has been killed and its hub seeded, so the round
+        # re-queues NOW as the dead-session path would (same attempt/round
+        # accounting: `reenqueued`, the `stale_reenqueued` bucket).
+        if self._wedged_on_first_run_dialog(
+            pr, round_, session, str(row["task_ref"] or "") or None, cap
+        ):
+            self._dialog_wedge_cleared = (pr.full_name, pr.number, round_)
+            return None
+
         if (
             age >= STALLED_DEFER_MULTIPLE * STALE_ROUND_SECONDS
             and not self.state.pinged(pr.full_name, pr.number, stalled_kind(session))
@@ -4936,7 +5048,7 @@ class ReviewWatcher:
             stability=stability.text if stability is not None else "",
         )
 
-        hub, problem = self._ensure_hub(pr)
+        hub, problem = self._ensure_hub(pr, task_ref=task.ref if task else None)
         if problem is not None:
             return Decision(Action.SKIPPED, problem, round_)
 
@@ -5040,7 +5152,9 @@ class ReviewWatcher:
             env_var=self.config.reviewer_token_env, reviewer=self.github.login
         )
 
-    def _ensure_hub(self, pr: PullRequest) -> tuple[Path, str | None]:
+    def _ensure_hub(
+        self, pr: PullRequest, *, task_ref: "str | None" = None
+    ) -> tuple[Path, str | None]:
         """Resolve the reviewer's cwd, hub-ifying the repo first if configured.
 
         Returns (hub, problem). `problem` is non-None when the round cannot run.
@@ -5050,9 +5164,20 @@ class ReviewWatcher:
         _refused_before_start, above the CI gate. The re-read below is not
         redundant with it -- `add` can have created the hub in between, and this
         is the check that says so.
+
+        Either way out (hub present, or hub-ified here) the hub is pre-trusted
+        for claude BEFORE the caller enqueues the session (issue #136; see
+        `_trust_hub`). `task_ref` names the round's review task, so the
+        `REVIEW-<task>` checkout the skill may create is trusted too.
         """
         hub = self.config.hub_for(pr.owner, pr.repo)
         if hub.is_dir():
+            # A hub that appeared between boots was never seeded by the
+            # entrypoint at all, and a REVIEW-* checkout may have appeared
+            # since the last spawn: trust is re-asserted before EVERY spawn.
+            # Idempotent and cheap -- a state file already carrying every
+            # path is not rewritten.
+            self._trust_hub(hub, "before spawn", task_ref)
             return hub, None
 
         # Guarded twice: config.load() rejects 'add' without an allowlist, and
@@ -5085,7 +5210,151 @@ class ReviewWatcher:
                 f"{hub} still does not exist — check hub_template against the "
                 f"manifest's `dir:` override"
             )
+        # Issue #136: the entrypoint pre-trusts only the hubs it can name at
+        # boot, and under `repos_source: bows` a hub created here was never
+        # among them -- the first session on it would sit on Claude Code's
+        # "trust this folder?" dialog while the stale-round probe read it as
+        # alive. Seed the hub root, main/ (the spawn cwd) and the review
+        # checkout BEFORE the session is enqueued.
+        self._trust_hub(hub, "hub-ified", task_ref)
         return hub, None
+
+    def _trust_hub(
+        self, cwd: Path, why: str, task_ref: "str | None" = None
+    ) -> "list[Path]":
+        """Pre-accept Claude Code's trust dialog for every directory a
+        reviewer session on this hub may start in or `cd` into (see
+        `trust.hub_trust_paths`: the hub root, `main/`, the `REVIEW-<task>`
+        checkout), in both claude state files. Returns the state files that
+        changed. Dry-run seeds nothing. Best-effort by construction
+        (`seed_trust` never raises): a session can still be spawned into an
+        untrusted hub -- it just may wedge on the dialog, which the
+        stale-round probe now detects -- so a failed seed must never cost the
+        spawn."""
+        paths = hub_trust_paths(cwd, task_ref=task_ref)
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would pre-trust %d claude dir(s) for hub %s (%s)",
+                len(paths), hub_root_of(cwd), why,
+            )
+            return []
+        changed = seed_trust(paths)
+        if changed:
+            log.info(
+                "trusted hub %s for claude (%s): %d dir(s) — %s — written to %s",
+                hub_root_of(cwd), why, len(paths),
+                ", ".join(str(p) for p in paths),
+                ", ".join(str(t) for t in changed),
+            )
+        return changed
+
+    def _wedged_on_first_run_dialog(
+        self,
+        pr: PullRequest,
+        round_: int,
+        session: str,
+        task_ref: "str | None",
+        cap: int,
+    ) -> bool:
+        """Issue #136: is this stale round's alive session sitting on one of
+        Claude Code's first-run gates -- and if so, clear the lane.
+
+        Reads the pane (`alissa tmux tail`, 40 lines) and asks
+        `trust.pane_shows_first_run_dialog` whether the session is PARKED on
+        a gate -- the gate's accept option among the last lines with nothing
+        but the gate's own chrome below it, its question above -- not merely
+        whether the gate's words appear: this repo's own README, CHANGELOG,
+        `trust.py` and issue #136 quote them, so a session that cats or
+        diffs any of them has them on screen while at work, and a kill here
+        would double the round. A pane not parked on a gate, or one the CLI
+        could not capture, answers False and the caller keeps the floored
+        defer it always took (the other alive-but-idle causes -- an expired
+        login, a usage limit, any other permission prompt -- are
+        deliberately NOT classified here).
+
+        A match is `wedged:first-run-dialog`: ONE WARNING per episode (keyed
+        first_run_dialog_kind(session) in the ping ledger; a kill that fails
+        and is retried next poll logs at INFO), then the row's own session is
+        killed (`alissa tmux kill <name>`, never a sweep), the hub it started
+        in is trusted (root, main/, the review checkout -- the very entries
+        the gate was asking for, so the re-queued round does not meet it
+        again), one activity-comment line records the act, and True tells
+        the caller to re-queue the round NOW, exactly as a dead session
+        would (the respawn is `reenqueued`, lands in the `stale_reenqueued`
+        bucket, and burns the round's attempt the same way). Dry-run
+        classifies and logs but kills nothing and answers False (the defer
+        holds). A kill that fails answers False too: the defer holds and the
+        next poll, reading the same pane, tries again -- the remedy for a
+        session that will not die, not a loop to guard against.
+
+        The pane is untrusted third-party terminal content: only its
+        CLASSIFICATION reaches the log; the capture itself stays at DEBUG.
+        """
+        pane = self.alissa.tail_session(session, FIRST_RUN_PANE_TAIL_LINES)
+        if not pane_shows_first_run_dialog(pane):
+            return False
+        log.debug(
+            "%s: last %d pane lines of %s:\n%s",
+            WEDGE_FIRST_RUN_DIALOG, FIRST_RUN_PANE_TAIL_LINES, session, pane,
+        )
+        cwd = self.config.hub_for(pr.owner, pr.repo)
+        hub = hub_root_of(cwd)
+        kind = first_run_dialog_kind(session)
+        if self.state.pinged(pr.full_name, pr.number, kind):
+            log.info(
+                "%s: session %s (%s round %d) is still on claude's first-run "
+                "dialog — retrying the kill",
+                WEDGE_FIRST_RUN_DIALOG, session, pr.slug, round_,
+            )
+        else:
+            log.warning(
+                "%s: session %s (%s round %d) reads alive but its pane shows "
+                "claude's first-run dialog (%s) — the directive was swallowed "
+                "by the prompt and no verdict will ever be submitted. Killing "
+                "it, pre-trusting hub %s (root, main/, review checkout) for "
+                "claude, and re-queuing round %d now (counted exactly as a dead "
+                "session's respawn). Operator lever: `alissa tmux tail "
+                "<session>` to see the prompt, `tmux send-keys -t <session> "
+                "Down Enter` to accept it by hand, or kill + seed as the daemon "
+                "does",
+                WEDGE_FIRST_RUN_DIALOG, session, pr.slug, round_,
+                " / ".join(repr(m) for m in FIRST_RUN_DIALOG_MARKERS), hub,
+                round_,
+            )
+            self.state.record_ping(pr.full_name, pr.number, kind)
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would kill %s, pre-trust %s and re-queue round %d",
+                session, hub, round_,
+            )
+            return False
+        try:
+            self.alissa.kill_session(session)
+        except CommandError as exc:
+            log.warning(
+                "%s: could not kill %s (%s) — kills are best-effort; the round "
+                "keeps its defer and the kill is retried next poll",
+                WEDGE_FIRST_RUN_DIALOG, session, exc,
+            )
+            return False
+        self._trust_hub(cwd, WEDGE_FIRST_RUN_DIALOG, task_ref)
+        activity_kind = first_run_dialog_activity_kind(session)
+        if not self.state.pinged(pr.full_name, pr.number, activity_kind):
+            landed = self._append_activity(
+                pr,
+                self._activity_line(
+                    session,
+                    round_,
+                    f"{WEDGE_FIRST_RUN_DIALOG} — session `{session}` read alive "
+                    f"but its pane sat on claude's first-run dialog (the hub was "
+                    f"not pre-trusted); killed, hub `{hub}` pre-trusted, round "
+                    f"{round_} re-queued",
+                    cap,
+                ),
+            )
+            if landed:
+                self.state.record_ping(pr.full_name, pr.number, activity_kind)
+        return True
 
     def preflight(self) -> list[str]:
         """Startup checks. Returns warnings; raises on anything fatal."""

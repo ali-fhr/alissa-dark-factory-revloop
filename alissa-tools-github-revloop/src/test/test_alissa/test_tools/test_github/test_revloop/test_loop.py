@@ -9,9 +9,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -120,6 +122,10 @@ from alissa.tools.github.revloop.loop import (
     stability_kind,
     stalled_kind,
     verdict_post_kind,
+    first_run_dialog_kind,
+    first_run_dialog_activity_kind,
+    FIRST_RUN_PANE_TAIL_LINES,
+    WEDGE_FIRST_RUN_DIALOG,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop import state as state_module
@@ -351,6 +357,13 @@ class FakeAlissa:
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
         self.killed: list[str] = []
+        # The pane `alissa tmux tail` answers per session (issue #136), and
+        # the (session, lines) reads the loop made. Absent: an empty capture.
+        self.tails: dict[str, str] = {}
+        self.tailed: list[tuple[str, int]] = []
+        # A CommandError `kill_session` raises when set (a session that will
+        # not die), so the dialog wedge's retry-next-poll path is testable.
+        self.kill_error = None
         self.on_add = None  # optional side effect: actually create the hub
         self.sessions: list = []  # live ManagedSessions, as `alissa tmux ls` sees them
         # Full-corpus `alissa task list` fetches this fake has served. The
@@ -461,9 +474,15 @@ class FakeAlissa:
         return [s for s in self.sessions if parse_session_name(s.name)]
 
     def kill_session(self, session):
+        if self.kill_error is not None:
+            raise self.kill_error
         self.killed.append(session)
         # A killed session drops off the live list, like real tmux.
         self.sessions = [s for s in self.sessions if s.name != session]
+
+    def tail_session(self, session, lines):
+        self.tailed.append((session, lines))
+        return self.tails.get(session, "")
 
     def add_repo_to_workspace(self, owner, repo, workspace_root, *, dry_run=False):
         self.added.append((owner, repo, workspace_root))
@@ -10382,3 +10401,440 @@ def test_the_verdict_cooldown_layers_like_every_other_key(tmp_path):
     assert cfg.verdict_cooldown_s == 30
     cfg = Config.build(tmp_path, {"verdict_cooldown_s": 30}, {"verdict_cooldown_s": 0})
     assert cfg.verdict_cooldown_s == 0
+
+
+# -- issue #136: claude trust seeding at hub-ify / spawn time, and the
+# first-run-dialog wedge on the stale-round branch
+# ---------------------------------------------------------------------------
+#
+# The reviewer's shape: a session starts in {hub}/main, and the review skill's
+# throwaway worktree is REVIEW-<task ref> beside it. The dialog fixtures are
+# devloop PR #124's (see test_trust.py for the full set); the loop-level tests
+# here pin what the daemon DOES with a classification, not the classifier.
+
+
+def claude_trusted(path):
+    """The directories a claude state file pre-trusts."""
+    if not path.exists():
+        return set()
+    return {
+        p for p, entry in json.loads(path.read_text()).get("projects", {}).items()
+        if entry.get("hasTrustDialogAccepted") is True
+    }
+
+
+TRUST_DIALOG_PANE = """\
+ Quick safety check: Is this a project you created or one you trust?
+
+ ❯ No, exit
+   Yes, I trust this folder
+"""
+
+BYPASS_GATE_PANE = """\
+ WARNING: Claude Code running in Bypass Permissions mode
+ ❯ No, exit
+   Yes, I accept
+"""
+
+TRUST_DIALOG_BOXED_PANE = """\
+╭──────────────────────────────────────────────────────────────────╮
+│ Quick safety check: Is this a project you created or one you     │
+│ trust?                                                           │
+│                                                                  │
+│ ❯ 1. Yes, I trust this folder                                    │
+│   2. No, exit                                                    │
+│                                                                  │
+│ Enter to confirm · Esc to exit                                   │
+╰──────────────────────────────────────────────────────────────────╯
+
+
+"""
+
+BYPASS_GATE_NUMBERED_PANE = """\
+ WARNING: Claude Code running in Bypass Permissions mode
+
+ In Bypass Permissions mode, Claude Code will not ask for your approval
+ before running potentially dangerous commands.
+
+   1) No, exit
+ ❯ 2) Yes, I accept
+ Enter to confirm · Esc to cancel
+"""
+
+DIALOG_PANES = [
+    TRUST_DIALOG_PANE, BYPASS_GATE_PANE, TRUST_DIALOG_BOXED_PANE, BYPASS_GATE_NUMBERED_PANE,
+]
+
+WORKING_PANE_QUOTING_THE_DIALOG = """\
+● Bash(sed -n 490,512p README.md)
+  ⎿  **"trust this folder?"** dialog (and its one-time bypass-permissions gate),
+     `bypass permissions mode`, classifies the round `wedged:first-run-dialog`
+     ❯ No, exit
+     Yes, I trust this folder
+
+⠋ Reading files… (esc to interrupt)
+"""
+
+TRUST_LOGGER = "alissa.tools.github.revloop.trust"
+
+
+def test_hub_ify_seeds_trust_for_root_main_and_checkout_before_the_spawn(
+    tmp_path, isolated_claude_home
+):
+    """The hub-ify path trusts the hub ROOT, main/ (the spawn cwd), the
+    REVIEW-<task> checkout the skill may create and every REVIEW-* checkout
+    on disk, in BOTH claude state files, and does so BEFORE the session is
+    enqueued -- the entrypoint never saw this hub."""
+    home, ccdir = isolated_claude_home
+    cfg = hub_add_config(tmp_path)
+    gh = FakeGitHub(make_pr(), [])
+    al = FakeAlissa(FakeTask())
+    hub = tmp_path / REPO
+
+    def create_hub(owner, repo):  # what `alissa code workspace add` leaves
+        (tmp_path / repo / "main").mkdir(parents=True)
+        (tmp_path / repo / "REVIEW-TASK-1").mkdir()
+    al.on_add = create_hub
+
+    at_enqueue = {}
+    real_enqueue = al.enqueue_reviewer
+
+    def enqueue(**kwargs):
+        at_enqueue["home"] = claude_trusted(home / ".claude.json")
+        at_enqueue["ccdir"] = claude_trusted(ccdir / ".claude.json")
+        return real_enqueue(**kwargs)
+    al.enqueue_reviewer = enqueue
+    w = ReviewWatcher(cfg, github=gh, alissa=al, state=State(cfg.state_db))
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert al.enqueued[0]["cwd"] == hub / "main"
+    expected = {
+        str(hub), str(hub / "main"), str(hub / "REVIEW-TASK-500"), str(hub / "REVIEW-TASK-1"),
+    }
+    assert at_enqueue["home"] == expected, "trusted in ~/.claude.json before the enqueue"
+    assert at_enqueue["ccdir"] == expected, "and in $CLAUDE_CONFIG_DIR/.claude.json"
+
+
+def test_an_existing_hub_is_re_trusted_before_every_spawn(config, isolated_claude_home):
+    """A hub on disk at boot may have grown a REVIEW-* checkout since, and a
+    hub that appeared between boots was never seeded: every spawn re-asserts
+    trust. No task (spawn_anyway) -> no named checkout, the rest as usual."""
+    home, _ = isolated_claude_home
+    hub = config.workspace_root / REPO
+    (hub / "REVIEW-TASK-42").mkdir()
+    w, _, al = watcher(config, make_pr(), [], task=None)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert al.added == [], "no hub-ify: the hub existed"
+    assert claude_trusted(home / ".claude.json") == {
+        str(hub), str(hub / "main"), str(hub / "REVIEW-TASK-42")
+    }
+
+
+def test_hub_trust_seeding_is_idempotent(config, isolated_claude_home):
+    home, ccdir = isolated_claude_home
+    cwd = config.workspace_root / REPO / "main"
+    w, _, _ = watcher(config, make_pr(), [])
+
+    first = w._trust_hub(cwd, "test", "TASK-500")
+    before = [(home / ".claude.json").read_text(), (ccdir / ".claude.json").read_text()]
+    second = w._trust_hub(cwd, "test", "TASK-500")
+
+    assert first == [home / ".claude.json", ccdir / ".claude.json"]
+    assert second == [], "nothing new to trust -> no state file rewritten"
+    assert [(home / ".claude.json").read_text(), (ccdir / ".claude.json").read_text()] == before
+
+
+def test_dry_run_hub_add_seeds_no_trust(tmp_path, isolated_claude_home):
+    home, ccdir = isolated_claude_home
+    cfg = hub_add_config(tmp_path, dry_run=True)
+    w, _, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert not (home / ".claude.json").exists()
+    assert not (ccdir / ".claude.json").exists()
+
+
+def test_a_failed_trust_seed_never_costs_the_spawn(config, isolated_claude_home, caplog):
+    """Trust is a convenience for the session; an unwritable state file is
+    a WARNING and the spawn goes ahead (the dialog wedge, below, is the
+    net under it)."""
+    home, ccdir = isolated_claude_home
+    (home / ".claude.json").write_text("{corrupt")
+    (ccdir / ".claude.json").write_text("{corrupt")
+    w, _, al = watcher(config, make_pr(), [])
+
+    with caplog.at_level(logging.WARNING, logger=TRUST_LOGGER):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and len(al.enqueued) == 1
+    assert (home / ".claude.json").read_text() == "{corrupt", "never overwritten"
+    assert any("could not read" in r.message for r in caplog.records)
+
+
+def _stale_alive_round(config, pane, *, status="busy"):
+    """Round 1 spawned, its session alive in the roster, its spawn past the
+    stale window, and its pane answering `pane`."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    session = al.enqueued[0]["session"]
+    _live(al, session, status=status, last_activity=time.time())
+    _backdate(st, PAST_STALE)
+    al.tails[session] = pane
+    # Forget the spawn's own seeding so the wedge's seeding is observable.
+    for target in (
+        Path(os.environ["HOME"]) / ".claude.json",
+        Path(os.environ["CLAUDE_CONFIG_DIR"]) / ".claude.json",
+    ):
+        target.unlink(missing_ok=True)
+    return w, gh, al, session
+
+
+@pytest.mark.parametrize("pane", DIALOG_PANES)
+def test_stale_alive_session_on_a_first_run_dialog_is_killed_seeded_and_re_queued(
+    config, caplog, isolated_claude_home, pane
+):
+    """Stale, session ALIVE in a successful listing, and the pane shows
+    claude's first-run gate (any of the #124 shapes): `wedged:first-run-dialog`
+    -- ONE WARNING, the row's own session killed, the hub pre-trusted, and
+    the round re-queued in the same pass exactly as a dead session's is."""
+    home, ccdir = isolated_claude_home
+    hub = config.workspace_root / REPO
+    w, gh, al, session = _stale_alive_round(config, pane)
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github.revloop.loop"):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert d.reenqueued, "the same accounting as a dead session's respawn"
+    assert al.tailed == [(session, FIRST_RUN_PANE_TAIL_LINES)]
+    assert al.killed == [session], "only the row's own session, no sweep"
+    assert len(al.enqueued) == 2 and al.enqueued[1]["session"] != session
+    assert al.enqueued[1]["cwd"] == hub / "main"
+    for target in (home / ".claude.json", ccdir / ".claude.json"):
+        assert claude_trusted(target) >= {
+            str(hub), str(hub / "main"), str(hub / "REVIEW-TASK-500")
+        }, target
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [r.message for r in warnings]
+    assert WEDGE_FIRST_RUN_DIALOG in warnings[0].message
+    assert session in warnings[0].message
+    assert "re-queuing round 1" in warnings[0].message
+    assert "send-keys" in warnings[0].message, "the operator lever"
+    assert w.state.pinged(SLUG, NUMBER, first_run_dialog_kind(session))
+    assert w.state.pinged(SLUG, NUMBER, first_run_dialog_activity_kind(session)), \
+        "the activity comment records the kill"
+    activity = [c.body for c in activity_comments(gh)]
+    assert len(activity) == 1, activity
+    assert activity[0].count(WEDGE_FIRST_RUN_DIALOG) == 1 and "re-queued" in activity[0]
+    assert operator_comments(gh) == [], "no stalled ping: the round was acted on, not deferred"
+
+
+def test_the_wedge_re_queue_lands_in_the_stale_reenqueued_bucket(config, isolated_claude_home):
+    """poll_once's accounting: the respawn after a dialog kill is a
+    `stale_reenqueued` spawn, like any presumed-dead round's."""
+    w, gh, al, session = _stale_alive_round(config, TRUST_DIALOG_PANE)
+
+    w.poll_once()
+
+    snap = w.state.read_snapshots()[-1]
+    assert snap["stale_reenqueued"] == 1 and snap["spawned"] == 0
+    assert al.killed == [session]
+
+
+def test_stale_alive_session_without_the_dialog_keeps_the_not_respawning_defer(
+    config, caplog
+):
+    """Every OTHER alive-but-idle case is unchanged: a thorough round
+    running long, an expired login, a usage limit -- the pane is read, does
+    not show the gate, and the existing defer holds with its existing line."""
+    w, gh, al, session = _stale_alive_round(config, "⠋ Reading the diff of acme/widgets#7 …")
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github.revloop.loop"):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert "not respawning over a live reviewer" in d.reason
+    assert al.tailed == [(session, FIRST_RUN_PANE_TAIL_LINES)]
+    assert al.killed == [] and len(al.enqueued) == 1 and operator_comments(gh) == []
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert not w.state.pinged(SLUG, NUMBER, first_run_dialog_kind(session))
+
+
+@pytest.mark.parametrize("pane", [
+    "",
+    "Error: OAuth token has expired. Run /login",
+    "You've hit your usage limit",
+    WORKING_PANE_QUOTING_THE_DIALOG,
+])
+def test_an_untailable_other_wedge_or_quoting_pane_is_not_the_dialog(config, caplog, pane):
+    """An empty capture is no evidence; another wedge is not this one; and a
+    reviewer that cats this README or the PR's diff has the gate's words
+    on screen while at work and printed after them. All keep the defer."""
+    w, _, al, session = _stale_alive_round(config, pane)
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github.revloop.loop"):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert al.killed == [] and len(al.enqueued) == 1
+    assert not any(WEDGE_FIRST_RUN_DIALOG in r.message for r in caplog.records)
+
+
+def test_a_session_gone_from_the_listing_respawns_without_reading_the_pane(config):
+    """DEAD (listed without the name) respawns as before; the pane is never read."""
+    w, _, al, session = _stale_alive_round(config, TRUST_DIALOG_PANE)
+    al.sessions = []  # gone -> presumed dead
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and al.tailed == [] and al.killed == []
+
+
+def test_an_unprobeable_listing_defers_without_reading_the_pane(config):
+    """No roster, no classification: the defer holds exactly as before."""
+    w, _, al, session = _stale_alive_round(config, TRUST_DIALOG_PANE)
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no tmux server")
+    al.list_review_sessions = boom
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT and al.tailed == [] and al.killed == []
+
+
+def test_an_idle_finished_session_respawns_without_reading_the_pane(config):
+    """Idle past the quiet period is dead by the reap doctrine already; the
+    dialog probe sits below that answer and never runs."""
+    w, _, al, session = _stale_alive_round(config, TRUST_DIALOG_PANE)
+    al.sessions = [ManagedSession(name=session, status="idle", last_activity=0.0)]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and al.tailed == [] and al.killed == []
+
+
+def test_the_dialog_check_stays_off_the_fresh_path(config):
+    """The pane is read ONLY on the stale path: a fresh in-flight round is
+    never tailed, so the common case pays nothing."""
+    w, _, al = watcher(config, make_pr(), [])
+    w.evaluate(OWNER, REPO, NUMBER)
+    session = al.enqueued[0]["session"]
+    _live(al, session, status="busy")
+    al.tails[session] = TRUST_DIALOG_PANE
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT and al.tailed == [] and al.killed == []
+
+
+def test_a_failed_dialog_kill_keeps_the_defer_and_warns_the_classification_once(
+    config, caplog
+):
+    """The WARNING is per EPISODE: a kill that fails is retried next poll
+    (the pane still shows the gate) at INFO, and the re-queue happens once
+    the kill lands."""
+    w, _, al, session = _stale_alive_round(config, TRUST_DIALOG_PANE)
+    al.kill_error = CommandError(["alissa", "tmux", "kill", session], 1, "boom")
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github.revloop.loop"):
+        first = w.evaluate(OWNER, REPO, NUMBER)
+        second = w.evaluate(OWNER, REPO, NUMBER)
+        al.kill_error = None
+        third = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert first.action is Action.IN_FLIGHT and second.action is Action.IN_FLIGHT
+    assert third.action is Action.SPAWNED
+    classified = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "pane shows claude's first-run dialog" in r.message
+    ]
+    assert len(classified) == 1, "one WARNING per episode"
+    retries = [r for r in caplog.records if "retrying the kill" in r.message]
+    assert len(retries) == 2 and all(r.levelno == logging.INFO for r in retries)
+    assert len([r for r in caplog.records if "could not kill" in r.message]) == 2
+    assert al.killed == [session]
+
+
+def test_a_new_dialog_episode_warns_again(config, caplog, isolated_claude_home):
+    """Episode-keyed: the re-queued round's NEW session meeting the dialog
+    again (a seeding that did not land) is a fresh WARNING, not silence."""
+    w, _, al, s1 = _stale_alive_round(config, TRUST_DIALOG_PANE)
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github.revloop.loop"):
+        w.evaluate(OWNER, REPO, NUMBER)
+        s2 = al.enqueued[1]["session"]
+        _live(al, s2, status="busy", last_activity=time.time())
+        _backdate(w.state, PAST_STALE)
+        al.tails[s2] = TRUST_DIALOG_PANE
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and al.killed == [s1, s2]
+    wedges = [r for r in caplog.records if WEDGE_FIRST_RUN_DIALOG in r.message]
+    assert len(wedges) == 2
+
+
+def test_dry_run_classifies_the_dialog_but_kills_nothing(config, caplog, isolated_claude_home):
+    home, _ = isolated_claude_home
+    cfg = dataclasses.replace(config, dry_run=True)
+    st = State(cfg.state_db)
+    w, _, al = watcher(cfg, make_pr(), [], state=st)
+    session = _record(w, make_pr(), 1)  # a real run recorded this spawn earlier
+    _live(al, session, status="busy", last_activity=time.time())
+    _backdate(st, PAST_STALE)
+    al.tails[session] = TRUST_DIALOG_PANE
+    (home / ".claude.json").unlink(missing_ok=True)
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github.revloop.loop"):
+        d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.IN_FLIGHT
+    assert al.killed == [] and al.enqueued == []
+    assert not (home / ".claude.json").exists()
+    assert any("[dry-run] would kill" in r.message for r in caplog.records)
+
+
+# -- issue #136: the derived allowlist is recorded and its hubs trusted --------
+
+
+def test_bows_refresh_records_the_derived_list_and_trusts_its_hubs(
+    config, isolated_claude_home
+):
+    """After a successful refresh the derived repos are written to
+    {root}/.alissa-derived-repos for the NEXT boot's entrypoint seeding, and
+    their hubs (root and main/ each, hub-ified or not) are trusted NOW."""
+    home, ccdir = isolated_claude_home
+    root = config.workspace_root
+    client = _BowClient(["autodev: acme/widgets", "autodev: Acme/Gadgets"])
+    w, _, _ = _bows_watcher(config, client, repos=("acme/static",))
+
+    w.poll_once()
+
+    assert (root / ".alissa-derived-repos").read_text() == "acme/widgets\nAcme/Gadgets\n", \
+        "the derived half alone -- the static seed is the entrypoint's own"
+    expected = {
+        str(root / "widgets"), str(root / "widgets" / "main"),
+        str(root / "Gadgets"), str(root / "Gadgets" / "main"),
+    }
+    for target in (home / ".claude.json", ccdir / ".claude.json"):
+        assert claude_trusted(target) >= expected, target
+
+
+def test_bows_failed_first_refresh_and_dry_run_record_nothing(config, isolated_claude_home):
+    home, _ = isolated_claude_home
+    root = config.workspace_root
+    w, _, _ = _bows_watcher(config, _BowClient(error=AlissaTransient(503, "down")))
+    w.poll_once()
+    assert not (root / ".alissa-derived-repos").exists()
+
+    cfg = dataclasses.replace(config, dry_run=True)
+    w, _, _ = _bows_watcher(cfg, _BowClient(["autodev: acme/widgets"]))
+    w.poll_once()
+    assert not (root / ".alissa-derived-repos").exists()
+    assert claude_trusted(home / ".claude.json") == set()

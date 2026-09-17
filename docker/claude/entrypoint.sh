@@ -904,6 +904,19 @@ fi
 # moves the state/settings files is undocumented, so we seed BOTH $HOME and
 # $CLAUDE_CONFIG_DIR — whichever claude reads, the flags are there. Merges are
 # load-then-update, so a persisted login (oauthAccount etc.) is preserved.
+#
+# BOWS MODE (issue #136): under repos_source=bows ALISSA_REVIEW_REPOS is empty —
+# the allowlist is DERIVED from the feed Bodies of Work by the daemon at
+# runtime — so the static loop below names nothing, and a hub the daemon
+# hub-ifies AFTER boot was never trusted: the first review session on it parks
+# on claude's "trust this folder?" dialog while the stale-round probe reads it
+# as alive. The daemon (revloop >= 0.31.2) writes every successful derivation
+# to ${WORKSPACE_ROOT}/.alissa-derived-repos (one owner/repo per line;
+# ALISSA_DERIVED_REPOS_FILE relocates it on both sides), and this seeding reads
+# it, so the derived hubs are trusted from the NEXT boot on exactly as a static
+# allowlist's are. The daemon also trusts a hub itself at hub-ify time and
+# before every spawn (the first boot has no file yet), and treats a stale round
+# whose session's pane shows the dialog as `wedged:first-run-dialog`.
 # -----------------------------------------------------------------------------
 python3 - "${WORKSPACE_ROOT}" <<'PY' || true
 import glob, json, os, sys
@@ -911,14 +924,36 @@ root = sys.argv[1]
 home = os.path.expanduser("~")
 ccdir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
 
-# Reviewer working dirs to pre-trust: allowlisted repos (basename of owner/repo,
-# even before hub-ified) plus any hub main/ already on disk.
+# Reviewer working dirs to pre-trust: the hub ROOT and its main/ (where the
+# reviewer starts) for every allowlisted repo (basename of owner/repo, even
+# before it is hub-ified) and for every repo the daemon DERIVED from the feed
+# on a previous boot (bows mode; same rule, read from the file the daemon
+# keeps), plus every hub main/ already on disk, its root, and any REVIEW-*
+# checkout a reviewer left beside it.
 paths = set()
+def trust_hub(hub):
+    paths.add(hub)
+    paths.add(os.path.join(hub, "main"))
 for r in os.environ.get("ALISSA_REVIEW_REPOS", "").replace("|", "\n").split():
     r = r.strip()
     if "/" in r:
-        paths.add(os.path.join(root, r.split("/")[-1], "main"))
-paths.update(glob.glob(os.path.join(root, "*", "main")))
+        trust_hub(os.path.join(root, r.split("/")[-1]))
+derived_file = os.environ.get("ALISSA_DERIVED_REPOS_FILE", "").strip() \
+    or os.path.join(root, ".alissa-derived-repos")
+derived = []
+try:
+    with open(derived_file) as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#") and "/" in line:
+                derived.append(line)
+except OSError:
+    pass
+for r in derived:
+    trust_hub(os.path.join(root, r.split("/")[-1]))
+for main in glob.glob(os.path.join(root, "*", "main")):
+    trust_hub(os.path.dirname(main))
+paths.update(p for p in glob.glob(os.path.join(root, "*", "REVIEW-*")) if os.path.isdir(p))
 
 def merge(path, apply):
     try:
@@ -951,7 +986,8 @@ for t in state_targets:
     merge(t, state)
 for t in settings_targets:
     merge(t, settings)
-print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} reviewer dir(s)")
+print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} reviewer dir(s)"
+      f" ({len(derived)} derived repo(s) read from {derived_file})")
 PY
 
 # -----------------------------------------------------------------------------

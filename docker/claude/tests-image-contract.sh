@@ -31,7 +31,10 @@
 #   3. `alissa` is uid 1000 / gid 1000
 #   4. BOTH GitHub SSH->HTTPS rewrites, the gh credential helper, and
 #      advice.detachedHead=false are present system-wide
-#   5. claude's first-run gates are pre-seeded
+#   5. claude's first-run gates are pre-seeded — and the entrypoint's OWN
+#      seeding, run out of the shipped file with an EMPTY ALISSA_REVIEW_REPOS
+#      and one derived repo (bows mode, issue #136), pre-trusts that repo's
+#      hub root and main/
 #   6. the per-daemon git author identity resolves FOR THE alissa USER
 #   7. the baked ARG->ENV knob defaults are unchanged
 #   8. /usr/local/bin/entrypoint.sh is THIS repo's file and not the base's stub
@@ -215,6 +218,58 @@ rc=0
 eq() { if [ "$2" = "$3" ]; then printf '  ok   %s = %s\n' "$1" "$2"; else printf '  FAIL %s: expected %s, got %s\n' "$1" "$2" "${3:-<unset>}"; rc=1; fi; }
 eq "git config --global user.name"  "alissa-review-daemon" "$(git config --global user.name  2>/dev/null)"
 eq "git config --global user.email" "support@alissa.app"   "$(git config --global user.email 2>/dev/null)"
+exit "${rc}"
+PROBE
+then fail=1; fi
+
+# --- 5 (bows mode): the shipped seeding trusts a DERIVED hub (issue #136) ---
+# The base bakes the onboarding flags; the per-directory trust is the
+# entrypoint's, and under repos_source=bows ALISSA_REVIEW_REPOS is empty, so the
+# only thing that can name a hub created after boot is the derived-repos file
+# the daemon writes. Lift the 3a heredoc out of /usr/local/bin/entrypoint.sh
+# (the shipped text, not a copy) and run it as the alissa user against
+# scratch HOME / CLAUDE_CONFIG_DIR / workspace dirs: an empty allowlist plus
+# one derived repo must leave that repo's hub root AND main/ trusted in BOTH
+# files, and a hub already on disk must stay trusted.
+info ""
+info "3b. the entrypoint's claude trust seeding with an empty ALISSA_REVIEW_REPOS and one derived repo (bows mode)"
+if ! docker run --rm -i --platform "${PLATFORM}" --user alissa --entrypoint bash "${IMAGE}" -s <<'PROBE'
+set -uo pipefail
+rc=0
+ok() { printf '  ok   %s\n' "$*"; }
+no() { printf '  FAIL %s\n' "$*"; rc=1; }
+EP=/usr/local/bin/entrypoint.sh
+open="$(grep -nF "python3 - \"\${WORKSPACE_ROOT}\" <<'PY' || true" "$EP" | cut -d: -f1)"
+if [ "$(printf '%s\n' "$open" | grep -c .)" != "1" ]; then
+  no "expected exactly one 3a seeding heredoc in $EP, found: ${open:-none}"
+  exit "$rc"
+fi
+close="$(tail -n +"$((open + 1))" "$EP" | grep -n '^PY$' | head -n1 | cut -d: -f1)"
+[ -n "$close" ] || { no "no PY closes the seeding heredoc"; exit "$rc"; }
+block="$(sed -n "$((open + 1)),$((open + close - 1))p" "$EP")"
+case "$block" in *hasTrustDialogAccepted*) ;; *) no "the lifted heredoc carries no trust merge"; exit "$rc" ;; esac
+case "$block" in *.alissa-derived-repos*) ;; *) no "the lifted heredoc does not read the derived-repos file"; exit "$rc" ;; esac
+ok "seeding heredoc lifted out of the shipped entrypoint ($((close - 1)) lines)"
+T="$(mktemp -d)"
+mkdir -p "$T/home" "$T/cc" "$T/ws/on-disk-hub/main"
+printf 'ali-fhr/slides.alissa.app\n' > "$T/ws/.alissa-derived-repos"
+out="$(printf '%s\n' "$block" | env -i PATH="$PATH" HOME="$T/home" CLAUDE_CONFIG_DIR="$T/cc" ALISSA_REVIEW_REPOS="" python3 - "$T/ws" 2>&1)"
+case "$out" in
+  *"1 derived repo(s) read from"*) ok "seeding read the derived-repos file: ${out}" ;;
+  *) no "seeding did not report the derived repo: ${out}" ;;
+esac
+for f in "$T/home/.claude.json" "$T/cc/.claude.json"; do
+  if python3 - "$f" "$T/ws/slides.alissa.app" "$T/ws/slides.alissa.app/main" "$T/ws/on-disk-hub" "$T/ws/on-disk-hub/main" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+pr = d.get("projects", {})
+missing = [p for p in sys.argv[2:] if pr.get(p, {}).get("hasTrustDialogAccepted") is not True]
+sys.exit(1 if missing else 0)
+PY
+  then ok "$f pre-trusts the derived hub (root + main/) AND the hub already on disk"
+  else no "$f does not pre-trust the derived hub root/main (slides.alissa.app) and/or the on-disk hub: $(cat "$f" 2>/dev/null)"
+  fi
+done
 exit "${rc}"
 PROBE
 then fail=1; fi

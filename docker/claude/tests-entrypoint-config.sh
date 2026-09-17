@@ -528,6 +528,56 @@ assert_log "${LOG1C}" "respecting the existing ${CFG1}" "an unstamped (operator)
 assert_eq "$(cat "${CFG1}")" '.repos' '["mounted/repo"]' "the operator's config is byte-for-byte untouched"
 stop_boot "${PID1C}"
 
+# --- 1d. bows-mode claude trust seeding (issue #136) --------------------------
+# Under bows ALISSA_REVIEW_REPOS is empty, so the 3a seeding can name a hub
+# only through the derived-repos file the daemon writes after each refresh.
+# An empty allowlist plus a derived list of THREE repos must leave six paths
+# trusted (hub root + main/ each) in BOTH state files, a hub already on disk
+# but absent from the list must still be trusted (root + main/), and the log
+# line must count the derived repos it read. ALISSA_DERIVED_REPOS_FILE
+# relocates the file on the entrypoint's side exactly as on the daemon's.
+WS1D="${TMPROOT}/ws-trust"; LOG1D="${TMPROOT}/bows-trust.log"
+CC1D="${TMPROOT}/claude-config-trust"
+mkdir -p "${WS1D}/on-disk-hub/main" "${CC1D}"
+printf '# derived by the daemon\nali-fhr/slides.alissa.app\nali-fhr/forms.alissa.app\n\nali-fhr/bok.alissa.app\n' \
+  > "${WS1D}/.alissa-derived-repos"
+rm -f "${FAKE_HOME}/.claude.json" "${MARKERS}"/*
+boot "${WS1D}" "${LOG1D}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows \
+  CLAUDE_CONFIG_DIR="${CC1D}"; PID1D="${EP_PID}"
+if wait_for_log "${LOG1D}" "alissa worker is running" 45; then
+  pass "bows + empty ALISSA_REVIEW_REPOS + a derived-repos file boots"
+else
+  bad "bows boot with a derived-repos file did not come up (see ${LOG1D})"; sed 's/^/      | /' "${LOG1D}" | tail -20 >&2
+fi
+assert_log "${LOG1D}" "3 derived repo(s) read from ${WS1D}/.alissa-derived-repos" "the seeding names the derived repos it read"
+for f in "${FAKE_HOME}/.claude.json" "${CC1D}/.claude.json"; do
+  if [ -f "${f}" ]; then
+    for hub in slides.alissa.app forms.alissa.app bok.alissa.app on-disk-hub; do
+      for p in "${WS1D}/${hub}" "${WS1D}/${hub}/main"; do
+        assert_eq "$(cat "${f}")" ".projects[\"${p}\"].hasTrustDialogAccepted" 'true' \
+          "$(basename "$(dirname "${f}")")/.claude.json pre-trusts ${hub}$( [ "${p##*/}" = main ] && printf '/main' )"
+      done
+    done
+  else
+    bad "no claude state file at ${f} after the bows boot"
+  fi
+done
+stop_boot "${PID1D}"
+# The override: the file lives elsewhere, the workspace's own is ignored.
+ELSEWHERE="${TMPROOT}/derived-elsewhere.txt"; LOG1E="${TMPROOT}/bows-trust-override.log"
+printf 'ali-fhr/loopwork\n' > "${ELSEWHERE}"
+printf 'ali-fhr/ignored\n' > "${WS1D}/.alissa-derived-repos"
+rm -f "${FAKE_HOME}/.claude.json" "${CC1D}/.claude.json" "${MARKERS}"/*
+boot "${WS1D}" "${LOG1E}" "${SRC_TREE}" ALISSA_REVIEW_REPOS="" ALISSA_REVIEW_REPOS_SOURCE=bows \
+  CLAUDE_CONFIG_DIR="${CC1D}" ALISSA_DERIVED_REPOS_FILE="${ELSEWHERE}"; PID1E="${EP_PID}"
+wait_for_log "${LOG1E}" "alissa worker is running" 45 || bad "bows boot with ALISSA_DERIVED_REPOS_FILE did not come up"
+assert_log "${LOG1E}" "1 derived repo(s) read from ${ELSEWHERE}" "ALISSA_DERIVED_REPOS_FILE relocates the read"
+assert_eq "$(cat "${CC1D}/.claude.json")" ".projects[\"${WS1D}/loopwork/main\"].hasTrustDialogAccepted" 'true' \
+  "the relocated list's hub is trusted"
+assert_eq "$(cat "${CC1D}/.claude.json")" ".projects | has(\"${WS1D}/ignored\")" 'false' \
+  "the workspace's own file is ignored when the override is set"
+stop_boot "${PID1E}"
+
 # --- 2. static + EMPTY ALISSA_REVIEW_REPOS still dies -------------------------
 WS2="${TMPROOT}/ws-static"; LOG2="${TMPROOT}/static.log"
 rm -f "${MARKERS}"/*
