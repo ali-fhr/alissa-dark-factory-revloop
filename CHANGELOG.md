@@ -4,6 +4,82 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.2
+
+- **Pre-trust hubs in bows mode; classify the first-run dialog as a wedge**
+  (issue #136, origin TASK-683998090; the reviewer-side sibling of devloop PR
+  #124 / issue #123). The entrypoint pre-trusts Claude Code's per-directory
+  *"trust this folder?"* gate only for hubs it can name at boot, and under
+  `repos_source: bows` `ALISSA_REVIEW_REPOS` is empty — so the first review on
+  a repo the daemon hub-ifies at review time started claude in an untrusted
+  `{hub}/main`, parked on the dialog, and the stale-round probe read the live
+  tmux session as *"still active — not respawning over a live reviewer"* every
+  poll. Three closures, the shape of devloop 0.8.24 with the reviewer's paths:
+  - **Seed from the derived list.** New `trust.py`. After every refresh the
+    daemon records the derived allowlist at
+    `{workspace_root}/.alissa-derived-repos` (one `owner/repo` per line;
+    `ALISSA_DERIVED_REPOS_FILE` relocates it) and pre-trusts `{root}/{repo}`
+    and `{root}/{repo}/main` for each, hub-ified or not. The entrypoint's 3a
+    seeding reads that file (and now trusts root + `main/` for the static
+    list and every hub on disk, plus any `REVIEW-*` checkout), and its log line
+    counts the derived repos it read.
+  - **Seed at hub-ify time and before every spawn.** `_ensure_hub` trusts the
+    hub root, `main/` (the spawn cwd) and the `REVIEW-<task>` checkout the
+    review skill may create — immediately after `alissa code workspace add`
+    and, for a hub that already exists, on every spawn. Load-then-update into
+    both `~/.claude.json` and `$CLAUDE_CONFIG_DIR/.claude.json`, only ever
+    adds `hasTrustDialogAccepted: true`, atomic, compare-and-swap against a
+    concurrent claude rewrite (bounded retries, then one WARNING), rewrites
+    nothing when every entry is present, never raises (a failed seed never
+    costs the spawn), seeds nothing under dry-run.
+  - **`wedged:first-run-dialog`.** On the stale-round branch, only when a
+    successful listing names the round's session and it is not idle-finished,
+    the pane is read (`alissa tmux tail`, 40 lines; new
+    `Alissa.tail_session`). A pane *parked* on a gate — the accept option
+    among the last non-blank lines, nothing but the gate's chrome below it,
+    the question strictly above — is one WARNING per episode (ping kind
+    `first-run-dialog:<session>` in production, a process-lifetime set under
+    dry-run; a failed kill retries next poll at INFO),
+    the round's own session killed, its hub seeded, one activity-comment
+    line, and the round re-queued in the same pass exactly as a dead
+    session's is (`reenqueued`, the `stale_reenqueued` bucket; the respawn
+    site logs at INFO so the episode is one WARNING). Every other
+    alive-but-idle pane — including one that merely quotes the gate's words —
+    keeps the existing defer and `stalled` ping; the capture stays at DEBUG.
+  - **Docs.** README (*Behaviour* row, *Sitting on the first-run dialog*, the
+    bows-mode trust rule under *Deriving the allowlist*, *Tests*) and the
+    docker README (trust rule under *claude auth*, the bows checklist, boot
+    step 2b).
+  - **Tests.** `test_trust.py` (merge, idempotence, never-remove, atomic
+    write, compare-and-swap, derived-repos record, the reviewer path shape,
+    the pane classifier with devloop #124's fixtures verbatim — boxed,
+    numbered, accept-first, footer); loop tests (hub-ify seeds root / main /
+    checkout before the enqueue, re-trust before every spawn, idempotent,
+    dry-run, failed seed never costs the spawn; dialog → kill + seed +
+    re-queue with one WARNING and the `stale_reenqueued` accounting; other
+    panes, untailable panes, dead / unprobeable / idle-finished / fresh rows
+    unchanged; failed kill retries; new episode warns again; dry-run; bows
+    refresh records and trusts, failed first refresh and dry-run record
+    nothing); `tests-entrypoint-config.sh` boots the real entrypoint with an
+    empty `ALISSA_REVIEW_REPOS` and three derived repos (six trusted paths in
+    both state files, an on-disk hub still trusted, the env override); the
+    image contract runs the shipped seeding with one derived repo. A
+    `conftest.py` autouse fixture points `HOME` / `CLAUDE_CONFIG_DIR` at
+    scratch dirs for every test.
+  - **Review round 1 (PR #137).** The wedge's one-WARNING gate recorded its
+    ping-ledger row *before* the dry-run guard, so a `--once --dry-run` pass
+    over the default state path silenced the WARNING production owed for the
+    same episode; it now takes the identity-drift split (durable in
+    production, process-lifetime in dry-run). The classifier's third leg read
+    the option line itself and `Yes, I trust this folder` contains the old
+    `trust this folder` marker, so for the trust gate the leg was
+    self-satisfied; the markers are now the gates' question text (`quick
+    safety check` / `is this a project you created` / the older `trust the
+    files in this folder` / `bypass permissions mode`) and must stand
+    strictly above the option line — stricter than devloop's `hubs.py`
+    until devloop follows. `trust.read_derived_repos` (no production caller;
+    the entrypoint parses the file inline) is dropped.
+
 ## 0.31.1
 
 - **Session-posted verdicts carry the `Merge-Readiness` trailer too** (issue

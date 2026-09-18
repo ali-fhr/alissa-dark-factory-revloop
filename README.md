@@ -273,6 +273,31 @@ feed-authority gate bounds the blast radius instead. The container's baked
 request (`alissa code workspace add`), so a lane created in Studio is reviewed
 on its first request with no operator action on the review service.
 
+**The bows-mode trust rule (issue #136).** Claude Code asks, once per
+directory, whether to trust the folder a session starts in, and the container
+entrypoint pre-answers it at boot only for hubs it can *name* at boot —
+`ALISSA_REVIEW_REPOS` plus hubs already on disk. Under `bows` that static list
+is empty, so a hub created at review time met the dialog and its session hung.
+The daemon now closes the gap itself, in three places: after every
+**successful refresh** it records the derived list at
+`{workspace_root}/.alissa-derived-repos` (one `owner/repo` per line;
+`ALISSA_DERIVED_REPOS_FILE` relocates it on both sides) for the *next* boot's
+entrypoint seeding and pre-trusts the derived hubs right away — `{root}/{repo}`
+and `{root}/{repo}/main` each, hub-ified or not; at **hub-ify time and before
+every spawn** (`_ensure_hub`) it trusts the hub root, `main/` (the reviewer's
+cwd) and the `REVIEW-<task>` checkout the review skill may create; and a stale
+round found **sitting on the dialog** is `wedged:first-run-dialog` (see
+*Sitting on the first-run dialog*). The merge is load-then-update into both
+`~/.claude.json` and `$CLAUDE_CONFIG_DIR/.claude.json`, only ever adds
+`hasTrustDialogAccepted: true`, rewrites nothing when every entry is already
+there, and is best-effort — a failed write is one WARNING and the spawn goes
+ahead. Claude Code rewrites the same file while sessions run, so the write is
+a compare-and-swap (the file must still hold the bytes the merge read)
+followed by a re-read; a merge another writer moved the file under is
+restarted on the newer content a bounded number of times, then it is one
+WARNING — never a lost login or a dropped `projects` entry of another
+session's. Dry-run seeds nothing.
+
 ### Config file discovery
 
 `--config-path PATH`, else `./revloop.config.json`, else
@@ -577,6 +602,7 @@ Leave it on `skip` unless you want unattended clones.
 | a round is owed but the head's CI has not concluded | **held** — the reviewer is not queued until the checks settle, bounded by `checks_spawn_wait_seconds`; a session that has not started cannot approve ahead of its evidence — see *Never approve a red head* |
 | a round is owed and the head's CI is red | queued **now**, with the failing jobs and run URLs in its directive and no approve permitted |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
+| round enqueued >90 min, session still alive | **deferred** behind the live session (floored `stalled` ping) — **unless** its pane is parked on claude's first-run dialog: `wedged:first-run-dialog`, kill + seed trust + re-queue, one WARNING — see *Sitting on the first-run dialog* |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
 | that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
@@ -753,6 +779,74 @@ head has moved past the head the last verdict was written against it says so and
 recommends a single verification round: the reviewer re-checks the fix against
 its own final findings and flips to `approve` (or re-requests, consuming the
 grant).
+
+### Sitting on the first-run dialog (`wedged:first-run-dialog`)
+
+Alive is a process, not a reviewer. The stale-round probe defers a respawn
+behind any session that shows life — that liveness signal is what stops a
+round being double-spent — and one alive-but-idle cause is mechanical enough to
+classify and cheap enough to fix: Claude Code's per-directory **"trust this
+folder?"** dialog (and its one-time bypass-permissions gate), which
+`--dangerously-skip-permissions` does **not** suppress. A session started in a
+directory nobody pre-trusted sits on that prompt — the directive typed into the
+pane is swallowed by it — registers tmux activity, and reads alive forever:
+*"round 1 is stale (91 min) but session … is still active — not respawning
+over a live reviewer"*, every poll. The container entrypoint seeds trust at
+boot for every hub it can *name* at boot — `ALISSA_REVIEW_REPOS` plus hubs
+already on disk — and under `repos_source: bows` the static list is empty, so a
+hub the daemon created at review time was never trusted (see *Deriving the
+allowlist* for the bows-mode trust rule that now closes the gap; devloop's
+image met the same wedge on `ali-fhr/docs.alissa.app#10`, 108 minutes).
+
+The stale-round branch therefore adds one probe, **only after a successful
+listing names the round's session and only when it is not idle-finished**
+(an unprobeable listing defers as before; an idle session past
+`reap_grace_seconds` respawns as before; neither reads a pane): it reads the
+session's terminal (`alissa tmux tail`, 40 lines) and, when the pane is
+**parked on the gate** — its accept option (`Yes, I trust this folder` /
+`Yes, I accept`) among the last non-blank lines with nothing below it but the
+gate's own chrome (`No, exit`, `Enter to confirm …`), and the gate's question
+(`Quick safety check` / `Is this a project you created` / `Bypass Permissions
+mode`) *strictly* above it — the accept option's own words never corroborate
+it — classifies the round `wedged:first-run-dialog`:
+
+- **one WARNING per episode** (keyed `first-run-dialog:<session>` in the ping
+  ledger; a kill that fails is retried next poll at INFO), naming the session,
+  the hub being trusted, the round it re-queues and the operator lever. Under
+  `--dry-run` the classification is logged once per process lifetime and
+  nothing is killed, seeded or re-queued — and **no ledger row is written**,
+  the identity-drift split, so a diagnostic pass cannot silence the WARNING a
+  production pass owes for the same episode;
+- **kill** the round's own session (`alissa tmux kill <name>`, never a sweep);
+- **seed trust** for the hub the session started in — the hub root, `main/`
+  (the reviewer's cwd) and the `REVIEW-<task>` checkout the review skill may
+  create — into `~/.claude.json` and `$CLAUDE_CONFIG_DIR/.claude.json`, so the
+  re-queued round does not meet the same prompt;
+- one `wedged:first-run-dialog` line on the activity comment, and **re-queue
+  the round in the same pass**, counted exactly as a dead session's respawn
+  (`reenqueued`, the `stale_reenqueued` bucket, the same round number) — the
+  respawn site logs that re-enqueue at INFO, so the episode is one WARNING.
+
+A pane not parked on a gate — a thorough round running long, an expired
+login, a usage limit, any *other* permission prompt — keeps the existing
+*"not respawning over a live reviewer"* defer and its floored `stalled` ping,
+unchanged; this classification deliberately covers only the dialog. So does a
+pane that merely *mentions* a gate: this README, the CHANGELOG, `trust.py` and
+issue #136 all quote its words, so a reviewer that cats or diffs them has them
+on screen while at work — and it has printed something of its own below them
+(a spinner, a tool call, its input prompt), which a gated session never does.
+The words alone never kill a session. Dry-run classifies and logs but kills
+nothing. Only the classification reaches the log: the pane capture itself
+stays at DEBUG, for the reason the reaper gives about third-party terminal
+content.
+
+**Operator lever** for a pane found on the dialog by hand:
+`alissa tmux tail <session>` (or `tmux capture-pane -p -t <session>`) to see
+the prompt, then `tmux send-keys -t <session> Down Enter` to accept it in
+place — or `alissa tmux kill <session>` and seed the hub's trust
+(`projects["<hub>"].hasTrustDialogAccepted: true` for the hub root and
+`<hub>/main` in both state files), and let the next poll's dead-session read
+respawn the round.
 
 ### Reaping finished reviewer sessions
 
@@ -1390,7 +1484,7 @@ The container entrypoint has its own shell suites (no docker needed — the CLIs
 shells out to are stubbed, and the entrypoint under test is the real one):
 
 ```sh
-bash docker/claude/tests-entrypoint-config.sh    # config renderer pass-through
+bash docker/claude/tests-entrypoint-config.sh    # config renderer pass-through, bows-mode trust seeding
 bash docker/claude/tests-entrypoint-identity.sh  # reviewer-identity preflight
 bash docker/claude/tests-entrypoint-auth.sh      # alissa auth failure triage
 bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
@@ -1408,7 +1502,12 @@ the CLI flag probe against the real help text of each CLI generation, and the
 runtime disproof of a flag the API does not serve), the
 `poll_snapshots` exhaust buffer (record/read round-trip, retention pruning,
 in-place migration, one-snapshot-per-poll, dry-run capture), the
-`alissa-pr-review` round/verdict/timeout logic, and the reviewer console (auth
+`alissa-pr-review` round/verdict/timeout logic, the claude trust seeding
+(`test_trust.py`: the merge into both state files, its idempotence and
+never-remove contract, the compare-and-swap under a concurrent writer, the
+derived-repos record, and the first-run-dialog pane classifier with devloop
+PR #124's fixtures verbatim; loop tests for hub-ify seeding before the spawn
+and the `wedged:first-run-dialog` kill + seed + re-queue), and the reviewer console (auth
 matrix, endpoint payload shapes off a seeded state.db, `/proc` parsing with
 vanished PIDs, pinned action argv, HTML token presence), with GitHub, Alissa,
 tmux and `/proc` faked.

@@ -1141,6 +1141,26 @@ class Alissa:
         """
         run(["alissa", "tmux", "kill", session], timeout=30, check=False)
 
+    def tail_session(self, session: str, lines: int) -> str:
+        """The last `lines` of ONE session's terminal, via `alissa tmux tail`.
+
+        The stale-round probe's evidence seam (issue #136): it asks whether a
+        session that reads alive is parked on Claude Code's first-run dialog.
+        Read-only, and best-effort by contract -- a CLI that cannot capture
+        the pane (the session just died, no tmux server, a timeout) answers
+        the EMPTY string, which the classifier treats as "no evidence", never
+        as the dialog: absence of a capture keeps the existing defer.
+        """
+        try:
+            return run(
+                ["alissa", "tmux", "tail", "-n", str(lines), session],
+                timeout=30,
+                check=False,
+            )
+        except CommandError as exc:
+            log.debug("could not tail %s: %s", session, exc)
+            return ""
+
     def add_repo_to_workspace(
         self, owner: str, repo: str, workspace_root: Path, *, dry_run: bool = False
     ) -> None:

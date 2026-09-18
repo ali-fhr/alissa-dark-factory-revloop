@@ -288,6 +288,34 @@ welcome / theme / bypass-mode / **"trust this folder?"** dialog (`"stuck — wai
 at a prompt"`); the trust dialog in particular is **not** suppressed by
 `--dangerously-skip-permissions`.
 
+**The bows-mode trust rule (issue #136).** The entrypoint can only trust hubs
+it can *name* at boot: `{root}/{basename}` and `{root}/{basename}/main` for
+every `ALISSA_REVIEW_REPOS` entry, plus every hub (root, `main/`, any
+`REVIEW-*` checkout) already on disk. Under `ALISSA_REVIEW_REPOS_SOURCE=bows`
+the static list is empty and the allowlist is derived by the daemon at
+runtime, so a repo hub-ified *at review time* was never trusted — its first
+session parked on the dialog while the daemon's stale-round probe read it as
+alive (devloop met the same wedge on `ali-fhr/docs.alissa.app#10`, 108 min).
+Since revloop 0.31.2 the seeding also reads
+**`${ALISSA_WORKSPACE_ROOT}/.alissa-derived-repos`** — the file the daemon
+writes after every successful feed refresh, one `owner/repo` per line
+(`ALISSA_DERIVED_REPOS_FILE` relocates it on both sides) — trusting root and
+`main/` for each, and the daemon trusts a hub itself at hub-ify time and
+before every spawn (root, `main/`, the `REVIEW-<task>` checkout), so the
+entrypoint's file only has to cover the boot the daemon has not run yet. A
+stale round whose session's pane is *parked* on the dialog (the accept option
+among its last lines, nothing but the dialog's own chrome below it, the
+dialog's question — `Quick safety check` / `Is this a project you created` /
+`Bypass Permissions mode` — strictly above it; a pane that merely quotes the
+words is not one) is classified
+`wedged:first-run-dialog`, killed, its hub seeded and the round re-queued (one
+WARNING; see the revloop README, *Sitting on the first-run dialog*).
+**Operator lever** for a pane you find on the dialog: `alissa tmux tail
+<session>` to see it, `tmux send-keys -t <session> Down Enter` to accept it in
+place — or kill the session and add `projects["<hub>"].hasTrustDialogAccepted:
+true` (the hub root and `<hub>/main`) to both `~/.claude.json` and
+`$CLAUDE_CONFIG_DIR/.claude.json`, and let the next poll respawn the round.
+
 **The skills dir is pinned to `$CLAUDE_CONFIG_DIR/skills`** (issue #132). Claude
 Code's rule: with `CLAUDE_CONFIG_DIR` set, personal skills are read from
 `$CLAUDE_CONFIG_DIR/skills/` *instead of* `~/.claude/skills/` — but the alissa
@@ -704,7 +732,7 @@ and may be left empty: the entrypoint no longer dies on an empty allowlist under
 its first review request. The bound is the operator's lanes ∩ review-requested —
 an empty feed set watches **nothing**, deliberately unlike `static`.
 
-Three things the entrypoint does on this path, each logged by name:
+Four things the entrypoint does on this path, each logged by name:
 
 - **Manifest**: written with an empty repo list when absent (hubs materialize
   on demand); a manifest already on the volume is respected as-is.
@@ -720,6 +748,15 @@ Three things the entrypoint does on this path, each logged by name:
   config is regenerated unconditionally and unstamped on every boot, with no
   provenance check — so a hand-written `bow_owners` belongs in
   `ALISSA_REVIEW_BOW_OWNERS`, never in a mounted file a set seed will rewrite.
+- **Trust**: the claude first-run seeding reads
+  `${ALISSA_WORKSPACE_ROOT}/.alissa-derived-repos` — the derived list the
+  daemon records after every successful refresh — and pre-trusts each hub's
+  root and `main/`, so a hub the daemon creates on demand never meets the
+  *"trust this folder?"* dialog on a later boot (the bows-mode trust rule,
+  under *claude auth* above; revloop ≥ 0.31.2). On an older daemon pin the
+  file is simply never written and the seeding falls back to what is on disk
+  — the gap the rule closes; the daemon's own hub-ify-time seeding and the
+  `wedged:first-run-dialog` classification cover the first boot.
 - **Version-skew guard**: the mode is honoured only when the *installed*
   `alissa-tools-github-revloop` understands `repos_source` — probed from the
   library at boot, not read off the pin. The default build installs `0.29.0`
@@ -1079,7 +1116,11 @@ volumes:
    here** if `ALISSA_UI_PASSCODE` is empty (fail-closed, fail-fast); then resolve
    `ALISSA_AGENT_MODEL` into `agents.yaml` and log the effective command.
 2. Ensure a manifest + `revloop.config.json` exist (mount or generate).
-2b. Seed claude's first-run flags into `$HOME` and `$CLAUDE_CONFIG_DIR`, and —
+2b. Seed claude's first-run flags into `$HOME` and `$CLAUDE_CONFIG_DIR` —
+   pre-trusting the `ALISSA_REVIEW_REPOS` hubs, the hubs the daemon **derived**
+   on a previous boot (read from `${ALISSA_WORKSPACE_ROOT}/.alissa-derived-repos`;
+   bows mode, issue #136) and every hub already on disk, root and `main/` each
+   — and —
    when `CLAUDE_CONFIG_DIR` is non-blank — pin the alissa CLI's `skillsDir` to
    `$CLAUDE_CONFIG_DIR/skills` (merged into its `config.json`, the directory
    created, a stop-gap symlink converted into a real directory, `installed`
