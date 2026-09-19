@@ -35,12 +35,15 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+
+log = logging.getLogger(__name__)
 
 # A POSIX-ish environment variable name -- what `reviewer_token_env` must be.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -196,6 +199,11 @@ CONFIG_KEYS = (
     "task_list_bow_id",
     "loop_events_enabled",
     "fleet_vitals_enabled",
+    "prompt_responder",
+    "prompt_quiet_seconds",
+    "prompt_kill_minutes",
+    "prompt_max_answers",
+    "waiting_dir",
     "alissa_endpoint",
     "dry_run",
 )
@@ -453,6 +461,20 @@ def _validate_actor_id(entry: str) -> None:
 
 
 MIN_POLL_INTERVAL = 10  # the search API allows 30 req/min
+
+# The prompt responder's master switch (issue #138; devloop #127's names):
+# `on` answers, `observe` classifies and narrates but sends nothing, `off`
+# never captures a pane.
+PROMPT_ON = "on"
+PROMPT_OBSERVE = "observe"
+PROMPT_OFF = "off"
+_PROMPT_MODES = frozenset((PROMPT_ON, PROMPT_OBSERVE, PROMPT_OFF))
+
+# Where the container's hooks leave the "this session is waiting for input"
+# marker (`docker/claude/hooks/note-waiting.py`): `${ALISSA_WAITING_DIR}/<tmux
+# session>.json`. The daemon reads the same directory, so the two halves
+# agree by construction on a default deployment.
+DEFAULT_WAITING_DIR = "/workspace/.waiting"
 
 # A reviewer session that has not submitted after this long is presumed dead
 # (skill failure mode: "reviewer session stalls"). The round is re-enqueued --
@@ -853,6 +875,40 @@ class Config:
     # about the client (its bearer token) comes from the environment.
     alissa_endpoint: str = DEFAULT_ALISSA_ENDPOINT
 
+    # The prompt responder (issue #138; devloop #127's knobs under the same
+    # names): every poll, for every ALIVE reviewer session this daemon owns,
+    # a waiting marker from the container's hook OR a session quiet for
+    # `prompt_quiet_seconds` triggers a pane capture, the classifier and the
+    # policy table (`prompts.py`), and the answer lands in seconds -- no
+    # SSH, no LLM in the loop. `on` (the default) answers; `observe`
+    # classifies and narrates but sends no key, kills nothing and pages
+    # nobody; `off` never captures a pane. Every side effect honours dry_run
+    # (a dry pass classifies and logs, sends nothing).
+    prompt_responder: str = PROMPT_ON
+
+    # How long a reviewer session must have been quiet (`lastActivity` in
+    # the roster) before its pane is read WITHOUT a waiting marker. The
+    # marker is the fast path (seconds); this is the net under it, for a
+    # hook that did not fire. Floored at 30 so a session between two tool
+    # calls is not read as parked.
+    prompt_quiet_seconds: int = 90
+
+    # The unknown-dialog ladder's last rung: a dialog no signature knows is
+    # waited out one poll, dismissed with Escape on its second sighting, and
+    # after this many minutes still on screen the session is killed so the
+    # ordinary stale-round re-entry takes over. Floored at 1.
+    prompt_kill_minutes: int = 10
+
+    # The per-session answer cap: after this many keystroke answers the
+    # session is killed and its round re-queued -- a reviewer that keeps
+    # producing prompts is diverging, and the narration says so. Floored at 1.
+    prompt_max_answers: int = 5
+
+    # Where the waiting markers are (see DEFAULT_WAITING_DIR). The hooks
+    # read ALISSA_WAITING_DIR at run time; the container's config renderer
+    # writes the same value here so the daemon looks where the hooks wrote.
+    waiting_dir: str = DEFAULT_WAITING_DIR
+
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -874,6 +930,23 @@ class Config:
     @property
     def manifest_path(self) -> Path:
         return self.workspace_root / "alissa-workspace.yaml"
+
+    @property
+    def prompt_kill_seconds(self) -> int:
+        """The unknown-dialog kill rung in seconds, floored at one minute
+        here as well as in `build()` so a Config assembled without it can
+        never kill a session on its first sighting."""
+        return max(1, self.prompt_kill_minutes) * 60
+
+    @property
+    def prompt_quiet_floor(self) -> int:
+        """`prompt_quiet_seconds` with the 30 s floor applied again
+        (`build()` clamps, and so does the read)."""
+        return max(30, self.prompt_quiet_seconds)
+
+    @property
+    def prompt_answer_cap(self) -> int:
+        return max(1, self.prompt_max_answers)
 
     def hub_for(self, owner: str, repo: str) -> Path:
         return Path(
@@ -1217,6 +1290,47 @@ class Config:
                     f"token — got {_describe(token_env)}.{rotate}"
                 )
 
+        # The prompt responder's knobs (issue #138). The mode is an enum
+        # validated by NAME like repos_source (a typo must not read as
+        # "off"); the three numbers have FLOORS rather than 0-sentinels --
+        # none of them has a meaningful "off" value, and each floor is the
+        # smallest value that cannot answer a session that is merely between
+        # two tool calls -- and are clamped up with a warning, because none of
+        # them is worth failing a boot.
+        prompt_mode = str(raw.get("prompt_responder", cls.prompt_responder)).strip()
+        if prompt_mode not in _PROMPT_MODES:
+            raise ValueError(
+                f"prompt_responder must be one of {sorted(_PROMPT_MODES)}, "
+                f"got {prompt_mode!r}"
+            )
+        prompt_quiet = int(raw.get("prompt_quiet_seconds", cls.prompt_quiet_seconds))
+        if prompt_quiet < 30:
+            log.warning(
+                "prompt_quiet_seconds=%d is below the 30 s floor — a shorter "
+                "window would read a session between two tool calls as "
+                "parked; clamping up to 30", prompt_quiet,
+            )
+            prompt_quiet = 30
+        prompt_kill = int(raw.get("prompt_kill_minutes", cls.prompt_kill_minutes))
+        if prompt_kill < 1:
+            log.warning(
+                "prompt_kill_minutes=%d is below the 1 min floor — the "
+                "unknown-dialog ladder needs at least one poll between the "
+                "dismissal and the kill; clamping up to 1", prompt_kill,
+            )
+            prompt_kill = 1
+        prompt_answers = int(raw.get("prompt_max_answers", cls.prompt_max_answers))
+        if prompt_answers < 1:
+            log.warning(
+                "prompt_max_answers=%d is below the floor of 1 — a cap of 0 "
+                "would kill every session on its first prompt; clamping up "
+                "to 1", prompt_answers,
+            )
+            prompt_answers = 1
+        waiting_dir = str(raw.get("waiting_dir", cls.waiting_dir)).strip()
+        if not waiting_dir:
+            raise ValueError("waiting_dir must be a non-empty path")
+
         state_path = raw.get("state_path")
         return cls(
             workspace_root=Path(workspace_root),
@@ -1248,6 +1362,11 @@ class Config:
             task_list_bow_id=bow_id,
             loop_events_enabled=bool(raw.get("loop_events_enabled", False)),
             fleet_vitals_enabled=bool(raw.get("fleet_vitals_enabled", False)),
+            prompt_responder=prompt_mode,
+            prompt_quiet_seconds=prompt_quiet,
+            prompt_kill_minutes=prompt_kill,
+            prompt_max_answers=prompt_answers,
+            waiting_dir=waiting_dir,
             alissa_endpoint=endpoint,
             dry_run=bool(raw.get("dry_run", False)),
         )

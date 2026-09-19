@@ -21,6 +21,21 @@
 # reviewer sat at exactly that rm prompt for 7+ hours holding its slot while
 # the queue re-delivered the same round (issue #116).
 #
+# EVEN SO, the bypass flag does not silence everything (issue #138, devloop
+# #125): Claude Code's critical-path removal check — `rm`/`rmdir` on a glob, an
+# unexpanded variable, a command substitution, `~`, `/`, the cwd or a parent of
+# it — prompts in EVERY mode, and no allow rule or hook `allow` can approve it.
+# It wedged studio lane #1358 twice on 2026-09-19 and a reviewer round on PR
+# #808 (the sentinel's wedge corpus, `wedge-dialog:revloop:pr808-r10`). The
+# answer is UPSTREAM of this profile: the PreToolUse hook
+# /usr/local/share/alissa/hooks/guard-shell.py (registered into claude's
+# settings.json by the entrypoint, ALISSA_SHELL_GUARD=off to disable) DENIES
+# those shapes with an instructive reason before the dialog exists, the
+# Notification hook note-waiting.py leaves a marker under
+# ${ALISSA_WAITING_DIR:-/workspace/.waiting} for any prompt that still appears,
+# and the daemon's prompt responder answers it within one poll from a policy
+# table. The `promptPatterns` below stay as the last line of detection.
+#
 # To pin the reviewer model, set the ALISSA_AGENT_MODEL env var (default:
 # claude-fable-5-1) — the entrypoint rewrites the `command:` below with
 # `--model "$ALISSA_AGENT_MODEL"` at container boot (set it to `default` or empty

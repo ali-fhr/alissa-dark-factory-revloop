@@ -905,6 +905,14 @@ fi
 # $CLAUDE_CONFIG_DIR — whichever claude reads, the flags are there. Merges are
 # load-then-update, so a persisted login (oauthAccount etc.) is preserved.
 #
+# HOOKS (issue #138, the reviewer-seat port of devloop #125): the same settings
+# merge registers the three Claude Code hooks shipped at
+# /usr/local/share/alissa/hooks — the PreToolUse rm guard (refuses, with an
+# instructive reason, the rm shapes that would open the "Dangerous rm
+# operation" dialog nobody can answer; ALISSA_SHELL_GUARD=off unregisters it),
+# the Notification "waiting for input" marker and its UserPromptSubmit /
+# PostToolUse clearer. See docker/claude/README.md.
+#
 # BOWS MODE (issue #136): under repos_source=bows ALISSA_REVIEW_REPOS is empty —
 # the allowlist is DERIVED from the feed Bodies of Work by the daemon at
 # runtime — so the static loop below names nothing, and a hub the daemon
@@ -972,10 +980,87 @@ def state(d):  # ~/.claude.json equivalent: onboarding + per-project trust
     for p in paths:
         pr.setdefault(p, {})["hasTrustDialogAccepted"] = True
 
-def settings(d):  # settings.json: skip the bypass-mode prompt, theme, TUI
+# Claude Code hooks (issue #138; devloop #125's merge, byte for byte). The rm
+# guard, the waiting marker and its clearer ship at HOOKS_DIR (Dockerfile).
+# MERGED, never overwritten: an operator's own hooks survive, a re-run adds
+# nothing twice (a hook is recognised by its script path in the group carrying
+# the same matcher), and ALISSA_SHELL_GUARD=off — the rollback lever — both
+# skips the guard's registration AND removes one a previous boot wrote into a
+# persisted settings.json, so turning it off actually turns it off. The marker
+# pair is always registered. The Notification matcher is a regex on the type.
+# HOOKS_DIR is image-owned, so any registration under it that THIS boot does
+# not make itself — a script, event or matcher another image version wrote
+# into the volume's settings.json — is stale and pruned first: a rollback or
+# roll-forward between two images carrying this merge heals the file on the
+# next boot. (A pre-#138 image has no hook code and cannot; see the README.)
+HOOKS_DIR = "/usr/local/share/alissa/hooks"
+GUARD_HOOK = os.path.join(HOOKS_DIR, "guard-shell.py")
+NOTE_HOOK = os.path.join(HOOKS_DIR, "note-waiting.py")
+CLEAR_HOOK = os.path.join(HOOKS_DIR, "clear-waiting.py")
+guard_on = os.environ.get("ALISSA_SHELL_GUARD", "").strip().lower() not in ("off", "0", "false", "no")
+HOOK_SPECS = [  # (event, matcher or None, script, timeout in seconds)
+    ("PreToolUse", "Bash", GUARD_HOOK, 10),
+    ("Notification", "permission_prompt|idle_prompt", NOTE_HOOK, 10),
+    ("UserPromptSubmit", None, CLEAR_HOOK, 10),
+    ("PostToolUse", None, CLEAR_HOOK, 10),
+]
+
+def _carries(group, script):
+    return isinstance(group, dict) and any(
+        isinstance(h, dict) and script in str(h.get("command", "")) for h in group.get("hooks") or [])
+
+def _ours(h):  # a registration pointing into the image-owned hooks dir
+    return isinstance(h, dict) and (HOOKS_DIR + "/") in str(h.get("command", ""))
+
+def _prune_stale(table, wanted):
+    """Drop every registration under HOOKS_DIR that is not one this boot makes
+    ((event, matcher, script) in `wanted`); a group left empty goes, a foreign
+    hook sharing the group stays, an emptied event disappears."""
+    for event in list(table):
+        groups = table[event]
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for g in groups:
+            if isinstance(g, dict):
+                matcher = g.get("matcher") or None
+                before = g.get("hooks") or []
+                rest = [h for h in before if not _ours(h) or any(
+                    e == event and m == matcher and s in str(h["command"]) for e, m, s in wanted)]
+                if len(rest) < len(before):
+                    if not rest:
+                        continue
+                    g = dict(g, hooks=rest)
+            kept.append(g)
+        if kept:
+            table[event] = kept
+        else:
+            del table[event]
+
+def hooks(d):
+    table = d.get("hooks")
+    if not isinstance(table, dict):
+        table = d["hooks"] = {}
+    specs = [spec for spec in HOOK_SPECS if guard_on or spec[2] != GUARD_HOOK]
+    _prune_stale(table, {(e, m, s) for e, m, s, _ in specs})
+    for event, matcher, script, timeout in specs:
+        groups = table.get(event)
+        if not isinstance(groups, list):
+            groups = table[event] = []
+        if any(_carries(g, script) and (g.get("matcher") or None) == matcher for g in groups):
+            continue
+        entry = {"hooks": [{"type": "command", "command": script, "timeout": timeout}]}
+        if matcher is not None:
+            entry["matcher"] = matcher
+        groups.append(entry)
+    if not table:
+        d.pop("hooks", None)
+
+def settings(d):  # settings.json: skip the bypass-mode prompt, theme, TUI, hooks
     d["skipDangerousModePermissionPrompt"] = True
     d.setdefault("theme", "dark")
     d.setdefault("tui", "fullscreen")
+    hooks(d)
 
 state_targets = [os.path.join(home, ".claude.json")]
 settings_targets = [os.path.join(home, ".claude", "settings.json")]
@@ -987,7 +1072,8 @@ for t in state_targets:
 for t in settings_targets:
     merge(t, settings)
 print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} reviewer dir(s)"
-      f" ({len(derived)} derived repo(s) read from {derived_file})")
+      f" ({len(derived)} derived repo(s) read from {derived_file});"
+      f" hooks: shell guard {'ON' if guard_on else 'OFF (ALISSA_SHELL_GUARD)'}, waiting marker ON")
 PY
 
 # -----------------------------------------------------------------------------

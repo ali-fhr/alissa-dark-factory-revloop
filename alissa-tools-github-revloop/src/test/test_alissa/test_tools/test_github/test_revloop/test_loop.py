@@ -361,6 +361,17 @@ class FakeAlissa:
         # the (session, lines) reads the loop made. Absent: an empty capture.
         self.tails: dict[str, str] = {}
         self.tailed: list[tuple[str, int]] = []
+        # The prompt responder's surface (issue #138): what raw `tmux
+        # capture-pane` would print per managed name (a str, or a LIST of
+        # successive captures -- the answer's re-capture pops the next one),
+        # the keys pressed (live and dry-run apart, exactly the production
+        # split), and the pane's current path.
+        self.panes: dict = {}
+        self.captured: list[tuple[str, int]] = []
+        self.paths: dict[str, str] = {}
+        self.sent: list[tuple[str, tuple]] = []
+        self.dry_sent: list[tuple[str, tuple]] = []
+        self.send_error = False
         # A CommandError `kill_session` raises when set (a session that will
         # not die), so the dialog wedge's retry-next-poll path is testable.
         self.kill_error = None
@@ -483,6 +494,29 @@ class FakeAlissa:
     def tail_session(self, session, lines):
         self.tailed.append((session, lines))
         return self.tails.get(session, "")
+
+    def capture_pane(self, name, lines=40):
+        self.captured.append((name, lines))
+        pane = self.panes.get(name, "")
+        if isinstance(pane, list):
+            if not pane:
+                return ""
+            return pane.pop(0) if len(pane) > 1 else pane[0]
+        return pane
+
+    def pane_path(self, name):
+        return self.paths.get(name, "")
+
+    def send_keys(self, name, *keys, dry_run=False):
+        from alissa.tools.github.revloop.prompts import ALLOWED_KEYS
+        assert set(keys) <= ALLOWED_KEYS, keys
+        if dry_run:
+            self.dry_sent.append((name, keys))
+            return False
+        if self.send_error:
+            return False
+        self.sent.append((name, keys))
+        return True
 
     def add_repo_to_workspace(self, owner, repo, workspace_root, *, dry_run=False):
         self.added.append((owner, repo, workspace_root))
@@ -10898,3 +10932,777 @@ def test_bows_failed_first_refresh_and_dry_run_record_nothing(config, isolated_c
     w.poll_once()
     assert not (root / ".alissa-derived-repos").exists()
     assert claude_trusted(home / ".claude.json") == set()
+
+
+# -- the prompt responder (issue #138) ----------------------------------------
+#
+# The wiring: a waiting marker OR a quiet session triggers capture ->
+# classify -> decide -> act; a session the sweep did not list is never
+# captured; observe and dry-run send nothing; every act is one activity line
+# and one `prompt:` ping row; an account-level notice pages once and HOLDS
+# spawns through the spawn gate; the ladder and the cap end in the daemon's
+# own kill; and THE PIN -- a killed reviewer's round re-enters under the same
+# round number, the cap untouched.
+
+from alissa.tools.github.revloop import prompts as prompts_mod  # noqa: E402
+from alissa.tools.github.revloop import loop_events  # noqa: E402
+from alissa.tools.github.revloop.loop import (  # noqa: E402
+    PROMPT_PAGE_COMMENT,
+    PromptSweep,
+    marker_file_name,
+    review_checkout_of,
+)
+
+PROMPT_SESSION = "review-widgets-pr7-r1-abcdef"
+PROMPT_CHECKOUT = "REVIEW-TASK-500"
+
+
+def rm_dialog(target):
+    return (
+        f"● Bash(rm -rf x)\n"
+        f"  ⎿  Dangerous rm operation on statically-unresolvable target: {target}\n\n"
+        "│ Do you want to proceed?\n│ ❯ 1. Yes\n"
+        "│   2. No, and tell Claude what to do differently (esc)\n"
+    )
+
+
+PROMPT_IDLE = "● Done.\n\n╭───────╮\n│ ❯     │\n╰───────╯\n"
+PROMPT_LOGIN = "\n  Login expired · Please run /login\n\n❯ \n"
+PROMPT_UNKNOWN = "\n Something new asks a question?\n ❯ 1. Option A\n   2. Option B\n Esc to cancel\n"
+PROMPT_PERMISSION = (
+    "● Bash(git push --force)\n│ Do you want to proceed?\n│ ❯ 1. Yes\n"
+    "│   2. Yes, and don't ask again\n│   3. No, and tell Claude what to do differently (esc)\n"
+)
+PROMPT_TRUST = """
+╭──────────────────────────────────────────────────────────╮
+│ Do you trust the files in this folder?                   │
+│                                                          │
+│ /workspace/widgets/main                                  │
+│                                                          │
+│ ❯ 1. Yes, proceed                                        │
+│   2. No, exit                                            │
+│                                                          │
+│ Enter to confirm · Esc to exit                           │
+╰──────────────────────────────────────────────────────────╯
+"""
+
+
+def prompt_config(config, tmp_path, **over):
+    return dataclasses.replace(config, waiting_dir=str(tmp_path / "waiting"), **over)
+
+
+def prompt_watcher(config, tmp_path, *, reviews=(), state=None, pr=None, **over):
+    """A watcher whose ledger already holds round 1's spawn row for
+    PROMPT_SESSION -- the round the responder's acts anchor on."""
+    cfg = prompt_config(config, tmp_path, **over)
+    st = state or State(cfg.state_db)
+    st.record_spawn(
+        repo=SLUG, number=NUMBER, round_=1, head_sha="abc123",
+        session=PROMPT_SESSION, task_ref=FakeTask.ref,
+    )
+    w, gh, al = watcher(cfg, pr or make_pr(), list(reviews), state=st)
+    w._sleep = lambda seconds: None
+    return w, gh, al
+
+
+def roster_entry(name, *, quiet=0, status="busy", dated=True):
+    return ManagedSession(
+        name=name, status=status,
+        last_activity=(time.time() - quiet) if dated else 0.0,
+        session=f"ali-{name}",
+    )
+
+
+def write_marker(cfg, name, cwd=None):
+    path = Path(cfg.waiting_dir) / marker_file_name(f"ali-{name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "session": f"ali-{name}", "cwd": cwd, "kind": "permission_prompt",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - 14)),
+    }))
+    return path
+
+
+def hub_of(w):
+    return str(w.config.workspace_root / REPO)
+
+
+def activity_lines(gh):
+    """The `- …` lines of THE activity comment (the header is two lines)."""
+    return [
+        line for c in activity_comments(gh) for line in c.body.splitlines()
+        if line.startswith("- ")
+    ]
+
+
+def prompt_pings(w):
+    return [r["kind"] for r in w.state.read_pings() if r["kind"].startswith("prompt")]
+
+
+def test_a_marked_session_parked_on_rm_inside_its_checkout_is_accepted(config, tmp_path):
+    """THE golden path: the hook left a marker whose cwd is the reviewer's
+    REVIEW-<task> checkout, the pane shows the rm dialog on a target inside
+    it, and within the pass Enter is pressed, the pane is re-read, the
+    activity line and the loop-event row land, and the ladder is cleared."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    checkout = f"{hub_of(w)}/{PROMPT_CHECKOUT}"
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{checkout}/src")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{checkout}/sales/shots/*"), PROMPT_IDLE]
+
+    sweep = w._respond_to_prompts(al.sessions)
+
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    assert al.captured == [(PROMPT_SESSION, 40), (PROMPT_SESSION, 40)], "captured, answered, re-captured"
+    assert sweep.answered == 1 and sweep.hold is None
+    assert sweep.waiting[0]["kind"] == "dangerous_rm" and sweep.waiting[0]["action"] == "accept"
+    assert al.killed == []
+    line = activity_comments(gh)[0].body.splitlines()[-1]
+    assert "prompt-answered: dangerous_rm → accept (target inside worktree)" in line
+    assert f"target {PROMPT_CHECKOUT}/sales/shots" in line, "paths relative to the hub"
+    assert hub_of(w) not in line, "never an absolute path"
+    assert "14 s after it appeared" in line
+    assert "Dangerous rm operation" not in line, "never the pane's text"
+    assert f"`{PROMPT_SESSION}`" in line and "round 1 of 3" in line
+    kinds = prompt_pings(w)
+    assert len(kinds) == 1 and kinds[0].startswith(f"prompt:dangerous_rm:accept@{PROMPT_SESSION}#")
+    events = [e for e in loop_events.derive_events(w.state) if e["kind"] == "escalation.prompt"]
+    assert len(events) == 1 and events[0]["session"] == PROMPT_SESSION
+    assert events[0]["data"]["action"] == "accept" and events[0]["prNumber"] == NUMBER
+    assert w.state.read_prompt_sightings() == [], "the pane changed: the ladder is cleared"
+    assert w.state.prompt_sighting(PROMPT_SESSION)["answers"] == 1
+
+
+def test_the_spawn_rows_task_ref_names_the_checkout_when_the_marker_has_no_cwd(config, tmp_path):
+    """The reviewer seat's one advantage: the review skill names the
+    checkout REVIEW-<task ref>, so the spawn row alone resolves it."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog("tmp/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    assert f"target {PROMPT_CHECKOUT}/tmp" in activity_comments(gh)[0].body
+
+
+def test_an_rm_in_main_or_another_checkout_is_declined_with_the_numbered_no(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/main/x"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))]
+    line = activity_comments(gh)[0].body.splitlines()[-1]
+    assert "dangerous_rm → decline (target outside worktree)" in line
+    assert "target main/x" in line
+
+    al.sent.clear()
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/REVIEW-TASK-501/x/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))], "another round's checkout is outside"
+
+
+def test_a_session_whose_checkout_cannot_be_named_declines(config, tmp_path):
+    """No marker cwd, no task ref on the row, and the pane path is main/ (a
+    fresh spawn's shell): the policy cannot tell this round's checkout from
+    another's."""
+    cfg = prompt_config(config, tmp_path)
+    st = State(cfg.state_db)
+    st.record_spawn(repo=SLUG, number=NUMBER, round_=1, head_sha="abc123",
+                    session=PROMPT_SESSION, task_ref=None)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    w._sleep = lambda s: None
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=120)]
+    al.paths[PROMPT_SESSION] = f"{hub_of(w)}/main"
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))]
+    assert "lane worktree unknown" in activity_comments(gh)[0].body
+
+
+def test_the_pane_path_is_the_last_leg_of_the_checkout_resolution(config, tmp_path):
+    cfg = prompt_config(config, tmp_path)
+    st = State(cfg.state_db)
+    st.record_spawn(repo=SLUG, number=NUMBER, round_=1, head_sha="abc123",
+                    session=PROMPT_SESSION, task_ref=None)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    w._sleep = lambda s: None
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=120)]
+    al.paths[PROMPT_SESSION] = f"{hub_of(w)}/{PROMPT_CHECKOUT}/deep"
+    al.panes[PROMPT_SESSION] = [rm_dialog("tmp/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+
+
+def test_review_checkout_of_and_marker_file_name():
+    assert review_checkout_of("/w/h/REVIEW-TASK-1/a/b", "/w/h") == "/w/h/REVIEW-TASK-1"
+    assert review_checkout_of("/w/h/REVIEW-TASK-1", "/w/h/") == "/w/h/REVIEW-TASK-1"
+    assert review_checkout_of("/w/h/main/a", "/w/h") is None
+    assert review_checkout_of("/w/h/TASK-1-X/a", "/w/h") is None, "a developer's worktree is not ours"
+    assert review_checkout_of("/w/h", "/w/h") is None
+    assert review_checkout_of("/w/other/REVIEW-TASK-1", "/w/h") is None
+    assert review_checkout_of("", "/w/h") is None and review_checkout_of("/x", None) is None
+    assert marker_file_name("ali-review-widgets-pr7-r1-abcdef") == "ali-review-widgets-pr7-r1-abcdef.json"
+    assert marker_file_name("a b/c") == "a_b_c.json"
+
+
+def test_a_quiet_session_is_read_without_a_marker_and_a_busy_one_is_not(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    other = "review-widgets-pr9-r1-0000ff"
+    al.sessions = [
+        roster_entry(PROMPT_SESSION, quiet=120),
+        roster_entry(other, quiet=10),
+    ]
+    al.panes[PROMPT_SESSION] = PROMPT_IDLE
+    al.panes[other] = rm_dialog("/tmp/x")
+    sweep = w._respond_to_prompts(al.sessions)
+    assert [n for n, _ in al.captured] == [PROMPT_SESSION], (
+        "quiet past prompt_quiet_seconds is read; a session active 10 s ago is not"
+    )
+    assert sweep.waiting == () and al.sent == []
+
+
+def test_a_session_the_roster_cannot_date_is_read_only_on_a_marker(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, dated=False)]
+    al.panes[PROMPT_SESSION] = rm_dialog("/tmp/x")
+    w._respond_to_prompts(al.sessions)
+    assert al.captured == []
+    write_marker(w.config, PROMPT_SESSION)
+    w._respond_to_prompts(al.sessions)
+    assert [n for n, _ in al.captured] == [PROMPT_SESSION, PROMPT_SESSION]
+
+
+def test_only_the_sweeps_own_grammar_roster_is_ever_read(config, tmp_path):
+    """The responder runs on the sweep's post-reap roster, and that roster
+    is `list_review_sessions` -- filtered on the grammar, so a foreign name
+    never reaches it. A failed listing (None) reads nothing at all."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    al.sessions = [
+        roster_entry("develop-acme-widgets-i7-a1", quiet=999),
+        roster_entry("operator-shell", quiet=999),
+        roster_entry(PROMPT_SESSION, quiet=999),
+    ]
+    for name in ("develop-acme-widgets-i7-a1", "operator-shell", PROMPT_SESSION):
+        al.panes[name] = rm_dialog("/tmp/x")
+        write_marker(w.config, name)
+    sweep = w._respond_to_prompts(al.list_review_sessions())
+    assert {n for n, _ in al.captured} == {PROMPT_SESSION}, "a foreign name is never read"
+    assert [n for n, _ in al.sent] == [PROMPT_SESSION]
+    assert [x["session"] for x in sweep.waiting] == [PROMPT_SESSION]
+    al.captured.clear()
+    assert w._respond_to_prompts(None) == PromptSweep()
+    assert al.captured == []
+
+
+def test_off_never_captures_a_pane(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_responder="off")
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=999)]
+    al.panes[PROMPT_SESSION] = rm_dialog("/tmp/x")
+    assert w._respond_to_prompts(al.sessions) == PromptSweep()
+    assert al.captured == []
+
+
+def test_observe_classifies_and_narrates_but_sends_nothing(config, tmp_path, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_responder="observe")
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*")
+    with caplog.at_level(logging.INFO):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert al.sent == [] and al.dry_sent == [] and al.killed == []
+    assert al.captured == [(PROMPT_SESSION, 40)], "no re-capture: nothing was pressed"
+    assert sweep.answered == 0
+    assert sweep.waiting[0]["kind"] == "dangerous_rm"
+    line = activity_comments(gh)[0].body.splitlines()[-1]
+    assert "prompt-answered: dangerous_rm → accept" in line and "observe mode, nothing sent" in line
+    assert "[observe: not sent]" in caplog.text
+    # the same pane on the next pass narrates nothing more (one line per episode)
+    w._respond_to_prompts(al.sessions)
+    assert len(activity_lines(gh)) == 1
+
+
+def test_observe_neither_pages_nor_holds_on_an_account_notice(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_responder="observe")
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+    sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.hold is None and operator_comments(gh) == []
+    assert sweep.waiting[0]["kind"] == "login_expired"
+
+
+def test_dry_run_classifies_and_logs_but_sends_nothing_and_writes_no_ledger(config, tmp_path, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path, dry_run=True)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*")
+    with caplog.at_level(logging.INFO):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert al.sent == [] and al.dry_sent == [(PROMPT_SESSION, ("Enter",))]
+    assert sweep.answered == 0
+    assert gh.comments == [] and gh.issue_store == [], "dry-run posts nothing"
+    assert prompt_pings(w) == [], "no ping row for an act that did not happen"
+    assert w.state.prompt_sighting(PROMPT_SESSION) is None, "the dry-run ladder stays in memory"
+    assert sweep.waiting[0]["kind"] == "dangerous_rm"
+    assert "[dry-run] would append activity line" in caplog.text
+
+
+def test_an_unchanged_pane_counts_as_unanswered_and_keeps_the_ladder(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*")
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    row = w.state.prompt_sighting(PROMPT_SESSION)
+    assert row["kind"] == "dangerous_rm" and row["answers"] == 1
+    assert "unanswered (pane unchanged)" in activity_comments(gh)[0].body
+    assert w.state.read_prompt_sightings()[0]["session"] == PROMPT_SESSION, "still waiting"
+
+
+def test_the_answer_cap_ends_in_the_daemons_own_kill(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_max_answers=2)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*")
+
+    w._respond_to_prompts(al.sessions)
+    w._respond_to_prompts(al.sessions)
+    assert len(al.sent) == 2 and al.killed == []
+    sweep = w._respond_to_prompts(al.sessions)
+
+    assert len(al.sent) == 2, "no third answer"
+    assert al.killed == [PROMPT_SESSION]
+    assert sweep.waiting[0]["action"] == "kill"
+    body = activity_comments(gh)[0].body
+    assert "prompt-killed: dangerous_rm → kill (answer cap reached (2/2" in body
+    assert "diverging" in body and "the stale-round edge re-enters the same round next poll" in body
+    assert any(k.startswith(f"prompt:dangerous_rm:kill@{PROMPT_SESSION}#") for k in prompt_pings(w))
+
+
+def test_the_unknown_dialog_ladder_waits_escapes_then_kills(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_kill_minutes=1)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=999)]
+    al.panes[PROMPT_SESSION] = PROMPT_UNKNOWN
+
+    first = w._respond_to_prompts(al.sessions)
+    assert al.sent == [] and first.waiting[0]["action"] == "wait"
+    assert "prompt-seen: unknown_dialog → wait" in activity_comments(gh)[0].body
+
+    second = w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Escape",))] and second.waiting[0]["action"] == "escape"
+    assert al.killed == []
+
+    # still there past prompt_kill_minutes: the kill
+    w.state._db.execute(
+        "UPDATE prompt_sightings SET first_seen=first_seen-120 WHERE session=?", (PROMPT_SESSION,)
+    )
+    w.state._db.commit()
+    third = w._respond_to_prompts(al.sessions)
+    assert al.killed == [PROMPT_SESSION] and third.waiting[0]["action"] == "kill"
+    assert len(al.sent) == 1, "no further Escape once the kill is due"
+
+
+def test_a_permission_prompt_is_declined_never_accepted(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [PROMPT_PERMISSION, PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("3", "Enter"))]
+    assert "permission → decline" in activity_comments(gh)[0].body
+
+
+def test_the_trust_gate_under_workspace_is_accepted_within_one_poll(config, tmp_path):
+    """The first-run dialog the stale-round probe classifies at 90 minutes
+    (issue #136) is answered by the responder on the next poll instead: the
+    reviewer's hub is under /workspace, so the gate is accepted in place."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [PROMPT_TRUST, PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    assert "trust → accept (path under /workspace)" in activity_comments(gh)[0].body
+    assert al.killed == []
+
+
+def test_an_account_notice_pages_once_per_window_holds_spawns_and_presses_nothing(
+    config, tmp_path
+):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+
+    sweep = w._respond_to_prompts(al.sessions)
+
+    assert al.sent == [] and al.killed == []
+    assert sweep.hold and sweep.hold.startswith(f"login_expired on {PROMPT_SESSION}")
+    pages = operator_comments(gh)
+    assert len(pages) == 1 and "Reviewer account needs an operator" in pages[0]
+    assert "login_expired" in pages[0] and "HOLDING new reviewer spawns" in pages[0]
+    assert "prompt-paged: login_expired → page" in activity_comments(gh)[0].body
+    kinds = prompt_pings(w)
+    assert any(k.startswith(f"prompt-page:login_expired@{PROMPT_SESSION}#") for k in kinds)
+    assert any(k.startswith(f"prompt:login_expired:page@{PROMPT_SESSION}#") for k in kinds)
+    events = {e["kind"] for e in loop_events.derive_events(w.state)}
+    assert {"escalation.prompt", "escalation.prompt_page"} <= events
+
+    # the next pass: the hold stands, nothing is paged again
+    again = w._respond_to_prompts(al.sessions)
+    assert again.hold is not None
+    assert len(operator_comments(gh)) == 1
+    assert len(activity_lines(gh)) == 1, "one narration line"
+
+    # a SECOND session showing the same notice inside the window: no new page
+    other = "review-widgets-pr9-r1-0000ff"
+    w.state.record_spawn(repo=SLUG, number=9, round_=1, head_sha="h9", session=other, task_ref=None)
+    al.sessions.append(roster_entry(other))
+    write_marker(w.config, other)
+    al.panes[other] = PROMPT_LOGIN
+    w._respond_to_prompts(al.sessions)
+    assert len(operator_comments(gh)) == 1
+
+
+def test_the_account_hold_expires_by_killing_the_parked_session(config, tmp_path):
+    """A banner never changes on its own, so the hold has an expiry: the
+    same pane past ACCOUNT_HOLD_SECONDS on a later sighting is killed
+    through the ordinary kill path, that pass raises no hold, and the page
+    told the operator so."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+
+    first = w._respond_to_prompts(al.sessions)
+    assert first.hold is not None and al.killed == []
+    assert "in any case after 60 min on the same pane" in operator_comments(gh)[0]
+
+    w.state._db.execute(
+        "UPDATE prompt_sightings SET first_seen=first_seen-? WHERE session=?",
+        (prompts_mod.ACCOUNT_HOLD_SECONDS + 5, PROMPT_SESSION),
+    )
+    w.state._db.commit()
+    expired = w._respond_to_prompts(al.sessions)
+    assert expired.hold is None, "the kill pass raises no hold"
+    assert al.killed == [PROMPT_SESSION] and al.sent == []
+    assert expired.waiting[0]["action"] == "kill"
+    assert "prompt-killed: login_expired → kill" in activity_lines(gh)[-1]
+    assert len(operator_comments(gh)) == 1, "no second page inside the window"
+
+
+def test_the_page_repeats_after_the_six_hour_window(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+    w._respond_to_prompts(al.sessions)
+    w.state._db.execute(
+        "UPDATE pings SET pinged_at=pinged_at-? WHERE kind LIKE 'prompt-page:%'",
+        (prompts_mod.PAGE_WINDOW_SECONDS + 5,),
+    )
+    w.state._db.commit()
+    w._respond_to_prompts(al.sessions)
+    assert len(operator_comments(gh)) == 2
+
+
+def test_the_hold_defers_every_spawn_in_poll_once_and_lifts_when_the_notice_clears(
+    config, tmp_path
+):
+    """Through the whole pass: another PR's parked reviewer shows the login
+    banner, so the pending request that would spawn round 1 on OUR PR is
+    QUEUED `prompt-held` with the hold's reason, and the pass after the
+    notice clears spawns it."""
+    cfg = prompt_config(config, tmp_path)
+    st = State(cfg.state_db)
+    other = "review-widgets-pr9-r1-0000ff"
+    st.record_spawn(repo=SLUG, number=9, round_=1, head_sha="h9", session=other, task_ref=None)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    w._sleep = lambda s: None
+    write_marker(cfg, other)
+    al.sessions = [roster_entry(other)]
+    al.panes[other] = PROMPT_LOGIN
+
+    results = w.poll_once()
+
+    decisions = {slug: d for slug, d in results}
+    d = decisions[f"{SLUG}#{NUMBER}"]
+    assert d.action is Action.QUEUED and d.prompt_held is True
+    assert "spawns held by the prompt responder — login_expired on" in d.reason
+    assert al.enqueued == []
+    assert w._stage_record(f"{SLUG}#{NUMBER}", d)["stage"] == "prompt-held"
+    assert len(operator_comments(gh)) == 1, "the page landed on PR #9"
+
+    al.panes[other] = PROMPT_IDLE
+    results = w.poll_once()
+    d = {slug: d for slug, d in results}[f"{SLUG}#{NUMBER}"]
+    assert d.action is Action.SPAWNED and len(al.enqueued) == 1
+    assert w._prompt_hold is None
+
+
+def test_the_hold_is_excluded_from_the_capacity_summary(config, tmp_path):
+    """`_note_deferrals` counts slot-gated rounds; a prompt-held round is
+    waiting on the ACCOUNT, and must not read as a full container."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    results = [
+        (f"{SLUG}#{NUMBER}", Decision(Action.QUEUED, "held", 1, prompt_held=True)),
+    ]
+    w._note_deferrals(results)
+    assert w._gate_streak.count == 0
+
+
+def test_a_sighting_is_cleared_when_the_session_moves_on_and_pruned_when_it_leaves(
+    config, tmp_path
+):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=999)]
+    al.panes[PROMPT_SESSION] = PROMPT_UNKNOWN
+    w._respond_to_prompts(al.sessions)
+    assert w.state.read_prompt_sightings()[0]["session"] == PROMPT_SESSION
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=5)]
+    w._respond_to_prompts(al.sessions)
+    assert w.state.read_prompt_sightings() == [], "busy again: the ladder is reset"
+    al.sessions = []
+    w._respond_to_prompts(al.sessions)
+    assert w.state.prompt_sighting(PROMPT_SESSION) is None, "gone: the row is pruned"
+
+
+def test_a_session_with_no_spawn_row_and_no_allowlist_match_is_answered_but_log_only(
+    config, tmp_path, caplog
+):
+    """The policy runs on the name grammar; the artifact to narrate on needs
+    a spawn row or a name that resolves to exactly one watched repo. A
+    hand-spawned `review-pr-<n>` on a daemon watching every repo still gets
+    its answer -- and no comment anywhere."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    stranger = "review-pr-904"
+    write_marker(w.config, stranger)
+    al.sessions = [roster_entry(stranger)]
+    al.panes[stranger] = [PROMPT_PERMISSION, PROMPT_IDLE]
+    with caplog.at_level(logging.WARNING):
+        w._respond_to_prompts(al.sessions)
+    assert al.sent == [(stranger, ("3", "Enter"))]
+    assert gh.issue_store == [] and prompt_pings(w) == []
+    assert "names no PR this daemon can resolve" in caplog.text
+
+
+def test_a_name_that_resolves_to_exactly_one_watched_repo_narrates_on_that_pr(config, tmp_path):
+    cfg = dataclasses.replace(prompt_config(config, tmp_path), repos=(SLUG, "acme/gadgets"))
+    w, gh, al = watcher(cfg, make_pr(), [])
+    w._sleep = lambda s: None
+    skill_shaped = "review-widgets-pr7-r2-00beef"  # no spawn row: the skill spawned it
+    write_marker(cfg, skill_shaped)
+    al.sessions = [roster_entry(skill_shaped)]
+    al.panes[skill_shaped] = [PROMPT_PERMISSION, PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(skill_shaped, ("3", "Enter"))]
+    line = activity_comments(gh)[0].body.splitlines()[-1]
+    assert "round 2 of 3" in line and "permission → decline" in line
+
+
+# -- THE PIN: a reviewer killed by the ladder never consumes a round -----------
+
+
+def test_a_killed_reviewer_re_enters_the_same_round_and_the_cap_is_untouched(config, tmp_path):
+    """Round 1 is in flight; its session parks on a permission prompt, is
+    declined, parks again, and the answer cap kills it. The kill ages the
+    spawn row past the stale window, so the NEXT evaluate re-enqueues ROUND
+    1 -- `reenqueued`, the same round number, no verdict counted -- and the
+    loop still runs its full cap of rounds afterwards. Attempts are not
+    rounds; the cap counts verdicts."""
+    cfg = prompt_config(config, tmp_path, prompt_max_answers=1)
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    w._sleep = lambda s: None
+    first = w.evaluate(OWNER, REPO, NUMBER)
+    assert first.action is Action.SPAWNED and first.round == 1
+    name = al.enqueued[0]["session"]
+
+    write_marker(cfg, name)
+    al.sessions = [roster_entry(name)]
+    al.panes[name] = PROMPT_PERMISSION
+    w._respond_to_prompts(al.sessions)          # declined (answer 1 of 1)
+    assert al.sent == [(name, ("3", "Enter"))] and al.killed == []
+    sweep = w._respond_to_prompts(al.sessions)  # the cap: killed
+    assert al.killed == [name] and sweep.waiting[0]["action"] == "kill"
+    assert al.sessions == [], "the fake drops a killed session like real tmux"
+
+    # The very next pass: the stale-round probe reads the session gone and
+    # re-enqueues the SAME round.
+    second = w.evaluate(OWNER, REPO, NUMBER)
+    assert second.action is Action.SPAWNED and second.reenqueued is True
+    assert second.round == 1, "the same round, not round 2"
+    assert len(al.enqueued) == 2 and al.enqueued[1]["session"] != name
+    assert w.state.get_spawn(SLUG, NUMBER, 1)["session"] == al.enqueued[1]["session"]
+    stages = [w._stage_record(f"{SLUG}#{NUMBER}", second)["stage"]]
+    assert stages == ["stale-re-enqueued"]
+    assert not any(k.startswith("capout") for k in prompt_pings(w))
+
+    # And the cap still has every round in it: two request_changes verdicts
+    # later, round 3 (the cap) is spawned, not escalated.
+    gh._reviews[:] = [review(at="2026-07-18T10:00:00Z"), review(at="2026-07-18T11:00:00Z")]
+    al.verdict_count = 2
+    w.state._db.execute("DELETE FROM spawns")
+    w.state._db.commit()
+    third = w.evaluate(OWNER, REPO, NUMBER)
+    assert third.action is Action.SPAWNED and third.round == 3
+    assert operator_comments(gh) == [], "no cap-out, no page: the kill cost nothing"
+
+
+def test_a_kill_without_a_spawn_row_leaves_the_stale_edge_to_its_own_clock(config, tmp_path):
+    cfg = dataclasses.replace(prompt_config(config, tmp_path, prompt_max_answers=1), repos=(SLUG,))
+    w, gh, al = watcher(cfg, make_pr(), [])
+    w._sleep = lambda s: None
+    skill_shaped = "review-widgets-pr7-r1-00beef"
+    write_marker(cfg, skill_shaped)
+    al.sessions = [roster_entry(skill_shaped)]
+    al.panes[skill_shaped] = PROMPT_PERMISSION
+    w._respond_to_prompts(al.sessions)
+    w._respond_to_prompts(al.sessions)
+    assert al.killed == [skill_shaped]
+    assert w.state.read_spawns() == [], "nothing to age"
+
+
+def test_the_live_stalled_comment_says_what_the_responder_classified(config, tmp_path):
+    """The 3x-stale-window operator ping now ends with the pane's
+    classification: `working`, a kind, `unreadable`, or `responder off`."""
+    cases = [
+        ("", "unreadable"),
+        ("✻ Thinking… (esc to interrupt)\n", "working"),
+        (PROMPT_LOGIN, "login_expired"),
+        (PROMPT_PERMISSION, "permission"),
+    ]
+    for pane, label in cases:
+        cfg = prompt_config(config, tmp_path, state_path=tmp_path / f"{label}.db")
+        st = State(cfg.state_db)
+        w, gh, al = watcher(cfg, make_pr(), [], state=st)
+        w.evaluate(OWNER, REPO, NUMBER)
+        name = al.enqueued[0]["session"]
+        st._db.execute("UPDATE spawns SET spawned_at=?", (int(time.time()) - PAST_FLOOR,))
+        st._db.commit()
+        al.sessions = [roster_entry(name, quiet=5)]
+        al.panes[name] = pane
+        d = w.evaluate(OWNER, REPO, NUMBER)
+        assert d.action is Action.IN_FLIGHT and d.deferred
+        page = operator_comments(gh)[0]
+        assert "Review round stalled?" in page
+        assert f"classified it: `{label}`" in page, (label, page)
+    cfg = prompt_config(config, tmp_path, prompt_responder="off", state_path=tmp_path / "off.db")
+    st = State(cfg.state_db)
+    w, gh, al = watcher(cfg, make_pr(), [], state=st)
+    w.evaluate(OWNER, REPO, NUMBER)
+    name = al.enqueued[0]["session"]
+    st._db.execute("UPDATE spawns SET spawned_at=?", (int(time.time()) - PAST_FLOOR,))
+    st._db.commit()
+    al.sessions = [roster_entry(name, quiet=5)]
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert "classified it: `responder off`" in operator_comments(gh)[0]
+    assert al.captured == []
+
+
+def test_an_unparseable_marker_still_counts_as_present(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    path = write_marker(w.config, PROMPT_SESSION)
+    path.write_text("{not json")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [PROMPT_PERMISSION, PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("3", "Enter"))]
+    assert "0 s after it appeared" in activity_lines(gh)[0], "no `at` to date it by"
+
+
+def test_marker_age_tolerates_missing_or_odd_stamps():
+    assert ReviewWatcher._marker_age(None, 1000.0) == 0
+    assert ReviewWatcher._marker_age({}, 1000.0) == 0
+    assert ReviewWatcher._marker_age({"at": "yesterday"}, 1000.0) == 0
+    assert ReviewWatcher._marker_age({"at": 5}, 1000.0) == 0
+    assert ReviewWatcher._marker_age({"at": "1970-01-01T00:10:00+00:00"}, 1000.0) == 400
+
+
+def test_a_failed_cap_kill_keeps_the_ladder_and_is_retried(config, tmp_path, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_max_answers=1)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*")
+    w._respond_to_prompts(al.sessions)
+    al.kill_error = CommandError(["alissa", "tmux", "kill", PROMPT_SESSION], 1, "no such session")
+    with caplog.at_level(logging.WARNING):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.waiting[0]["action"] == "kill" and al.killed == []
+    assert "could not kill" in caplog.text
+    assert "prompt-killed" in activity_lines(gh)[-1]
+    assert "re-enters the same round" not in activity_lines(gh)[-1]
+    assert w.state.spawn_age(SLUG, NUMBER, 1) < STALE_ROUND_SECONDS, "a failed kill ages nothing"
+
+
+def test_a_refused_send_is_narrated_as_not_sent(config, tmp_path):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    al.send_error = True
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_PERMISSION
+    sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.answered == 0 and al.sent == []
+    assert "keys not sent (tmux refused)" in activity_lines(gh)[0]
+    assert w.state.prompt_sighting(PROMPT_SESSION)["answers"] == 0, "a refused send is not an answer"
+
+
+def test_the_cap_kill_is_dry_run_gated_and_the_dry_ladder_is_in_memory(config, tmp_path, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_max_answers=1, dry_run=True)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_PERMISSION
+    w._respond_to_prompts(al.sessions)  # the dry answer counts toward the in-memory cap
+    assert w._dry_run_sightings[PROMPT_SESSION]["answers"] == 0, "a dry send is not an answer"
+    w._dry_run_sightings[PROMPT_SESSION]["answers"] = 1
+    with caplog.at_level(logging.INFO):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.waiting[0]["action"] == "kill" and al.killed == []
+    assert "[dry-run] would kill" in caplog.text
+    assert w.state.read_prompt_sightings() == [], "production's ladder is untouched"
+    assert w.state.spawn_age(SLUG, NUMBER, 1) < STALE_ROUND_SECONDS
+
+
+def test_a_failed_page_comment_retries_next_poll(config, tmp_path, monkeypatch, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+
+    def boom(owner, repo, number, body):
+        raise CommandError(["gh"], 1, "boom")
+    monkeypatch.setattr(gh, "comment", boom)
+    with caplog.at_level(logging.ERROR):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.hold is not None, "the hold does not depend on the page landing"
+    assert "could not post the prompt page" in caplog.text
+    assert not any(k.startswith("prompt-page:") for k in prompt_pings(w))
+
+
+def test_the_page_is_dry_run_gated(config, tmp_path, caplog):
+    w, gh, al = prompt_watcher(config, tmp_path, dry_run=True)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = PROMPT_LOGIN
+    with caplog.at_level(logging.INFO):
+        sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.hold is not None and gh.comments == []
+    assert "[dry-run] would page" in caplog.text
+    assert PROMPT_PAGE_COMMENT.split("—")[0].strip("* ") in caplog.text
+
+
+def test_poll_once_runs_the_responder_on_the_post_reap_roster_and_logs_the_summary(
+    config, tmp_path, caplog
+):
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/{PROMPT_CHECKOUT}")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/x/*"), PROMPT_IDLE]
+    with caplog.at_level(logging.INFO):
+        w.poll_once()
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    assert "1 parked on a prompt, 1 answered," in caplog.text
+    assert w._prompt_sweep.answered == 1

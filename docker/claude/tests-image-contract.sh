@@ -34,7 +34,11 @@
 #   5. claude's first-run gates are pre-seeded — and the entrypoint's OWN
 #      seeding, run out of the shipped file with an EMPTY ALISSA_REVIEW_REPOS
 #      and one derived repo (bows mode, issue #136), pre-trusts that repo's
-#      hub root and main/
+#      hub root and main/ and registers the three Claude Code hooks (issue
+#      #138) in both settings files
+#   5b. the hooks themselves ship at /usr/local/share/alissa/hooks — this
+#      repo's bytes, root-owned, executable — and the rm guard decides in the
+#      image's own python (one deny, one silent pass)
 #   6. the per-daemon git author identity resolves FOR THE alissa USER
 #   7. the baked ARG->ENV knob defaults are unchanged
 #   8. /usr/local/bin/entrypoint.sh is THIS repo's file and not the base's stub
@@ -105,6 +109,21 @@ EXPECT_EP_SHA="$(sha256sum "${SCRIPT_DIR}/entrypoint.sh"      | cut -d' ' -f1)"
 EXPECT_RC_SHA="$(sha256sum "${SCRIPT_DIR}/revloop-config.sh"  | cut -d' ' -f1)"
 EXPECT_FW_SHA="$(sha256sum "${SCRIPT_DIR}/init-firewall.sh"   | cut -d' ' -f1)"
 EXPECT_AGENTS_SHA="$(sha256sum "${SCRIPT_DIR}/agents.yaml"    | cut -d' ' -f1)"
+# The Claude Code hooks (issue #138) land under /usr/local/share/alissa/hooks,
+# not /usr/local/bin. Same shape as the sha checks above: "<basename>:<sha256>"
+# tokens on one line, NO-SUCH-FILE for an unhashable source, and every one of
+# them must be executable (they are RUN by claude).
+EXPECT_HOOKS="$(
+  for f in "${SCRIPT_DIR}"/hooks/*.py; do
+    sum="$(sha256sum "${f}" 2>/dev/null | cut -d' ' -f1)"
+    printf '%s:%s ' "$(basename "${f}")" "${sum:-NO-SUCH-FILE}"
+  done
+)"
+case "${EXPECT_HOOKS}" in
+  *guard-shell.py:*note-waiting.py:*|*note-waiting.py:*guard-shell.py:*)
+    pass "hook manifest read from docker/claude/hooks: ${EXPECT_HOOKS}" ;;
+  *) bad "hook manifest incomplete — expected guard-shell.py and note-waiting.py under docker/claude/hooks: ${EXPECT_HOOKS:-<empty>}" ;;
+esac
 # The pin, read out of the Dockerfile the same way check-entrypoint.yaml reads it.
 EXPECT_REVLOOP="$(sed -n 's/^ARG REVLOOP_VERSION=\([0-9.]*\).*/\1/p' "${SCRIPT_DIR}/Dockerfile")"
 
@@ -116,6 +135,7 @@ if ! docker run --rm -i --platform "${PLATFORM}" --entrypoint bash \
   -e "EXPECT_RC_SHA=${EXPECT_RC_SHA}" \
   -e "EXPECT_FW_SHA=${EXPECT_FW_SHA}" \
   -e "EXPECT_AGENTS_SHA=${EXPECT_AGENTS_SHA}" \
+  -e "EXPECT_HOOKS=${EXPECT_HOOKS}" \
   -e "EXPECT_REVLOOP=${EXPECT_REVLOOP}" \
   "${IMAGE}" -s <<'PROBE'
 set -uo pipefail
@@ -201,6 +221,30 @@ done
 eq "sha256 agents.yaml" "${EXPECT_AGENTS_SHA}" "$(sha256sum /home/alissa/.config/alissa/agents.yaml | cut -d' ' -f1)"
 eq "agents.yaml owner" "alissa:alissa" "$(stat -c '%U:%G' /home/alissa/.config/alissa/agents.yaml 2>/dev/null)"
 
+# --- the Claude Code hooks (issue #138): shipped, this repo's bytes, RUNNABLE ---
+HOOKS_DIR=/usr/local/share/alissa/hooks
+for entry in ${EXPECT_HOOKS}; do
+  f="${entry%%:*}"
+  sha="${entry##*:}"
+  if [ ! -e "${HOOKS_DIR}/${f}" ]; then
+    no "missing: ${HOOKS_DIR}/${f}"
+    continue
+  fi
+  eq "sha256 ${HOOKS_DIR}/${f}" "${sha}" "$(sha256sum "${HOOKS_DIR}/${f}" 2>/dev/null | cut -d' ' -f1)"
+  if [ -x "${HOOKS_DIR}/${f}" ]; then ok "executable: ${HOOKS_DIR}/${f}"
+  else no "not executable: ${HOOKS_DIR}/${f} — claude runs it by path"; fi
+  eq "owner ${HOOKS_DIR}/${f}" "root:root" "$(stat -c '%U:%G' "${HOOKS_DIR}/${f}" 2>/dev/null)"
+done
+# The guard actually decides, in the image's own python: one deny, one pass.
+out="$(printf '{"tool_name":"Bash","cwd":"/workspace/r/REVIEW-TASK-1","tool_input":{"command":"rm -rf build/*"}}' | "${HOOKS_DIR}/guard-shell.py" 2>/dev/null)"
+case "${out}" in
+  *'"permissionDecision": "deny"'*) ok "guard-shell.py denies 'rm -rf build/*' in the image" ;;
+  *) no "guard-shell.py did not deny 'rm -rf build/*' in the image: ${out:-<empty>}" ;;
+esac
+out="$(printf '{"tool_name":"Bash","cwd":"/workspace/r/REVIEW-TASK-1","tool_input":{"command":"rm -rf build/cache"}}' | "${HOOKS_DIR}/guard-shell.py" 2>/dev/null)"
+if [ -z "${out}" ]; then ok "guard-shell.py passes 'rm -rf build/cache' silently in the image"
+else no "guard-shell.py spoke on a literal in-checkout rm: ${out}"; fi
+
 # --- the installed daemon is the pinned one ---
 got="$(python3 -c 'import importlib.metadata as m; print(m.version("alissa-tools-github-revloop"))' 2>/dev/null)"
 eq "installed alissa-tools-github-revloop" "${EXPECT_REVLOOP}" "${got}"
@@ -268,6 +312,23 @@ sys.exit(1 if missing else 0)
 PY
   then ok "$f pre-trusts the derived hub (root + main/) AND the hub already on disk"
   else no "$f does not pre-trust the derived hub root/main (slides.alissa.app) and/or the on-disk hub: $(cat "$f" 2>/dev/null)"
+  fi
+done
+# The same seeding registers the three hooks (issue #138) into BOTH settings
+# files, at the paths the Dockerfile above shipped them to.
+for f in "$T/home/.claude/settings.json" "$T/cc/settings.json"; do
+  if python3 - "$f" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1])).get("hooks", {})
+def cmds(event):
+    return [x["command"] for g in h.get(event, []) for x in g.get("hooks", [])]
+assert "/usr/local/share/alissa/hooks/guard-shell.py" in cmds("PreToolUse"), h
+assert "/usr/local/share/alissa/hooks/note-waiting.py" in cmds("Notification"), h
+assert "/usr/local/share/alissa/hooks/clear-waiting.py" in cmds("UserPromptSubmit"), h
+assert "/usr/local/share/alissa/hooks/clear-waiting.py" in cmds("PostToolUse"), h
+PY
+  then ok "$f registers the guard, the waiting marker and its clearer"
+  else no "$f lacks a hook registration: $(cat "$f" 2>/dev/null)"
   fi
 done
 exit "${rc}"

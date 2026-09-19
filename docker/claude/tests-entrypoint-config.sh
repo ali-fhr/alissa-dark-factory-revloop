@@ -58,6 +58,8 @@ out="$(env -u ALISSA_POLL_INTERVAL -u ALISSA_ROUND_CAP \
         -u ALISSA_CHECKS_WAIT_SECONDS -u ALISSA_CHECKS_SPAWN_WAIT_SECONDS \
         -u ALISSA_REVIEW_TASK_MISS_TTL_POLLS -u ALISSA_TASK_LIST_SELF_SCOPE \
         -u ALISSA_REV_LOOP_EVENTS_ENABLED -u ALISSA_REV_FLEET_VITALS_ENABLED \
+        -u ALISSA_PROMPT_RESPONDER -u ALISSA_PROMPT_QUIET_SECONDS -u ALISSA_PROMPT_KILL_MINUTES \
+        -u ALISSA_PROMPT_MAX_ANSWERS -u ALISSA_WAITING_DIR \
         bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
 assert_key_absent "${out}" poll_interval "poll_interval omitted when ALISSA_POLL_INTERVAL unset"
 assert_key_absent "${out}" round_cap     "round_cap omitted when ALISSA_ROUND_CAP unset"
@@ -79,6 +81,9 @@ assert_key_absent "${out}" loop_events_enabled \
   "loop_events_enabled omitted when ALISSA_REV_LOOP_EVENTS_ENABLED unset"
 assert_key_absent "${out}" fleet_vitals_enabled \
   "fleet_vitals_enabled omitted when ALISSA_REV_FLEET_VITALS_ENABLED unset"
+for k in prompt_responder prompt_quiet_seconds prompt_kill_minutes prompt_max_answers waiting_dir; do
+  assert_key_absent "${out}" "${k}" "${k} omitted when its ALISSA_PROMPT_* / ALISSA_WAITING_DIR variable is unset"
+done
 assert_eq "${out}" '.on_missing_hub' '"add"'    "on_missing_hub always emitted (structural: add)"
 assert_eq "${out}" '.agent_profile'  '"claude"' "agent_profile always emitted (structural: claude)"
 assert_eq "${out}" '.repos'          "${REPOS}" "repos emitted from allowlist"
@@ -352,6 +357,41 @@ if env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VIT
 else
   pass "a non-boolean ALISSA_REV_FLEET_VITALS_ENABLED is refused on a library that knows the key"
 fi
+echo "== prompt responder (issue #138): set -> rendered on a library that knows the keys =="
+PROMPT_VARS=(-u ALISSA_PROMPT_RESPONDER -u ALISSA_PROMPT_QUIET_SECONDS -u ALISSA_PROMPT_KILL_MINUTES -u ALISSA_PROMPT_MAX_ANSWERS -u ALISSA_WAITING_DIR)
+out="$(env "${PROMPT_VARS[@]}" "${BOWS_VARS[@]}" ALISSA_PROMPT_RESPONDER=observe ALISSA_PROMPT_QUIET_SECONDS=120 \
+      ALISSA_PROMPT_KILL_MINUTES=3 ALISSA_PROMPT_MAX_ANSWERS=2 ALISSA_WAITING_DIR=/workspace/.w PYTHONPATH="${SRC_TREE}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/pr.err")"
+assert_eq "${out}" '.prompt_responder'     '"observe"'        "prompt_responder rendered as a string"
+assert_eq "${out}" '.prompt_quiet_seconds' '120'              "prompt_quiet_seconds rendered as a number"
+assert_eq "${out}" '.prompt_kill_minutes'  '3'                "prompt_kill_minutes rendered as a number"
+assert_eq "${out}" '.prompt_max_answers'   '2'                "prompt_max_answers rendered as a number"
+assert_eq "${out}" '.waiting_dir'          '"/workspace/.w"'  "waiting_dir rendered as a string (the hooks' ALISSA_WAITING_DIR)"
+if [ -s "${TMPROOT}/pr.err" ]; then bad "no WARN when the library supports the prompt keys ($(cat "${TMPROOT}/pr.err"))"; else pass "no WARN when the library supports the prompt keys"; fi
+out="$(env "${PROMPT_VARS[@]}" "${BOWS_VARS[@]}" ALISSA_PROMPT_RESPONDER="" ALISSA_PROMPT_QUIET_SECONDS=" " ALISSA_WAITING_DIR="" PYTHONPATH="${SRC_TREE}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+for k in prompt_responder prompt_quiet_seconds waiting_dir; do
+  assert_key_absent "${out}" "${k}" "a blank ${k} variable renders as unset (Dockerfile bakes empty ENV)"
+done
+if env "${PROMPT_VARS[@]}" "${BOWS_VARS[@]}" ALISSA_PROMPT_QUIET_SECONDS=ninety PYTHONPATH="${SRC_TREE}" \
+     bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' >/dev/null 2>&1; then
+  bad "a non-numeric ALISSA_PROMPT_QUIET_SECONDS is refused"
+else
+  pass "a non-numeric ALISSA_PROMPT_QUIET_SECONDS is refused"
+fi
+# The mode's spelling is the LIBRARY's to refuse (Config.build names the
+# three modes); the renderer passes the string through so the boot fails
+# loudly on a typo rather than reading it as `off`.
+out="$(env "${PROMPT_VARS[@]}" "${BOWS_VARS[@]}" ALISSA_PROMPT_RESPONDER=yes PYTHONPATH="${SRC_TREE}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'')"
+assert_eq "${out}" '.prompt_responder' '"yes"' "an unknown prompt_responder spelling is passed through for the library to refuse by name"
+if CONFIG_JSON="${out}" PYTHONPATH="${SRC_TREE}" python3 - <<'PY' 2>/dev/null
+import json, os
+from alissa.tools.github.revloop.config import Config
+Config.build(workspace_root=".", file_data=json.loads(os.environ["CONFIG_JSON"]))
+PY
+then bad "the library accepted prompt_responder=yes"; else pass "the library refuses prompt_responder=yes at load"; fi
+
 # The Dockerfile must carry the ARG (and its pass-through ENV line) -- and this
 # PR must NOT re-pin REVLOOP_VERSION: CI installs the pinned release from PyPI,
 # which cannot yet carry 0.30.0 (a sibling task re-pins once it is published).
@@ -372,6 +412,15 @@ echo "== fleet vitals: skew guard — an old pin drops the key with a WARN namin
 out="$(env -u ALISSA_REV_FLEET_VITALS_ENABLED "${BOWS_VARS[@]}" ALISSA_REV_FLEET_VITALS_ENABLED=1 \
       PYTHONPATH="${STUB_OLD}" bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/fv-skew.err")"
 assert_key_absent "${out}" fleet_vitals_enabled "fleet_vitals_enabled dropped on an old pin"
+out="$(env "${PROMPT_VARS[@]}" "${BOWS_VARS[@]}" ALISSA_PROMPT_RESPONDER=observe ALISSA_WAITING_DIR=/w PYTHONPATH="${STUB_OLD}" \
+      bash -c '. "'"${HERE}"'/revloop-config.sh"; render_revloop_config '"'${REPOS}'"'' 2>"${TMPROOT}/pr-old.err")"
+assert_key_absent "${out}" prompt_responder "prompt_responder dropped on an old pin"
+assert_key_absent "${out}" waiting_dir      "waiting_dir dropped on an old pin"
+if grep -qF "the prompt responder landed in revloop 0.31.3" "${TMPROOT}/pr-old.err"; then
+  pass "the old-pin WARN names the release the prompt responder landed in"
+else
+  bad "the old-pin WARN does not name the responder's release: $(cat "${TMPROOT}/pr-old.err")"
+fi
 if grep -qF "fleet vitals landed in revloop 0.30.0 — re-pin ARG REVLOOP_VERSION" "${TMPROOT}/fv-skew.err" \
    && grep -qF "ALISSA_REV_FLEET_VITALS_ENABLED=1" "${TMPROOT}/fv-skew.err"; then
   pass "the drop is WARNed by variable and re-pin"

@@ -141,7 +141,7 @@ def test_state_read_degrades_on_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(sources_mod, "State", LockedState)
     assert src.snapshots() == []
     assert src.ledgers() == {
-        "escalations": [], "pings": [], "stability_pings": []
+        "escalations": [], "pings": [], "stability_pings": [], "prompt_pages": []
     }
     # the retry mutation degrades to a clean failure, not a 500 -- and says
     # "state unavailable", never "no ledger row" (that is an operator-error
@@ -527,7 +527,7 @@ def test_reads_never_create_the_state_db(tmp_path):
     assert src.state_present() is False
     assert src.snapshots() == []
     assert src.ledgers() == {
-        "escalations": [], "pings": [], "stability_pings": []
+        "escalations": [], "pings": [], "stability_pings": [], "prompt_pages": []
     }
     assert src.spawn_pairs([SESSION]) == {}
     assert not config.state_db.exists()
@@ -1189,3 +1189,53 @@ def test_the_dropped_count_reaches_the_payload(tmp_path):
     assert d["inbox_settled_dropped"] == 54 - sources_mod.INBOX_LIMIT
     # dropped by the per-half cap, NOT by a read bound -- the flag stays False
     assert d["inbox_truncated"] is False
+
+
+# -- the prompt responder's surface (issue #138) ---------------------------
+
+
+def test_waiting_lists_parked_sessions_oldest_first(tmp_path):
+    src = make_sources(tmp_path, runner=_quiet_runner)
+    assert src.waiting() == []
+    with State(src.config.state_db) as st:
+        st.record_prompt_sighting("review-pr-9", "unknown_dialog", "h1",
+                                  repo_slug="acme/widgets", number=9, answered=False)
+        st.record_prompt_sighting(SESSION, "dangerous_rm", "h2",
+                                  repo_slug="acme/widgets", number=16, answered=True)
+        st.record_prompt_sighting("review-pr-2", "permission", "h3",
+                                  repo_slug="acme/widgets", number=2, answered=False)
+        st.clear_prompt_sighting("review-pr-2")  # moved on: not waiting any more
+    rows = src.waiting()
+    assert [r["session"] for r in rows] == ["review-pr-9", SESSION]
+    assert rows[1] == {"session": SESSION, "kind": "dangerous_rm", "since": rows[1]["since"],
+                       "sightings": 1, "answers": 1}
+    assert "waiting" in src.dashboard()
+
+
+def test_prompt_pages_reach_the_inbox_and_prompt_telemetry_does_not(tmp_path):
+    src = make_sources(tmp_path, runner=_quiet_runner)
+    with State(src.config.state_db) as st:
+        st.record_ping("acme/widgets", 16, f"prompt:dangerous_rm:accept@{SESSION}#1")
+        st.record_ping("acme/widgets", 16, f"prompt-page:usage_limit@{SESSION}#3")
+    led = src.ledgers()
+    assert [r["kind"] for r in led["prompt_pages"]] == [f"prompt-page:usage_limit@{SESSION}#3"]
+    for key in ("pings", "stability_pings", "prompt_pages"):
+        assert all(not r["kind"].startswith("prompt:") for r in led[key]), key
+    inbox = src._inbox(led["escalations"], led["pings"], led["stability_pings"],
+                       prompt_pages=led["prompt_pages"])
+    pages = [i for i in inbox["live"] if i["kind"] == "prompt-page"]
+    assert len(pages) == 1
+    assert pages[0]["detail"] == f"usage_limit on {SESSION}"
+    assert pages[0]["url"] == "https://github.com/acme/widgets/pull/16"
+    assert pages[0]["number"] == 16
+
+
+def test_parse_prompt_page_kind():
+    assert sources_mod.parse_prompt_page_kind("prompt-page:login_expired@review-pr-7#12") == (
+        "login_expired", "review-pr-7")
+    assert sources_mod.parse_prompt_page_kind("prompt-page:login_expired@review-pr-7") == (
+        "login_expired", "review-pr-7")
+    assert sources_mod.parse_prompt_page_kind("prompt-page:login_expired") is None
+    assert sources_mod.parse_prompt_page_kind("prompt:login_expired:page@x#1") is None
+    assert sources_mod.parse_prompt_page_kind("stalled:x") is None
+    assert sources_mod.PING_PROMPT_PAGE_PREFIX == "prompt-page:"

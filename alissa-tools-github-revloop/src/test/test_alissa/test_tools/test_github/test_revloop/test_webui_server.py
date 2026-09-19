@@ -560,3 +560,192 @@ def test_default_port_does_not_collide_with_the_devloop_console(tmp_path, monkey
     monkeypatch.setattr(ui_main, "make_server", fake_make_server)
     ui_main.main(["--workspace-root", str(tmp_path)])
     assert seen["port"] == ui_main.DEFAULT_PORT != 8787
+
+
+# -- the prompt responder's console surface (issue #138) --------------------
+
+RM_DIALOG = """
+● Bash(rm -rf sales/shots/*)
+  ⎿  Dangerous rm operation on statically-unresolvable target: /workspace/x/REVIEW-TASK-9/sales/shots/*
+  ⎿  echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+
+│ Do you want to proceed?
+│ ❯ 1. Yes
+│   2. No, and tell Claude what to do differently (esc)
+"""
+LOGIN_BANNER = "\n  Login expired · Please run /login\n\n❯ \n"
+IDLE = "● Done.\n\n╭───────╮\n│ ❯     │\n╰───────╯\n"
+
+
+def tmux_runner(panes, sent):
+    """A `run` that answers raw-tmux argv from `panes` (session -> pane text)
+    and records every send-keys; anything else is the empty string."""
+    def run(argv, **kw):
+        if argv[:1] == ["tmux"] and "capture-pane" in argv:
+            target = argv[argv.index("-t") + 1]
+            name = target[len("=ali-"):-1]
+            if name not in panes:
+                raise CommandError(argv, 1, "can't find pane")
+            return panes[name]
+        if argv[:1] == ["tmux"] and "send-keys" in argv:
+            target = argv[argv.index("-t") + 1]
+            sent.append((target, argv[argv.index(target) + 1:]))
+            return ""
+        return "[]" if argv[:3] == ["alissa", "tmux", "ls"] else ""
+    return run
+
+
+def test_pane_returns_scrubbed_lines_and_the_classification(tmp_path):
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: RM_DIALOG}, []))
+    status, payload = app.pane(SESSION)
+    assert status == 200
+    assert payload["session"] == SESSION
+    assert payload["kind"] == "dangerous_rm"
+    assert len(payload["lines"]) <= 40
+    joined = "\n".join(payload["lines"])
+    assert "ghp_ABCDEFGHIJ" not in joined and "<redacted>" in joined
+    assert "Do you want to proceed?" in joined
+
+
+def test_pane_reaches_any_managed_session_not_only_reviewers(tmp_path):
+    """The console is the operator's lever over the whole container (kill
+    already reaches any managed session); the daemon's own responder is the
+    narrow one."""
+    app = make_app(tmp_path, runner=tmux_runner({"develop-acme-widgets-i7-a1": IDLE}, []))
+    status, payload = app.pane("develop-acme-widgets-i7-a1")
+    assert status == 200 and payload["kind"] is None
+
+
+def test_pane_404s_when_tmux_cannot_find_the_session_and_400s_a_bad_name(tmp_path):
+    app = make_app(tmp_path, runner=tmux_runner({}, []))
+    assert app.pane(SESSION)[0] == 404
+    for bad in ("", None, "has space", "-rf", "a;b", "x/../y"):
+        assert app.pane(bad)[0] == 400
+
+
+def test_answer_maps_verbs_to_the_dialog_on_screen(tmp_path):
+    sent = []
+    audit = []
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: RM_DIALOG}, sent),
+                   audit=lambda a, d: audit.append((a, d)))
+    status, body = app.answer(SESSION, "accept")
+    assert status == 200 and body["ok"] is True and body["kind"] == "dangerous_rm"
+    assert sent[-1] == (f"=ali-{SESSION}:", ["Enter"])
+    status, body = app.answer(SESSION, "decline")
+    assert status == 200 and sent[-1][1] == ["2", "Enter"]
+    status, body = app.answer(SESSION, "escape")
+    assert status == 200 and sent[-1][1] == ["Escape"]
+    assert all(a == "answer" and d["ok"] for a, d in audit)
+    assert audit[0][1]["keys"] == ["Enter"]
+    for _target, keys in sent:
+        assert set(keys) <= {"Enter", "Escape", "1", "2", "3", "Down", "Up"}
+
+
+def test_answer_409s_not_waiting_when_the_pane_is_not_parked(tmp_path):
+    sent = []
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: IDLE}, sent))
+    status, body = app.answer(SESSION, "accept")
+    assert status == 409 and body == {"ok": False, "error": "not_waiting"}
+    assert sent == [], "nothing pressed"
+
+
+def test_answer_409s_not_answerable_for_an_account_notice(tmp_path):
+    sent = []
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: LOGIN_BANNER}, sent))
+    status, body = app.answer(SESSION, "escape")
+    assert status == 409 and body["error"] == "not_answerable" and body["kind"] == "login_expired"
+    assert sent == []
+
+
+def test_answer_refuses_bad_verbs_and_bad_names_without_touching_tmux(tmp_path):
+    sent = []
+    audit = []
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: RM_DIALOG}, sent),
+                   audit=lambda a, d: audit.append((a, d)))
+    assert app.answer(SESSION, "Enter")[0] == 400
+    assert app.answer(SESSION, "y")[0] == 400
+    assert app.answer(SESSION, None)[0] == 400
+    for bad in ("", None, "has space", "-rf", "a;b", "x/../y"):
+        assert app.answer(bad, "accept")[0] == 400
+    assert app.answer("review-widgets-pr16-r2-000000", "accept")[0] == 404
+    assert sent == []
+    assert all(not d["ok"] for _, d in audit), "every refusal is audited"
+
+
+def test_answer_reports_a_refused_send(tmp_path):
+    def run(argv, **kw):
+        if "capture-pane" in argv:
+            return RM_DIALOG
+        raise CommandError(argv, 1, "no server running")
+    app = make_app(tmp_path, runner=run)
+    status, body = app.answer(SESSION, "accept")
+    assert status == 400 and body["ok"] is False and "no server running" in body["error"]
+
+
+@pytest.fixture
+def live_prompt(tmp_path):
+    """A live server whose tmux has one reviewer session parked on the rm
+    dialog, a `prompt:` telemetry row and a `prompt-page:` page in the ledger."""
+    config = Config.build(tmp_path, {"repos": ["acme/widgets"]}, {})
+    with State(config.state_db) as st:
+        st.record_prompt_sighting(
+            SESSION, "dangerous_rm", "h", repo_slug="acme/widgets", number=16, answered=False,
+        )
+        st.record_ping("acme/widgets", 16, f"prompt:dangerous_rm:wait@{SESSION}#1")
+        st.record_ping("acme/widgets", 16, f"prompt-page:login_expired@{SESSION}#2")
+    sent = []
+    runner = tmux_runner({SESSION: RM_DIALOG}, sent)
+    src = Sources(config=config, running_version="0.14.0",
+                  run=runner, http_get=lambda u, t: None, wall_clock=lambda: 5000.0)
+    app = App(auth=Auth("letmein", boot_nonce="fixed"), sources=src,
+              version="0.14.0", run=runner, audit=lambda a, d: None)
+    server = make_server(app, "127.0.0.1", 0)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}", sent
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+def test_pane_and_answer_over_http_are_gated_like_state_and_kill(live_prompt):
+    base, sent = live_prompt
+    q = f"/api/pane?session={SESSION}"
+    assert _req(base, q)[0] == 401, "pane needs the session cookie"
+    _, cookie = _login(base)
+    status, body, _ = _req(base, "/", headers={"Cookie": cookie})
+    csrf = re.search(rb'csrf-token" content="([0-9a-f]+)"', body).group(1).decode()
+
+    status, body, _ = _req(base, q, headers={"Cookie": cookie})
+    assert status == 200
+    pane = json.loads(body)
+    assert pane["kind"] == "dangerous_rm" and "<redacted>" in "\n".join(pane["lines"])
+    assert _req(base, "/api/pane", headers={"Cookie": cookie})[0] == 400
+
+    payload = json.dumps({"session": SESSION, "verb": "decline"}).encode()
+    # no CSRF -> 403 even with a session; no session -> 401
+    assert _req(base, "/action/answer", "POST", payload,
+                {"Cookie": cookie, "Content-Type": "application/json"})[0] == 403
+    assert _req(base, "/action/answer", "POST", payload,
+                {"Content-Type": "application/json"})[0] == 401
+    assert sent == []
+    status, body, _ = _req(base, "/action/answer", "POST", payload,
+                           {"Cookie": cookie, "X-CSRF-Token": csrf,
+                            "Content-Type": "application/json"})
+    assert status == 200 and json.loads(body)["keys"] == ["2", "Enter"]
+    assert sent == [(f"=ali-{SESSION}:", ["2", "Enter"])]
+
+    # the state payload lists the waiting session, keeps `prompt:` telemetry
+    # out of the inbox and keeps the `prompt-page:` page in it, linked
+    status, body, _ = _req(base, "/api/state", headers={"Cookie": cookie})
+    state = json.loads(body)
+    assert state["waiting"] == [{
+        "session": SESSION, "kind": "dangerous_rm",
+        "since": state["waiting"][0]["since"], "sightings": 1, "answers": 0,
+    }]
+    kinds = [row["kind"] for row in state["inbox"]]
+    assert "prompt-page" in kinds and not any(k.startswith("prompt:") for k in kinds), kinds
+    page = [row for row in state["inbox"] if row["kind"] == "prompt-page"][0]
+    assert page["url"] == "https://github.com/acme/widgets/pull/16"
+    assert page["detail"] == f"login_expired on {SESSION}"

@@ -110,7 +110,19 @@ RUN pip install "alissa-tools-github-revloop==${REVLOOP_VERSION}"
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY revloop-config.sh /usr/local/bin/revloop-config.sh
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/revloop-config.sh /usr/local/bin/init-firewall.sh
+# The Claude Code hooks (issue #138, devloop #125's port): the PreToolUse rm
+# guard, the Notification "waiting for input" marker and its clearer.
+# Root-owned and RUN (executable, stdlib python), registered into claude's
+# settings.json by the entrypoint's 3a merge — never by this file, so an
+# operator's own hooks are merged with, not replaced, and ALISSA_SHELL_GUARD=off
+# can unregister the guard at boot.
+COPY hooks/guard-shell.py   /usr/local/share/alissa/hooks/guard-shell.py
+COPY hooks/note-waiting.py  /usr/local/share/alissa/hooks/note-waiting.py
+COPY hooks/clear-waiting.py /usr/local/share/alissa/hooks/clear-waiting.py
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/revloop-config.sh /usr/local/bin/init-firewall.sh \
+        /usr/local/share/alissa/hooks/guard-shell.py \
+        /usr/local/share/alissa/hooks/note-waiting.py \
+        /usr/local/share/alissa/hooks/clear-waiting.py
 
 # Agent profile the worker uses to launch reviewers non-interactively. Without
 # this, worker-spawned claude sessions stop on the first-run trust/permission

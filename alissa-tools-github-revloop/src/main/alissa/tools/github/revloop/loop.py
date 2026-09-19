@@ -10,6 +10,8 @@ Alissa review task.
 
 from __future__ import annotations
 
+import calendar
+import json
 import logging
 import re
 import secrets
@@ -20,8 +22,11 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
+from . import prompts as prompts_mod
 from .alissa import (
+    MANAGED_PREFIX,
     READINESS_AUTO,
     READINESS_MISSING,
     READINESS_OPERATOR,
@@ -42,15 +47,19 @@ from .alissa_client import AlissaClient
 from .bows import EMPTY_SET_WARNING, FEED_PREFIX, BowRepoSource
 from .trust import (
     FIRST_RUN_DIALOG_MARKERS,
+    REVIEW_CHECKOUT_PREFIX,
     WEDGE_FIRST_RUN_DIALOG,
     hub_root as hub_root_of,
     hub_trust_paths,
     pane_shows_first_run_dialog,
+    review_checkout_name,
     seed_trust,
     write_derived_repos,
 )
 from .config import (
     HUB_ADD,
+    PROMPT_OBSERVE,
+    PROMPT_OFF,
     REPOS_BOWS,
     ON_MISSING_SKIP,
     STALE_ROUND_SECONDS,
@@ -957,12 +966,41 @@ def directive_data(items: list[str]) -> str:
     return f"{DATA_OPEN} {text} {DATA_CLOSE}"
 
 
+# The shell rule (issue #138; devloop #125's `_SHELL_RULE`, word for word).
+# Reviewers run unattended under `--dangerously-skip-permissions`, and Claude
+# Code's critical-path removal check STILL prompts on an rm whose target it
+# cannot resolve statically (a glob, a variable, a path outside the cwd) -- the
+# dialog that wedged PR #808 round 10 in the sentinel's corpus. The container's
+# PreToolUse guard refuses those shapes with a reason; this rule tells the
+# reviewer up front so it never writes them, and never retries one the guard
+# refused. In BOTH round directives, because both run the same shell.
+_SHELL_RULE = (
+    "You are unattended: nothing can answer an interactive prompt. Never run "
+    "rm/rmdir on a glob, a shell variable or a path outside your worktree — "
+    "use literal paths, `find <dir> -mindepth 1 -delete` or `git clean -fdx "
+    "-- <path>`; never start an interactive command (editors, pagers, `git "
+    "rebase -i`, `npm init`, anything that asks y/n — pass the "
+    "non-interactive flag). If a command is refused by the shell guard, "
+    "change the command; do not retry it. "
+)
+
+# The reviewer's own line beside it (issue #138): the seat is read-only (CR6),
+# so the "worktree" the shell rule names is the throwaway REVIEW-<task>
+# checkout the review skill lets a reviewer make, and nothing a reviewer
+# writes there needs deleting -- the workspace prune reclaims it.
+_REVIEWER_RULE = (
+    "You never push and never delete: a reviewer that needs scratch files "
+    "writes them under its own checkout and leaves them. "
+)
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
     "hydrate the task and the PR it names, review per the rubric, post "
     "severity-tagged comments via gh pr review, record the verdict evidence, "
     "move the task to pending_validation. "
+    + _SHELL_RULE
+    + _REVIEWER_RULE
     + _RECORD_THE_CAP
     + _MERGE_READINESS_LINE
     + "{credential}"
@@ -982,6 +1020,8 @@ ROUND_K_DIRECTIVE = (
     "including its round-k section: verify the triage of every prior finding, "
     "verify the fixes, sweep the new diff with the full rubric, record a "
     "round-{round} verdict envelope, move the task to pending_validation. "
+    + _SHELL_RULE
+    + _REVIEWER_RULE
     + _RECORD_THE_CAP
     + _MERGE_READINESS_LINE
     + "{credential}"
@@ -1198,8 +1238,98 @@ STALLED_COMMENT = (
     "work it, both submit. Is that session actually making progress? Operator "
     "options: inspect it (`alissa tmux ls`) and, if it is wedged, kill it "
     "(`alissa tmux kill {session}`) so the respawn proceeds next poll, or "
-    "finish the round by hand."
+    "finish the round by hand. The prompt responder read its pane just now "
+    "and classified it: `{classified}`."
 )
+
+# The operator page for an account-level prompt kind (issue #138; devloop
+# #127's page, the reviewer's words): an expired login, a hit usage limit, an
+# empty credit balance. No keystroke answers these, so the page is the act --
+# one per kind per `prompts.PAGE_WINDOW_SECONDS`, on the PR of the first
+# session that showed it -- and NEW review spawns are held while the condition
+# stands.
+PROMPT_PAGE_COMMENT = (
+    "**Reviewer account needs an operator** — session `{session}` is parked on "
+    "`{kind}` (`{signature}`). No keystroke answers this, so the daemon is "
+    "not answering it, and it is HOLDING new reviewer spawns until the "
+    "condition clears (live sessions keep running; the rounds they owe are "
+    "not consumed). Operator options: `login_expired` → re-run the claude "
+    "login on the reviewer container; `usage_limit` → wait for the reset or "
+    "raise the plan; `out_of_credits` → top up. The hold lifts on the first "
+    "poll that no longer sees the notice and in any case after {hold_minutes} "
+    "min on the same pane: the session is then killed and the stale-round "
+    "re-entry re-confirms — a fresh pane showing the banner re-arms the hold, "
+    "a working one proves the account is back. One page per kind per {hours} h."
+)
+
+# The prompt responder's ping-ledger families (issue #138). `prompt:` rows are
+# the loop-event record of every finding and action -- `escalation.prompt`
+# with the kind, the action and the session on the event (see
+# loop_events.PROMPT_PREFIX) -- and are NOT operator pages: the console keeps
+# them out of the inbox (its ping reads narrow by prefix in SQL), the
+# `waiting` list is where they show. `prompt-page:` rows ARE pages, one per
+# account-level kind per `prompts.PAGE_WINDOW_SECONDS`, anchored on the PR of
+# the session that showed the notice so the inbox row links somewhere. Both
+# live in `pings` -- the free-form (repo, number, kind) ledger -- because this
+# seat's `escalations` table is keyed per head for the cap-out alone.
+ESCALATION_PROMPT = "prompt"
+ESCALATION_PROMPT_PAGE = "prompt-page"
+
+# How long the responder waits after pressing a dialog's keys before it
+# re-captures the pane to see whether the dialog went away. Claude Code
+# redraws within a second; three is devloop's figure and leaves room for a
+# slow container.
+PROMPT_SETTLE_SECONDS = 3.0
+
+
+def prompt_event_kind(kind: str, verb: str, session: str, seq: int) -> str:
+    """The ping kind of ONE responder act: `prompt:<kind>:<verb>@<session>#<seq>`.
+    The session name carries the round (so the event can be anchored on the
+    PR) and `seq` makes every act its own row."""
+    return f"{ESCALATION_PROMPT}:{kind}:{verb}@{session}#{seq}"
+
+
+def prompt_page_kind(kind: str, session: str, bucket: int) -> str:
+    """The ping kind of ONE account-level page:
+    `prompt-page:<kind>@<session>#<bucket>`; `bucket` is the six-hour window
+    the page fell in (see `_page_prompt`)."""
+    return f"{ESCALATION_PROMPT_PAGE}:{kind}@{session}#{bucket}"
+
+
+def review_checkout_of(path: "str | None", hub: "str | None") -> "str | None":
+    """The `<hub>/REVIEW-*` checkout `path` lies in (or is), or None.
+
+    THE SEAT DIFFERENCE (issue #138): devloop measures a dangerous-rm target
+    against the developer's `<hub>/TASK-*` worktree; this seat's own
+    worktree is the throwaway review checkout the alissa-code-review skill
+    lets a reviewer make beside `main/`. The places a session names it are
+    its waiting marker's `cwd` (the hook runs with Claude Code's tracked
+    cwd, which follows the reviewer into the checkout), the spawn row's task
+    ref (`review_checkout_name`) and its pane's current path. All resolve
+    through this one rule: a direct `REVIEW-` child of the hub, never
+    `main/`, never the hub itself."""
+    if not path or not hub:
+        return None
+    hub_n = str(Path(hub)).rstrip("/")
+    path_n = str(Path(path))
+    if not path_n.startswith(hub_n + "/"):
+        return None
+    first = path_n[len(hub_n) + 1:].split("/", 1)[0]
+    if not first.startswith(REVIEW_CHECKOUT_PREFIX):
+        return None
+    return f"{hub_n}/{first}"
+
+
+def marker_file_name(tmux_session: str) -> str:
+    """The waiting marker's file name for a tmux session, spelled exactly
+    as `docker/claude/hooks/note-waiting.py` spells it (`safe_name`): the
+    name with anything outside `[A-Za-z0-9-_.]` mapped to `_`, dots
+    stripped from both ends, plus `.json`."""
+    safe = "".join(
+        c if c.isalnum() or c in "-_." else "_" for c in tmux_session
+    ).strip(".") or "unknown-session"
+    return safe + ".json"
+
 
 # The hidden marker that identifies THE activity comment on a PR. Find-or-create
 # keys on it (plus own authorship -- anyone can paste the marker into their own
@@ -1577,6 +1707,57 @@ class Decision:
     # summary line must not claim a full container for a round that is waiting
     # on a test suite.
     checks_held: bool = False
+    # `prompt_held` marks a QUEUED that is waiting on the prompt responder's
+    # account-level HOLD (issue #138): an expired login, a hit usage limit or
+    # an empty credit balance is on a reviewer's screen, so a new spawn would
+    # only burn a round against a dead account. Same column as the slot
+    # gate, its own stage, and excluded from the gate's capacity summary
+    # exactly as `checks_held` is -- the operator's remedy is the account,
+    # not a session slot.
+    prompt_held: bool = False
+
+
+@dataclass(frozen=True)
+class PromptSweep:
+    """What ONE prompt-responder pass found and did (issue #138): the
+    sessions parked on a prompt (`{session, kind, since, action}`), the
+    spawn hold an account-level notice raised (its reason, or None), and
+    the keystroke answers sent."""
+
+    waiting: "tuple[dict, ...]" = ()
+    hold: "str | None" = None
+    answered: int = 0
+
+
+@dataclass(frozen=True)
+class PromptAnchor:
+    """The PR a parked reviewer session is about, as far as the daemon can
+    tell (issue #138): the `owner/repo` full name and PR number the
+    narration and the ledger rows anchor on, the round and task ref when a
+    spawn row names them, and the PR's effective cap for the activity line.
+    Resolved from the spawn ledger first (exact), else from the session
+    NAME against the allowlist -- the sweep's own `_probe_cache` when it has
+    already answered, or a repo component that names exactly one watched
+    repo. None when neither says: the policy still runs on the pane, the
+    narration stays in the log."""
+
+    repo: str
+    number: int
+    round: "int | None"
+    task_ref: "str | None"
+    cap: int
+
+    @property
+    def owner(self) -> str:
+        return self.repo.partition("/")[0]
+
+    @property
+    def name(self) -> str:
+        return self.repo.partition("/")[2]
+
+    @property
+    def slug(self) -> str:
+        return f"{self.repo}#{self.number}"
 
 
 @dataclass(frozen=True)
@@ -1864,6 +2045,23 @@ class ReviewWatcher:
         # "presumed dead" line would, and the issue's contract is ONE.
         # Consumed by the respawn that follows in the same evaluate().
         self._dialog_wedge_cleared: "tuple[str, int, int] | None" = None
+        # -- the prompt responder (issue #138) --------------------------------
+        # The spawn HOLD this pass's responder raised (an account-level
+        # notice's reason), read by `_gate_spawn`; None when nothing holds.
+        # Per pass: set right after the sweep, before any PR is evaluated.
+        self._prompt_hold: "str | None" = None
+        # What the responder found and did this pass, for the summary line.
+        self._prompt_sweep = PromptSweep()
+        # The settle wait between pressing a dialog's keys and re-capturing
+        # the pane; injectable so a test never sleeps.
+        self._sleep: "Callable[[float], None]" = time.sleep
+        # The responder's per-session ladder under DRY-RUN, process-lifetime
+        # and in memory: the durable `prompt_sightings` table is production's
+        # clock (the sightings count is what turns a wait into an Escape and
+        # an Escape into a kill), and a `--once --dry-run` pass over the
+        # default state path must never advance it -- the same split
+        # `_dry_run_drift` draws for the drift and dialog-wedge gates.
+        self._dry_run_sightings: dict[str, dict] = {}
         # (repo full name, PR number) -> when the reviewer login was most
         # recently asked to review that PR, per the issue timeline (an ISO
         # stamp, or None for never) -- the round-admission gate's one GitHub
@@ -2515,6 +2713,24 @@ class ReviewWatcher:
         the census): the census is read once per pass, so without that a single
         pass would hand the same free slot to every PR in the wave.
         """
+        # The prompt responder's HOLD (issue #138), first: while an
+        # account-level notice (an expired login, a hit limit, no credits) is
+        # on a reviewer's screen, a new session would only burn a round
+        # against a dead account, so every spawn is refused and the deferral
+        # names the notice. Live sessions are untouched, and a held round
+        # costs nothing -- no spawn row, no round number, no attempt, no
+        # queue seat (the FIFO order is about slots, which is not what is
+        # scarce here). The hold lifts by itself on the first pass that no
+        # longer sees the notice, and in any case within
+        # `prompts.ACCOUNT_HOLD_SECONDS` of one pane (see prompts.decide).
+        if self._prompt_hold:
+            return Decision(
+                Action.QUEUED,
+                f"round {round_} deferred — spawns held by the prompt "
+                f"responder — {self._prompt_hold}",
+                round_,
+                prompt_held=True,
+            )
         limit = self.config.max_concurrent_sessions
         live = self._live_session_count()
         key = (pr.full_name, pr.number)
@@ -3264,10 +3480,13 @@ class ReviewWatcher:
         # live" for rounds that are waiting on a test suite, and -- worse -- feed
         # the stall escalation, which pages when nothing spawns for half an hour.
         # A fleet whose CI is slow would then page as a review outage.
+        # The responder's account hold is excluded for the same reason: the
+        # remedy is the account, not a freed slot, and the hold has its own
+        # WARNING every pass it stands (see poll_once).
         held = [
             (slug, d)
             for slug, d in results
-            if d.action is Action.QUEUED and not d.checks_held
+            if d.action is Action.QUEUED and not d.checks_held and not d.prompt_held
         ]
         if not held:
             self._gate_stall.clear()
@@ -5366,6 +5585,499 @@ class ReviewWatcher:
                 self.state.record_ping(pr.full_name, pr.number, activity_kind)
         return True
 
+    # -- the prompt responder (issue #138) ------------------------------------
+
+    def _respond_to_prompts(
+        self, sessions: "list[ManagedSession] | None"
+    ) -> "PromptSweep":
+        """Answer every reviewer session parked on a dialog, once per pass.
+
+        `sessions` is the sweep's POST-REAP roster: every ALIVE session whose
+        name parses as one of this daemon's own (`parse_session_name` -- the
+        daemon's spawns AND the review skill's hand-driven `review-pr-<n>`
+        rounds, which are the same loop; a foreign session is never listed,
+        let alone captured or answered -- the operator's console is scoped
+        wider, see `webui.server.App.pane`), minus the sessions it just
+        killed. None -- the listing failed -- reads nothing. For each: a
+        waiting marker from the container's hook (`<waiting_dir>/<tmux
+        session>.json`) OR a session quiet past `prompt_quiet_seconds`
+        triggers `capture_pane` -> `prompts.classify` -> `prompts.decide` ->
+        act. A session that neither trigger names is not read at all -- its
+        pane is another agent's screen, and reading it costs a tmux call per
+        session per pass.
+
+        The act is the policy's verb: keys through `send_keys` (the allowlist
+        is enforced there), a kill through the daemon's own `kill_session`
+        (plus aging the round's spawn row so the stale-round edge re-enters
+        it NEXT pass -- the same round, no verdict, so the cap is untouched),
+        a page through the ping ledger, or nothing (`wait`). Every keystroke
+        answer is re-captured after PROMPT_SETTLE_SECONDS: a pane that did
+        not change counts as unanswered (the sighting row keeps the ladder
+        running and the answer counts toward the cap either way). `observe`
+        classifies, narrates and records the sighting but sends no key,
+        kills nothing, pages nobody and holds no spawn; `off` returns before
+        any capture; dry-run classifies and logs but every side effect is
+        withheld by the seam it would go through (`send_keys` and
+        `_append_activity_on` gate themselves, the kill, the page, the ping
+        rows and the durable ladder are gated here).
+
+        Every finding and action is ONE activity line on the session's PR
+        and one `prompt:` ping row the loop-events emitter turns into
+        `escalation.prompt` -- never pane text beyond the matched signature
+        line, scrubbed. The 3-line excerpt goes to DEBUG only.
+
+        Returns what the pass records: the parked sessions, the spawn hold
+        an account-level notice raised, and how many answers were sent."""
+        mode = self.config.prompt_responder
+        if mode == PROMPT_OFF or sessions is None:
+            return PromptSweep()
+        live: "set[str]" = set()
+        waiting: "list[dict]" = []
+        hold: "str | None" = None
+        answered = 0
+        for ses in sessions:
+            live.add(ses.name)
+            marker = self._waiting_marker(ses.tmux_name)
+            quiet = ses.quiet_for
+            if marker is None and (
+                quiet is None or quiet < self.config.prompt_quiet_floor
+            ):
+                # Nothing says this session is waiting: not read. A ladder
+                # left over from an earlier episode is reset -- the session
+                # provably moved on -- so the console's waiting list tells
+                # the truth.
+                self._sighting_clear(ses.name)
+                continue
+            pane = self.alissa.capture_pane(ses.name, prompts_mod.PANE_LINES)
+            finding = prompts_mod.classify(pane)
+            if finding is None:
+                log.debug(
+                    "prompt responder: %s is %s (%s) — pane reads %s, nothing to answer",
+                    ses.name,
+                    "marked waiting" if marker is not None else "quiet",
+                    "unknown quiet time" if quiet is None else f"quiet {int(quiet)} s",
+                    "unreadable" if not pane else "working/idle",
+                )
+                self._sighting_clear(ses.name)
+                continue
+            outcome = self._answer_prompt(ses, marker, finding, mode)
+            waiting.append(outcome["waiting"])
+            answered += outcome["answered"]
+            if outcome["hold"] and hold is None:
+                hold = outcome["hold"]
+        self._sighting_prune(live)
+        return PromptSweep(waiting=tuple(waiting), hold=hold, answered=answered)
+
+    def _answer_prompt(
+        self,
+        ses: ManagedSession,
+        marker: "dict | None",
+        finding: "prompts_mod.PromptFinding",
+        mode: str,
+    ) -> "dict":
+        """One parked session: run the policy on the finding, act, record,
+        narrate. Returns `{waiting, answered, hold}` for the sweep."""
+        name = ses.name
+        now = time.time()
+        anchor = self._prompt_anchor(ses)
+        hub = (
+            str(hub_root_of(self.config.hub_for(anchor.owner, anchor.name)))
+            if anchor is not None else None
+        )
+        checkout = self._review_checkout(hub, marker, anchor, name)
+        row = self._sighting_get(name) or {}
+        same = bool(row) and (
+            row["kind"] == finding.kind and row["pane_hash"] == finding.pane_hash
+        )
+        sightings = (int(row["sightings"]) + 1) if same else 1
+        answers = int(row["answers"]) if row else 0
+        waiting_for = max(0.0, now - int(row["first_seen"])) if same else 0.0
+        ctx = prompts_mod.SessionContext(
+            session=name,
+            hub=hub,
+            worktree=checkout,
+            sightings=sightings,
+            answers=answers,
+            waiting_for=waiting_for,
+            max_answers=self.config.prompt_answer_cap,
+            kill_after=float(self.config.prompt_kill_seconds),
+        )
+        action = prompts_mod.decide(finding, ctx)
+        live_mode = mode != PROMPT_OBSERVE
+        log.debug(
+            "prompt responder: %s pane excerpt (scrubbed):\n%s",
+            name, "\n".join(finding.excerpt),
+        )
+        target_rel = prompts_mod.relative_to_hub(
+            prompts_mod.normalise_target(finding.target or "", checkout)
+            if finding.kind == prompts_mod.KIND_DANGEROUS_RM else finding.target,
+            hub,
+        )
+        log.info(
+            "prompt responder: %s is parked on %s (%s)%s — %s%s: %s",
+            name, finding.kind,
+            "marker" if marker is not None else "quiet",
+            f" target {target_rel}" if target_rel else "",
+            action.verb,
+            "" if live_mode else " [observe: not sent]",
+            action.reason,
+        )
+
+        slug = anchor.repo if anchor is not None else "?"
+        number = anchor.number if anchor is not None else 0
+        sent = False
+        changed: "bool | None" = None
+        killed = False
+        paged = False
+        hold: "str | None" = None
+        if action.page:
+            if live_mode:
+                hold = f"{finding.kind} on {name} ({finding.signature[:80]})"
+                paged = self._page_prompt(finding, name, anchor)
+            self._sighting_record(name, finding, slug, number, answered=False)
+        elif action.verb == prompts_mod.VERB_WAIT:
+            self._sighting_record(name, finding, slug, number, answered=False)
+        elif action.verb == prompts_mod.VERB_KILL:
+            if live_mode and self.config.dry_run:
+                log.info("[dry-run] would kill %s (%s)", name, action.reason)
+            elif live_mode:
+                killed = self._kill_parked(name, anchor, now)
+            self._sighting_record(name, finding, slug, number, answered=False)
+        else:
+            if live_mode:
+                sent = self.alissa.send_keys(
+                    name, *action.keys, dry_run=self.config.dry_run
+                )
+                if sent:
+                    self._sleep(PROMPT_SETTLE_SECONDS)
+                    after = self.alissa.capture_pane(name, prompts_mod.PANE_LINES)
+                    changed = (
+                        prompts_mod.pane_hash(after) != finding.pane_hash
+                        if after else None
+                    )
+            self._sighting_record(name, finding, slug, number, answered=sent)
+            if changed:
+                self._sighting_clear(name)
+
+        # Narration: one line per ACT. A wait narrates on its first sighting
+        # only (the ladder's later rungs are acts of their own); a page
+        # narrates when it was actually posted; observe mode narrates each
+        # NEW episode, not each pass the same pane is seen.
+        narrate = (
+            (action.page and paged)
+            or (action.verb == prompts_mod.VERB_WAIT and sightings == 1)
+            or (
+                action.verb in (
+                    prompts_mod.VERB_ACCEPT, prompts_mod.VERB_DECLINE,
+                    prompts_mod.VERB_ESCAPE, prompts_mod.VERB_KILL,
+                )
+                and (live_mode or not same)
+            )
+        )
+        if narrate and anchor is not None:
+            since = int(waiting_for) if same else (
+                self._marker_age(marker, now) if marker else 0
+            )
+            prefix = (
+                "prompt-paged" if action.page
+                else "prompt-killed" if action.verb == prompts_mod.VERB_KILL
+                else "prompt-seen" if action.verb == prompts_mod.VERB_WAIT
+                else "prompt-answered"
+            )
+            tail = ""
+            if not live_mode:
+                tail = " · observe mode, nothing sent"
+            elif sent and changed is False:
+                tail = " · unanswered (pane unchanged)"
+            elif action.verb == prompts_mod.VERB_KILL and killed:
+                tail = " · killed; the stale-round edge re-enters the same round next poll"
+            elif action.sends_keys and not sent and not self.config.dry_run:
+                tail = " · keys not sent (tmux refused)"
+            line = self._activity_line(
+                name, anchor.round,
+                f"{prefix}: {finding.kind} → {action.verb} ({action.reason})"
+                f"{f' · target {target_rel}' if target_rel else ''}"
+                f" · {since} s after it appeared{tail}",
+                anchor.cap,
+            )
+            self._append_activity_on(
+                anchor.owner, anchor.name, anchor.number, anchor.slug, line
+            )
+            if not self.config.dry_run:
+                self.state.record_ping(
+                    anchor.repo, anchor.number,
+                    prompt_event_kind(finding.kind, action.verb, name, int(now)),
+                )
+        elif narrate:
+            log.warning(
+                "prompt responder: %s names no PR this daemon can resolve (no "
+                "spawn row, and the name resolves to no single watched repo) — "
+                "%s → %s recorded in the log only", name, finding.kind, action.verb,
+            )
+        return {
+            "waiting": {
+                "session": name, "kind": finding.kind,
+                "since": int(row["first_seen"]) if same else int(now),
+                "action": action.verb,
+            },
+            "answered": 1 if sent else 0,
+            "hold": hold,
+        }
+
+    def _kill_parked(
+        self, name: str, anchor: "PromptAnchor | None", now: float
+    ) -> bool:
+        """The responder's kill: the session's own `alissa tmux kill`, then
+        -- when a spawn row names its round -- that row aged past the stale
+        window, so the NEXT pass's stale-round probe reads the session gone
+        and re-enqueues THE SAME ROUND (`reenqueued`, the `stale_reenqueued`
+        bucket). The round cap counts verdicts (`completed`), and a killed
+        session submitted none, so the re-entry consumes no round -- the
+        pin the issue asks for. Aging is the console's own retry-now lever
+        (`State.age_out_spawn`), not a new path; without it the re-entry
+        would wait out the full 90-minute window. A kill that fails keeps
+        the ladder and is retried next poll."""
+        try:
+            self.alissa.kill_session(name)
+        except CommandError as exc:
+            log.warning(
+                "prompt responder: could not kill %s (%s) — kills are "
+                "best-effort; retried next poll", name, exc,
+            )
+            return False
+        if anchor is not None and anchor.round is not None:
+            aged = self.state.age_out_spawn(
+                anchor.repo, anchor.number, anchor.round,
+                int(now - STALE_ROUND_SECONDS - 60),
+            )
+            log.info(
+                "prompt responder: killed %s (%s round %d); %s",
+                name, anchor.slug, anchor.round,
+                "its spawn row is aged so the stale-round probe re-enters the "
+                "same round next poll" if aged else
+                "no spawn row to age — the stale-round probe re-enters it "
+                "when the round goes stale",
+            )
+        return True
+
+    def _page_prompt(
+        self,
+        finding: "prompts_mod.PromptFinding",
+        name: str,
+        anchor: "PromptAnchor | None",
+    ) -> bool:
+        """Page the operator about an account-level notice ONCE per kind per
+        `prompts.PAGE_WINDOW_SECONDS`, on the PR of the session that showed
+        it. True when THIS call posted the page.
+
+        The dedupe reads the ping ledger by kind PREFIX and age, not by exact
+        key: the row carries the session (so the loop event can anchor it)
+        and the six-hour bucket, and a second session showing the same
+        notice inside the window must not page again -- the account is one
+        account. Dry-run logs the page and records nothing, so a live pass
+        after it pages. The comment is posted before the row is written, the
+        ledger's usual order (a page that failed retries next poll)."""
+        window = prompts_mod.PAGE_WINDOW_SECONDS
+        now = time.time()
+        prefix = f"{ESCALATION_PROMPT_PAGE}:{finding.kind}@"
+        if self.state.ping_seen_since(prefix, int(now - window)):
+            log.debug(
+                "prompt responder: %s on %s already paged inside the %d h window",
+                finding.kind, name, window // 3600,
+            )
+            return False
+        body = PROMPT_PAGE_COMMENT.format(
+            session=name, kind=finding.kind,
+            signature=finding.signature[:160], hours=window // 3600,
+            hold_minutes=prompts_mod.ACCOUNT_HOLD_SECONDS // 60,
+        )
+        log.error(
+            "REVIEWER ACCOUNT NEEDS AN OPERATOR: %s is parked on %s (%s) — no "
+            "keystroke answers this; paging once per kind per %d h and "
+            "holding new spawns", name, finding.kind,
+            finding.signature[:120], window // 3600,
+        )
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] would page on %s:\n%s",
+                anchor.slug if anchor is not None else name, body,
+            )
+            return False
+        if anchor is None:
+            # No PR to page on: the ERROR line above is the page, and the
+            # hold still stands. Nothing to dedupe against, so the line
+            # repeats each pass the notice does -- a dead account with no
+            # anchored session is loud on purpose.
+            return False
+        try:
+            self.github.comment(anchor.owner, anchor.name, anchor.number, body)
+        except Exception as exc:
+            log.error(
+                "could not post the prompt page on %s: %s — the page retries "
+                "next poll", anchor.slug, exc,
+            )
+            return False
+        self.state.record_ping(
+            anchor.repo, anchor.number,
+            prompt_page_kind(finding.kind, name, int(now // window)),
+        )
+        return True
+
+    def _prompt_anchor(self, ses: ManagedSession) -> "PromptAnchor | None":
+        """The PR a parked session is about -- see PromptAnchor."""
+        row = self.state.find_spawn_by_session(ses.name)
+        if row is not None:
+            repo, number = str(row["repo"]), int(row["number"])
+            return PromptAnchor(
+                repo=repo, number=number, round=int(row["round"]),
+                task_ref=str(row["task_ref"] or "") or None,
+                cap=self.config.round_cap + self.state.granted_rounds(repo, number),
+            )
+        ref = ses.ref
+        if ref is None:
+            return None
+        target = self._probe_cache.get(ses.name)
+        if target is None:
+            if ref.repo is not None:
+                hits = [
+                    full for full in self.config.repos
+                    if session_repo_slug(full.partition("/")[2]) == ref.repo
+                ]
+                if len(hits) == 1:
+                    target = (hits[0], ref.number)
+        if target is None:
+            return None
+        repo, number = target
+        return PromptAnchor(
+            repo=repo, number=number, round=ref.round, task_ref=None,
+            cap=self.config.round_cap + self.state.granted_rounds(repo, number),
+        )
+
+    def _waiting_marker(self, tmux_name: str) -> "dict | None":
+        """The container hook's waiting marker for this tmux session, or None
+        when there is none. A marker that exists but cannot be parsed still
+        counts as present (an empty dict): its existence is the signal, its
+        fields are conveniences (`cwd` for the checkout, `at` for the age)."""
+        path = Path(self.config.waiting_dir) / marker_file_name(tmux_name)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            log.debug("could not read waiting marker %s (%s)", path, exc)
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _marker_age(marker: "dict | None", now: float) -> int:
+        """Seconds since the marker's `at` (ISO-8601 UTC), or 0."""
+        if not marker:
+            return 0
+        raw = marker.get("at")
+        if not isinstance(raw, str) or not raw:
+            return 0
+        try:
+            stamp = calendar.timegm(time.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            return 0
+        return max(0, int(now - stamp))
+
+    def _review_checkout(
+        self,
+        hub: "str | None",
+        marker: "dict | None",
+        anchor: "PromptAnchor | None",
+        name: str,
+    ) -> "str | None":
+        """The `<hub>/REVIEW-*` checkout this session works in, or None.
+
+        Three legs, cheapest first: the marker's `cwd` (Claude Code's
+        tracked cwd at the moment the hook fired, which follows the reviewer
+        into the checkout it created), the spawn row's task ref (the review
+        skill names the checkout `REVIEW-<task ref>` -- deterministic, this
+        seat's one advantage over the developer's freely-named worktree),
+        then the pane's current path (the shell the session was launched in
+        -- `main/` on a fresh spawn, the checkout once the session `cd`ed).
+        None resolving means the policy cannot tell this round's checkout
+        from another's, and the dangerous-rm rule declines: the reviewer
+        reads the refusal and adapts, which is the safe direction for a
+        removal."""
+        if not hub:
+            return None
+        found = review_checkout_of(str((marker or {}).get("cwd") or ""), hub)
+        if found:
+            return found
+        if anchor is not None and anchor.task_ref:
+            named = review_checkout_name(anchor.task_ref)
+            if named:
+                return f"{hub.rstrip('/')}/{named}"
+        return review_checkout_of(self.alissa.pane_path(name), hub)
+
+    def _classified_label(self, session: str) -> str:
+        """What the responder sees on this session's pane right now, as the
+        stalled comment's word: `working` (a pane that classifies as
+        nothing), a prompt kind, or `unreadable` (no capture)."""
+        if self.config.prompt_responder == PROMPT_OFF:
+            return "responder off"
+        pane = self.alissa.capture_pane(session, prompts_mod.PANE_LINES)
+        if not pane:
+            return "unreadable"
+        finding = prompts_mod.classify(pane)
+        return "working" if finding is None else finding.kind
+
+    # The responder's ladder store, split by mode (see `_dry_run_sightings`).
+
+    def _sighting_get(self, name: str) -> "dict | None":
+        if self.config.dry_run:
+            row = self._dry_run_sightings.get(name)
+            return None if row is None else dict(row)
+        return self.state.prompt_sighting(name)
+
+    def _sighting_record(
+        self,
+        name: str,
+        finding: "prompts_mod.PromptFinding",
+        slug: str,
+        number: int,
+        *,
+        answered: bool,
+    ) -> None:
+        if not self.config.dry_run:
+            self.state.record_prompt_sighting(
+                name, finding.kind, finding.pane_hash,
+                repo_slug=slug, number=number, answered=answered,
+            )
+            return
+        ts = int(time.time())
+        row = self._dry_run_sightings.get(name)
+        same = row is not None and row["kind"] == finding.kind and row["pane_hash"] == finding.pane_hash
+        self._dry_run_sightings[name] = {
+            "session": name, "kind": finding.kind, "pane_hash": finding.pane_hash,
+            "repo_slug": slug, "number": number,
+            "first_seen": int(row["first_seen"]) if same and row else ts, "last_seen": ts,
+            "sightings": (int(row["sightings"]) + 1) if same and row else 1,
+            "answers": (int(row["answers"]) if row else 0) + (1 if answered else 0),
+        }
+
+    def _sighting_clear(self, name: str) -> None:
+        if not self.config.dry_run:
+            self.state.clear_prompt_sighting(name)
+            return
+        row = self._dry_run_sightings.get(name)
+        if row is not None and row["kind"]:
+            row.update(kind="", pane_hash="", sightings=0, last_seen=int(time.time()))
+
+    def _sighting_prune(self, keep: "set[str]") -> None:
+        if not self.config.dry_run:
+            self.state.prune_prompt_sightings(keep)
+            return
+        for name in [n for n in self._dry_run_sightings if n not in keep]:
+            del self._dry_run_sightings[name]
+
     def preflight(self) -> list[str]:
         """Startup checks. Returns warnings; raises on anything fatal."""
         warnings: list[str] = []
@@ -5455,13 +6167,26 @@ class ReviewWatcher:
 
         return warnings
 
-    def _activity_line(self, session: str, round_: int, context: str, cap: int) -> str:
+    def _activity_line(
+        self, session: str, round_: "int | None", context: str, cap: int
+    ) -> str:
         """One mechanical line. `cap` is the PR's EFFECTIVE cap (config plus
         granted re-entries) -- printing the config value would render a granted
-        round 11 as "round 11 of 10"."""
-        return f"- {_now()} — `{session}` — round {round_} of {cap} — {context}"
+        round 11 as "round 11 of 10". `round_` is None only for a session the
+        daemon did not spawn (the skill's bare `review-pr-<n>` shape names no
+        round), printed as `?` rather than invented."""
+        shown = "?" if round_ is None else str(round_)
+        return f"- {_now()} — `{session}` — round {shown} of {cap} — {context}"
 
     def _append_activity(self, pr: PullRequest, line: str) -> bool:
+        """Append one line to THE activity comment on `pr`; True if it landed.
+        See `_append_activity_on` for the contract -- this is the PullRequest
+        spelling every round-decision site uses."""
+        return self._append_activity_on(pr.owner, pr.repo, pr.number, pr.slug, line)
+
+    def _append_activity_on(
+        self, owner: str, repo: str, number: int, slug: str, line: str
+    ) -> bool:
         """Append one line to THE activity comment on the PR; True if it landed.
 
         Find-or-create: the PR's issue comments are filtered to OWN authorship
@@ -5476,24 +6201,24 @@ class ReviewWatcher:
         would fail the whole poll pass over a log line.
         """
         if self.config.dry_run:
-            log.info("[dry-run] would append activity line on %s: %s", pr.slug, line)
+            log.info("[dry-run] would append activity line on %s: %s", slug, line)
             return False
         try:
             mine = [
                 c
-                for c in self.github.issue_comments(pr.owner, pr.repo, pr.number)
+                for c in self.github.issue_comments(owner, repo, number)
                 if c.author == self.github.login and ACTIVITY_MARKER in c.body
             ]
             if mine:
                 self.github.update_comment(
-                    pr.owner, pr.repo, mine[0].id, mine[0].body + "\n" + line
+                    owner, repo, mine[0].id, mine[0].body + "\n" + line
                 )
             else:
                 self.github.comment(
-                    pr.owner, pr.repo, pr.number, ACTIVITY_HEADER + "\n" + line
+                    owner, repo, number, ACTIVITY_HEADER + "\n" + line
                 )
         except Exception as exc:
-            log.warning("could not append activity line on %s: %s", pr.slug, exc)
+            log.warning("could not append activity line on %s: %s", slug, exc)
             return False
         return True
 
@@ -5516,6 +6241,7 @@ class ReviewWatcher:
             minutes=int(age / 60),
             stale=STALE_ROUND_SECONDS // 60,
             session=session,
+            classified=self._classified_label(session),
         )
         log.warning(
             "STALLED %s round %d has been deferred %.0f min behind live session "
@@ -5684,6 +6410,22 @@ class ReviewWatcher:
         started = time.monotonic()
         reaped = self.sweep_sessions()
 
+        # The prompt responder (issue #138) runs on the sweep's own listing,
+        # after the reaper (a session the sweep just killed has no pane to
+        # read) and before any PR is evaluated, because its one gate-shaped
+        # outcome -- the account-level hold -- has to reach every spawn this
+        # pass. A sweep that could not list leaves `_pass_roster` None and
+        # the responder reads nothing: no listing, no pane, no hold.
+        self._prompt_sweep = self._respond_to_prompts(self._pass_roster)
+        self._prompt_hold = self._prompt_sweep.hold
+        if self._prompt_hold:
+            log.warning(
+                "prompt responder: HOLDING new reviewer spawns this pass — %s. "
+                "Live sessions keep running and their rounds are not consumed; "
+                "the hold lifts on the first pass that no longer sees the notice",
+                self._prompt_hold,
+            )
+
         # Re-derive the allowlist when due (bows mode only; a no-op under
         # static). AFTER the sweep, so a session the sweep just reaped no
         # longer holds its repo in the allowlist, and BEFORE the search, so
@@ -5737,8 +6479,12 @@ class ReviewWatcher:
         # written and whose events are already on their way.
         vitals = self._push_fleet_vitals(completed_at=time.time())
         log.info(
-            "poll summary: %d candidate(s), %d reaped, %d ms, vitals: %s",
-            len(results), reaped, duration_ms, vitals,
+            "poll summary: %d candidate(s), %d reaped, %d parked on a prompt, "
+            "%d answered%s, %d ms, vitals: %s",
+            len(results), reaped, len(self._prompt_sweep.waiting),
+            self._prompt_sweep.answered,
+            " (spawns HELD)" if self._prompt_sweep.hold else "",
+            duration_ms, vitals,
         )
         return results
 
@@ -5859,6 +6605,10 @@ class ReviewWatcher:
             # at a waiting PR needs to know whether to free a session or look at
             # CI, and those are opposite actions.
             stage = "checks-held"
+        elif decision.prompt_held:
+            # Same column again; its own stage because the operator's remedy
+            # is different from both: the reviewer ACCOUNT (issue #138).
+            stage = "prompt-held"
         return {
             "slug": slug,
             "number": int(tail),
