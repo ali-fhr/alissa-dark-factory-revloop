@@ -986,6 +986,30 @@ def test_prune_prompt_sightings_drops_sessions_that_left_the_roster(tmp_path):
     assert st.prune_prompt_sightings({"live"}) == 0
 
 
+def test_prune_pings_drops_one_family_by_predicate_and_nothing_else(tmp_path):
+    """The `prompt:` family is the one telemetry family in `pings`
+    (PR #139 round 1): its owner passes the test a row must pass to stay;
+    the other families -- dedupe keys -- are never touched, whatever the
+    predicate says about them."""
+    st = State(tmp_path / "s.db")
+    st.record_ping("a/b", 1, "prompt:dangerous_rm:accept@live#10")
+    st.record_ping("a/b", 1, "prompt:dangerous_rm:accept@live#20")
+    st.record_ping("a/b", 2, "prompt:unknown:kill@gone#30")
+    st.record_ping("a/b", 2, "prompt-page:login_expired@gone#4")
+    st.record_ping("a/b", 3, "stalled:gone")
+    assert st.prune_pings("prompt:", lambda kind: "@live#" in kind) == 1
+    assert sorted(r["kind"] for r in st.read_pings()) == [
+        "prompt-page:login_expired@gone#4",
+        "prompt:dangerous_rm:accept@live#10",
+        "prompt:dangerous_rm:accept@live#20",
+        "stalled:gone",
+    ]
+    assert st.prune_pings("prompt:", lambda kind: "@live#" in kind) == 0
+    assert st.prune_pings("prompt:", lambda kind: False) == 2
+    assert sorted(r["kind"] for r in st.read_pings()) == ["prompt-page:login_expired@gone#4", "stalled:gone"]
+    assert st.prune_pings("nothing:", lambda kind: False) == 0
+
+
 def test_prompt_sightings_table_is_added_to_an_older_db(tmp_path):
     """The schema is `CREATE TABLE IF NOT EXISTS`, so a state.db that predates
     the responder gains the table on its next open."""

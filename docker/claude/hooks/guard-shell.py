@@ -4,7 +4,8 @@ would open an interactive prompt nobody in an unattended session can answer.
 
 WHY (devloop issue #125, ported to the reviewer seat by issue #138 — the two
 images ship the same bytes). Workers and reviewers run
-`claude --dangerously-skip-permissions` and STILL stop on Claude Code's critical-path removal check ("Dangerous rm operation on
+`claude --dangerously-skip-permissions` and STILL stop on Claude Code's
+critical-path removal check ("Dangerous rm operation on
 statically-unresolvable target … Do you want to proceed?"): `rm`/`rmdir` on a
 critical or statically-unresolvable target (a glob, an unexpanded variable, a
 command substitution, `~`, `/`, the working directory or a parent of it)

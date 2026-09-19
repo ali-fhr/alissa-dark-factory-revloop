@@ -48,10 +48,13 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     `prompt_quiet_seconds`, `prompt_kill_minutes`, `prompt_max_answers`,
     `waiting_dir` with devloop's floors. **The seat difference:** the
     "own worktree" a `dangerous_rm` target is measured against is the
-    reviewer's `REVIEW-<task>` checkout (marker cwd, then the spawn row's
-    task ref, then the pane path) — inside it `accept`, anything else
-    `decline`; the reason strings stay devloop's so the sentinel reads one
-    vocabulary. Narration is one line on the PR's marker-identified
+    reviewer's `REVIEW-<task>` checkout (marker cwd — an observation, so a
+    cwd anywhere else, `main/` included, declines outright; then the spawn
+    row's task ref — an assumption, so it contains an absolute target only
+    and never serves as the base of a relative one; then the pane path) —
+    inside it `accept`, anything else `decline`; the reason strings stay
+    devloop's so the sentinel reads one vocabulary. Narration is one line
+    on the PR's marker-identified
     **Review-loop activity** comment (`prompt-answered: dangerous_rm →
     accept (target inside worktree) · target REVIEW-TASK-9/build · 14 s
     after it appeared`) and one `escalation.prompt` loop event (`prompt:`
@@ -77,7 +80,16 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     answers}]`; a *Waiting on a prompt* panel with Pane / accept / decline /
     escape buttons, a Pane button on every roster row, and `prompt-page`
     rows in the operator inbox (linked to the PR). Scope as devloop's: any
-    managed session for the operator, own sessions only for the daemon.
+    managed session for the operator, own sessions only for the daemon; the
+    `answer` audit line records `managed` like the kill trail does.
+  - **Review round 1 (PR #139).** A marker cwd outside a `REVIEW-` checkout
+    now settles a `dangerous_rm` as `decline` instead of yielding to the
+    named checkout (the spawn cwd `main/` was resolving relative targets
+    into the shared mirror); the named leg contains absolute targets only.
+    `prompt_responder = off` clears the sighting ladder, so the waiting
+    panel empties instead of freezing. The per-act `prompt:` ping rows of a
+    session that left the roster are dropped once per pass
+    (`State.prune_pings`); the hooks join the style matrix.
   - **Container.** `ALISSA_PROMPT_RESPONDER`, `ALISSA_PROMPT_QUIET_SECONDS`,
     `ALISSA_PROMPT_KILL_MINUTES`, `ALISSA_PROMPT_MAX_ANSWERS` and
     `ALISSA_WAITING_DIR` render pass-through (skew-gated on this release)

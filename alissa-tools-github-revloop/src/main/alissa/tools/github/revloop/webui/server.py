@@ -201,34 +201,38 @@ class App:
             self._audit("answer", {"session": name, "verb": verb, "ok": False,
                                    "error": "invalid name"})
             return 400, {"ok": False, "error": "invalid session name"}
+        # WHOSE seat receives the keystrokes -- this daemon's reviewer, or
+        # another daemon's worker (both are answerable by design) -- on every
+        # outcome past the name check, exactly as the kill trail records it.
+        managed = is_managed(name)
         if verb not in prompts.CONSOLE_VERBS:
-            self._audit("answer", {"session": name, "verb": verb, "ok": False,
-                                   "error": "bad verb"})
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "bad verb"})
             return 400, {"ok": False, "error": "verb must be one of "
                          + ", ".join(prompts.CONSOLE_VERBS)}
         pane = self._capture(name)
         if pane is None:
-            self._audit("answer", {"session": name, "verb": verb, "ok": False,
-                                   "error": "no_pane"})
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "no_pane"})
             return 404, {"ok": False, "error": "no_pane"}
         finding = prompts.classify(pane)
         if finding is None:
-            self._audit("answer", {"session": name, "verb": verb, "ok": False,
-                                   "error": "not_waiting"})
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "not_waiting"})
             return 409, {"ok": False, "error": "not_waiting"}
         if not finding.answerable:
-            self._audit("answer", {"session": name, "verb": verb, "ok": False,
-                                   "error": "not_answerable", "kind": finding.kind})
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "not_answerable", "kind": finding.kind})
             return 409, {"ok": False, "error": "not_answerable", "kind": finding.kind}
         keys = prompts.keys_for(finding, verb)
         try:
             self._run(send_keys_argv(name, keys), timeout=15)
         except (ValueError, CommandError) as exc:
-            self._audit("answer", {"session": name, "verb": verb, "ok": False,
-                                   "kind": finding.kind, "error": str(exc)})
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "kind": finding.kind, "error": str(exc)})
             return 400, {"ok": False, "error": str(exc), "kind": finding.kind}
-        self._audit("answer", {"session": name, "verb": verb, "ok": True,
-                               "kind": finding.kind, "keys": list(keys)})
+        self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                               "ok": True, "kind": finding.kind, "keys": list(keys)})
         return 200, {"ok": True, "message": "answered", "kind": finding.kind,
                      "keys": list(keys)}
 

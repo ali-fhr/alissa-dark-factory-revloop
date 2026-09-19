@@ -10950,6 +10950,7 @@ from alissa.tools.github.revloop.loop import (  # noqa: E402
     PROMPT_PAGE_COMMENT,
     PromptSweep,
     marker_file_name,
+    prompt_event_session,
     review_checkout_of,
 )
 
@@ -11075,14 +11076,139 @@ def test_a_marked_session_parked_on_rm_inside_its_checkout_is_accepted(config, t
 
 def test_the_spawn_rows_task_ref_names_the_checkout_when_the_marker_has_no_cwd(config, tmp_path):
     """The reviewer seat's one advantage: the review skill names the
-    checkout REVIEW-<task ref>, so the spawn row alone resolves it."""
+    checkout REVIEW-<task ref>, so the spawn row alone contains an ABSOLUTE
+    target when nothing observed where the session is."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/tmp/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
+    assert f"target {PROMPT_CHECKOUT}/tmp" in activity_comments(gh)[0].body
+
+
+def test_a_marker_cwd_outside_a_review_checkout_declines_whatever_the_spawn_row_names(config, tmp_path):
+    """PR #139 round 1, [major]: the marker's cwd is an OBSERVATION and it
+    rules. A reviewer that never made a checkout sits in `<hub>/main` (the
+    spawn cwd); the spawn row still names REVIEW-<task ref>, but asserting
+    that name over the observed cwd resolved a relative target into the
+    shared mirror and pressed Enter on it."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION, cwd=f"{hub_of(w)}/main")
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog("build/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))], "declined, never Enter"
+    line = activity_comments(gh)[0].body.splitlines()[-1]
+    assert "dangerous_rm → decline" in line and "target inside worktree" not in line
+    assert f"{PROMPT_CHECKOUT}/build" not in line, "the trail never names a path the session is not in"
+
+    # An absolute target inside the NAMED checkout is declined too: the
+    # session is demonstrably elsewhere, so the name is not its worktree.
+    al.sent.clear()
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{hub_of(w)}/{PROMPT_CHECKOUT}/build/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))]
+    assert "lane worktree unknown" in activity_comments(gh)[0].body.splitlines()[-1]
+
+    # The hub itself and a developer's worktree are "anywhere else" as well.
+    for cwd in (hub_of(w), f"{hub_of(w)}/TASK-9-X/src"):
+        al.sent.clear()
+        write_marker(w.config, PROMPT_SESSION, cwd=cwd)
+        al.panes[PROMPT_SESSION] = [rm_dialog("build/*"), PROMPT_IDLE]
+        w._respond_to_prompts(al.sessions)
+        assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))], cwd
+
+
+def test_the_named_leg_never_serves_as_the_base_of_a_relative_target(config, tmp_path):
+    """No cwd observed (the marker carries none, the pane path is empty):
+    the spawn row's name is an assumption, and a RELATIVE target resolved
+    against an assumed base would relocate the decision into wherever the
+    session really is. It declines; the pane path, an observation, may
+    still resolve it."""
     w, gh, al = prompt_watcher(config, tmp_path)
     write_marker(w.config, PROMPT_SESSION)
     al.sessions = [roster_entry(PROMPT_SESSION)]
     al.panes[PROMPT_SESSION] = [rm_dialog("tmp/*"), PROMPT_IDLE]
     w._respond_to_prompts(al.sessions)
-    assert al.sent == [(PROMPT_SESSION, ("Enter",))]
-    assert f"target {PROMPT_CHECKOUT}/tmp" in activity_comments(gh)[0].body
+    assert al.sent == [(PROMPT_SESSION, ("2", "Enter"))]
+    assert "target unresolvable" in activity_comments(gh)[0].body.splitlines()[-1]
+
+    al.sent.clear()
+    al.paths[PROMPT_SESSION] = f"{hub_of(w)}/{PROMPT_CHECKOUT}"
+    al.panes[PROMPT_SESSION] = [rm_dialog("tmp/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    assert al.sent == [(PROMPT_SESSION, ("Enter",))], "the pane path is an observation"
+    assert f"target {PROMPT_CHECKOUT}/tmp" in activity_comments(gh)[0].body.splitlines()[-1]
+
+
+def test_off_clears_the_sighting_ladder_so_the_waiting_panel_empties(config, tmp_path):
+    """PR #139 round 1, [minor]: `off` returned before the prune, so the
+    rows an earlier mode wrote froze on the console's waiting panel with a
+    clock that kept counting. Off sees nothing parked, and says so."""
+    w, gh, al = prompt_watcher(config, tmp_path, prompt_responder="off")
+    w.state.record_prompt_sighting(
+        PROMPT_SESSION, "dangerous_rm", "h", repo_slug=SLUG, number=NUMBER, answered=False
+    )
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=999)]
+    al.panes[PROMPT_SESSION] = rm_dialog("/tmp/x")
+    assert w._respond_to_prompts(al.sessions) == PromptSweep()
+    assert w.state.read_prompt_sightings() == [] and al.captured == []
+
+    # An unlistable roster is not a reason to clear anything: the next
+    # listing heals it, and the rows may still be true.
+    w.state.record_prompt_sighting(
+        PROMPT_SESSION, "dangerous_rm", "h", repo_slug=SLUG, number=NUMBER, answered=False
+    )
+    assert w._respond_to_prompts(None) == PromptSweep()
+    assert w.state.read_prompt_sightings() == []
+
+    # Dry-run off touches the in-memory ladder only, never production's.
+    st = State(tmp_path / "prod.db")
+    st.record_prompt_sighting("other", "permission", "h", repo_slug=SLUG, number=NUMBER, answered=False)
+    w2, _, al2 = prompt_watcher(config, tmp_path, prompt_responder="off", dry_run=True, state=st)
+    w2._dry_run_sightings["x"] = {"kind": "permission"}
+    assert w2._respond_to_prompts([]) == PromptSweep()
+    assert w2._dry_run_sightings == {} and st.read_prompt_sightings() != []
+
+
+def test_prompt_ping_rows_follow_their_session_out_of_the_roster(config, tmp_path):
+    """PR #139 round 1, [minor]: the per-act `prompt:` rows are telemetry,
+    not dedupe keys, and nothing bounded them. A live session keeps its
+    trail; a session gone from the roster takes its rows with it; every
+    other family (the `prompt-page:` inbox rows included) stays."""
+    w, gh, al = prompt_watcher(config, tmp_path)
+    checkout = f"{hub_of(w)}/{PROMPT_CHECKOUT}"
+    write_marker(w.config, PROMPT_SESSION, cwd=checkout)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = [rm_dialog(f"{checkout}/x/*"), PROMPT_IDLE]
+    w._respond_to_prompts(al.sessions)
+    w.state.record_ping(SLUG, NUMBER, "prompt-page:login_expired@other#3")
+    w.state.record_ping(SLUG, NUMBER, "stalled:other")
+    assert len(prompt_pings(w)) == 2
+    assert prompt_event_session(prompt_pings(w)[0]) in (PROMPT_SESSION, None)
+    kinds = [k for k in prompt_pings(w) if k.startswith("prompt:")]
+    assert kinds and all(prompt_event_session(k) == PROMPT_SESSION for k in kinds)
+
+    # Still in the roster (idle now): the trail stays.
+    Path(w.config.waiting_dir, marker_file_name(f"ali-{PROMPT_SESSION}")).unlink()
+    al.panes[PROMPT_SESSION] = PROMPT_IDLE
+    w._respond_to_prompts([roster_entry(PROMPT_SESSION, quiet=5)])
+    assert [k for k in prompt_pings(w) if k.startswith("prompt:")] == kinds
+
+    # Dry-run over the same ledger prunes nothing.
+    w2, _, _ = prompt_watcher(config, tmp_path, dry_run=True, state=w.state)
+    w2._respond_to_prompts([])
+    assert [k for k in prompt_pings(w) if k.startswith("prompt:")] == kinds
+
+    # Gone from the roster: the family's rows go, the rest of the table stays.
+    w._respond_to_prompts([roster_entry("review-widgets-pr9-r1-0000ff", quiet=5)])
+    left = [r["kind"] for r in w.state.read_pings()]
+    assert sorted(left) == sorted(["prompt-page:login_expired@other#3", "stalled:other"])
+    assert not [e for e in loop_events.derive_events(w.state) if e["kind"] == "escalation.prompt"]
+    assert prompt_event_session("prompt-page:login_expired@other#3") is None
+    assert prompt_event_session("prompt:x:accept@s#1") == "s"
+    assert prompt_event_session("prompt:x:accept@s") is None and prompt_event_session("stalled:s") is None
 
 
 def test_an_rm_in_main_or_another_checkout_is_declined_with_the_numbered_no(config, tmp_path):

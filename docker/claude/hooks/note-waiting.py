@@ -3,8 +3,9 @@
 `idle_prompt`): leave a "this session is waiting for input" marker on disk.
 
 WHY (devloop issue #125, ported to the reviewer seat by issue #138). A
-reviewer session that still ends up on an interactive prompt — the guard refuses the rm shapes it knows, not every prompt Claude
-Code can raise — sits there until something notices. The supervisor's
+reviewer session that still ends up on an interactive prompt — the guard
+refuses the rm shapes it knows, not every prompt Claude Code can raise —
+sits there until something notices. The supervisor's
 `promptPatterns` in agents.yaml only detect a prompt by scraping the pane;
 this marker is the signal the daemon's prompt responder
 (`ReviewWatcher._respond_to_prompts`) reads FIRST, the pane being its

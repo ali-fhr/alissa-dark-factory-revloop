@@ -1296,6 +1296,19 @@ def prompt_page_kind(kind: str, session: str, bucket: int) -> str:
     return f"{ESCALATION_PROMPT_PAGE}:{kind}@{session}#{bucket}"
 
 
+def prompt_event_session(kind: str) -> "str | None":
+    """The session a `prompt:` ping row names (`prompt_event_kind`'s
+    `@<session>#<seq>` tail), or None for any other kind. The retention
+    sweep's key (`ReviewWatcher._prune_prompt_pings`): the family grows with
+    acts, and an act's row stops meaning anything once the session it names
+    is gone."""
+    if not kind.startswith(f"{ESCALATION_PROMPT}:"):
+        return None
+    head, hash_, _seq = kind.rpartition("#")
+    _, at, session = head.rpartition("@")
+    return session if hash_ and at and session else None
+
+
 def review_checkout_of(path: "str | None", hub: "str | None") -> "str | None":
     """The `<hub>/REVIEW-*` checkout `path` lies in (or is), or None.
 
@@ -5629,7 +5642,15 @@ class ReviewWatcher:
         Returns what the pass records: the parked sessions, the spawn hold
         an account-level notice raised, and how many answers were sent."""
         mode = self.config.prompt_responder
-        if mode == PROMPT_OFF or sessions is None:
+        if mode == PROMPT_OFF:
+            # The ladder is "what the responder sees parked", and an `off`
+            # responder sees nothing: rows an earlier mode wrote would
+            # otherwise freeze on the console's waiting panel with a clock
+            # that keeps counting (PR #139 round 1, `[minor]`). Dry-run
+            # touches its in-memory copy only, as everywhere else.
+            self._sighting_prune(set())
+            return PromptSweep()
+        if sessions is None:
             return PromptSweep()
         live: "set[str]" = set()
         waiting: "list[dict]" = []
@@ -5666,6 +5687,7 @@ class ReviewWatcher:
             if outcome["hold"] and hold is None:
                 hold = outcome["hold"]
         self._sighting_prune(live)
+        self._prune_prompt_pings(live)
         return PromptSweep(waiting=tuple(waiting), hold=hold, answered=answered)
 
     def _answer_prompt(
@@ -5684,7 +5706,7 @@ class ReviewWatcher:
             str(hub_root_of(self.config.hub_for(anchor.owner, anchor.name)))
             if anchor is not None else None
         )
-        checkout = self._review_checkout(hub, marker, anchor, name)
+        checkout = self._review_checkout(hub, marker, anchor, name, finding.target)
         row = self._sighting_get(name) or {}
         same = bool(row) and (
             row["kind"] == finding.kind and row["pane_hash"] == finding.pane_hash
@@ -5992,30 +6014,69 @@ class ReviewWatcher:
         marker: "dict | None",
         anchor: "PromptAnchor | None",
         name: str,
+        target: "str | None" = None,
     ) -> "str | None":
         """The `<hub>/REVIEW-*` checkout this session works in, or None.
 
-        Three legs, cheapest first: the marker's `cwd` (Claude Code's
+        Two OBSERVATIONS and one assumption, and an observation always rules
+        (PR #139 round 1, `[major]`). The marker's `cwd` is Claude Code's
         tracked cwd at the moment the hook fired, which follows the reviewer
-        into the checkout it created), the spawn row's task ref (the review
-        skill names the checkout `REVIEW-<task ref>` -- deterministic, this
-        seat's one advantage over the developer's freely-named worktree),
-        then the pane's current path (the shell the session was launched in
-        -- `main/` on a fresh spawn, the checkout once the session `cd`ed).
-        None resolving means the policy cannot tell this round's checkout
-        from another's, and the dangerous-rm rule declines: the reviewer
-        reads the refusal and adapts, which is the safe direction for a
-        removal."""
+        into the checkout it created -- so a marker that CARRIES a cwd is
+        three-valued: inside a `REVIEW-` checkout (that checkout), anywhere
+        else (None: the session is demonstrably somewhere a removal must not
+        be resolved into, and `main/`, the spawn cwd every reviewer starts
+        in, is the common case), and only a marker WITHOUT a cwd falls
+        through. The spawn row's task ref names the checkout the review
+        skill would make (`REVIEW-<task ref>` -- deterministic, this seat's
+        one advantage over the developer's freely-named worktree), but that
+        is an assumption about where the session is, not an observation, so
+        it serves the containment of an ABSOLUTE target only: a RELATIVE
+        target resolved against an assumed base would silently relocate the
+        decision into whatever directory the session actually sits in. The
+        pane's current path is the last leg (the shell the session was
+        launched in -- `main/` on a fresh spawn, the checkout once that
+        shell `cd`ed). None resolving means the policy cannot tell this
+        round's checkout from another's, and the dangerous-rm rule declines:
+        the reviewer reads the refusal and adapts, which is the safe
+        direction for a removal."""
         if not hub:
             return None
-        found = review_checkout_of(str((marker or {}).get("cwd") or ""), hub)
-        if found:
-            return found
-        if anchor is not None and anchor.task_ref:
+        cwd = str((marker or {}).get("cwd") or "")
+        if cwd:
+            return review_checkout_of(cwd, hub)
+        absolute = prompts_mod.normalise_target(target or "", None) is not None
+        if absolute and anchor is not None and anchor.task_ref:
             named = review_checkout_name(anchor.task_ref)
             if named:
                 return f"{hub.rstrip('/')}/{named}"
         return review_checkout_of(self.alissa.pane_path(name), hub)
+
+    def _prune_prompt_pings(self, live: "set[str]") -> None:
+        """Drop the `prompt:` ping rows of sessions no longer in the roster
+        (PR #139 round 1, `[minor]`). The rest of `pings` is dedupe keys the
+        daemon reads back by key, a space bounded by its workload; the
+        responder's per-act `prompt:` family is telemetry keyed on a session
+        NAME plus a clock -- it grows with acts, not with work items -- and
+        nothing reads a row back once the loop-events emitter has derived
+        its `escalation.prompt` and the session is gone. Devloop's
+        foreign-session shape (its issue #95): the owner passes the subjects
+        it can still see, once per pass, and the rest of the family goes. A
+        live session keeps every row (its trail stays readable while the
+        episode runs); dry-run prunes nothing, the production ledger being
+        the one it would reach."""
+        if self.config.dry_run:
+            return
+        dropped = self.state.prune_pings(
+            f"{ESCALATION_PROMPT}:",
+            lambda kind: prompt_event_session(kind) in live,
+        )
+        if dropped:
+            log.info(
+                "prompt responder: dropped %d `prompt:` ping row(s) of sessions "
+                "no longer in the roster (%d live) — the act is on the PR's "
+                "activity comment and was emitted as a loop event already",
+                dropped, len(live),
+            )
 
     def _classified_label(self, session: str) -> str:
         """What the responder sees on this session's pane right now, as the

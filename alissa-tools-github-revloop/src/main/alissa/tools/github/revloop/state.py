@@ -780,6 +780,48 @@ class State:
         )
         self._db.commit()
 
+    def prune_pings(self, kind_prefix: str, keep: "Callable[[str], bool]") -> int:
+        """Drop the rows of ONE ping family (a literal prefix, matched like
+        `read_pings`) that `keep` rejects. Returns how many went (0 when the
+        store refused the write).
+
+        `pings` is otherwise never pruned, and that is right for every family
+        the daemon reads back BY KEY (`stalled:`, `activity-deferred:`,
+        `stability:`, `checks-hold:`, `prompt-page:`, ...): those rows are
+        the proof an episode was already raised, and their key space is
+        bounded by the workload. The prompt responder's per-act `prompt:`
+        rows are the one family that is NOT a key -- a clock is folded in so
+        every act is its own row, and nothing reads one back (issue #138;
+        PR #139 round 1). Its owner passes the test a row must pass to stay
+        (the session it names is still in the roster), once per pass. A
+        predicate rather than a keep-set because the subject is folded into
+        the kind, and parsing it here would teach this module the daemon's
+        grammar: kinds are free-form strings, exactly as `record_ping` takes
+        them. The SELECT rides inside the telemetry write like
+        `prune_prompt_sightings`, and a pass with nothing to drop executes
+        no write."""
+        dropped = 0
+
+        def write() -> None:
+            nonlocal dropped
+            rows = self._db.execute(
+                "SELECT repo, number, kind FROM pings WHERE substr(kind, 1, ?) = ?",
+                (len(kind_prefix), kind_prefix),
+            ).fetchall()
+            gone = [row for row in rows if not keep(str(row["kind"]))]
+            if not gone:
+                return
+            for row in gone:
+                self._db.execute(
+                    "DELETE FROM pings WHERE repo=? AND number=? AND kind=?",
+                    (row["repo"], row["number"], row["kind"]),
+                )
+            self._db.commit()
+            dropped = len(gone)
+
+        self._write_telemetry(write, f"prune_pings({kind_prefix}*)")
+        return dropped
+
     def ping_seen_since(self, kind_prefix: str, since: int) -> bool:
         """Whether ANY ping of a kind family (by prefix) was raised at or
         after `since` (unix seconds). The prompt responder's once-per-kind-
@@ -1836,9 +1878,12 @@ class State:
     #
     # Rows come back newest-first, and every reader takes the same optional
     # `limit` read_snapshots does. Unlike poll_snapshots, `escalations` and
-    # `pings` are NEVER pruned (they are per-head / per-episode dedupe keys the
-    # daemon must keep), so a reader that returned all of them would grow an
-    # operator inbox that never clears. Bounding belongs here, in SQL, not in
+    # `pings` are never pruned as tables (they are per-head / per-episode
+    # dedupe keys the daemon must keep -- the one exception is the prompt
+    # responder's per-act `prompt:` family, telemetry that `prune_pings`
+    # drops once its session has left the roster), so a reader that returned
+    # all of them would grow an operator inbox that never clears. Bounding
+    # belongs here, in SQL, not in
     # the caller's slice -- and, for `pings`, AFTER the kind filter rather than
     # before it, or the noisier telemetry kind evicts the operator pages.
     #

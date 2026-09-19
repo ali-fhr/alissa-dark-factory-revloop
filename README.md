@@ -903,9 +903,13 @@ not change counts as unanswered (it still counts toward the cap).
 
 The reviewer's own checkout is resolved from the marker's `cwd` (Claude
 Code's tracked cwd, which follows the reviewer into the checkout it
-created), then the spawn row's task ref (the review skill names the
-checkout `REVIEW-<task ref>`, deterministically), then the pane's current
-path; when none names a `REVIEW-*` child of the hub the dangerous-rm rule
+created) — an observation, so a marker whose cwd is anywhere else (`main/`,
+the spawn cwd, is the common case) settles it: **decline**; only a marker
+with no cwd falls through — then the spawn row's task ref (the review skill
+names the checkout `REVIEW-<task ref>`, deterministically — an assumption,
+so it serves the containment of an *absolute* target only, never as the
+base a relative target is resolved against), then the pane's current path;
+when none names a `REVIEW-*` child of the hub the dangerous-rm rule
 **declines**, because it cannot tell this round's checkout from another's.
 
 **A kill never consumes a round.** The responder's kill (the ladder's last
@@ -925,9 +929,14 @@ worktree) · target REVIEW-TASK-500/build · 14 s after it appeared` — and one
 never pane text beyond the matched signature line (secrets-scrubbed), paths
 relative to the hub. The 3-line excerpt around the signature goes to DEBUG
 only. `prompt_responder` = `on` (default) | `observe` (classify + narrate,
-send nothing, kill nothing, page nobody) | `off`; `--dry-run` classifies and
-logs, sends nothing, and keeps its sighting ladder in memory so a
-diagnostic pass never advances production's clock. The 40-minute stalled
+send nothing, kill nothing, page nobody) | `off` (reads no pane and clears
+the sighting ladder, so the console's *Waiting on a prompt* panel empties
+rather than freezing on the last thing an earlier mode saw); `--dry-run`
+classifies and logs, sends nothing, and keeps its sighting ladder in memory
+so a diagnostic pass never advances production's clock. The `prompt:` ping
+rows of a session that has left the roster are dropped once per pass (the
+act stays on the activity comment and was emitted as a loop event); every
+other ping family is a dedupe key and is never pruned. The 40-minute stalled
 comment now ends with what the responder classified the pane as (`working`
 | `<kind>` | `unreadable` | `responder off`).
 

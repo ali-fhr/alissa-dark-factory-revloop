@@ -623,6 +623,27 @@ def test_pane_404s_when_tmux_cannot_find_the_session_and_400s_a_bad_name(tmp_pat
         assert app.pane(bad)[0] == 400
 
 
+def test_answer_audits_whose_seat_received_the_keys(tmp_path):
+    """PR #139 round 1, [nit]: `answer` has kill's scope (any managed
+    session) and presses buttons on someone else's dialog, so its trail says
+    whose seat took the keystrokes, exactly as the kill trail does -- on
+    every outcome past the name check."""
+    audit = []
+    foreign = "develop-acme-widgets-i7-a1"
+    app = make_app(tmp_path, runner=tmux_runner({SESSION: RM_DIALOG, foreign: IDLE}, []),
+                   audit=lambda a, d: audit.append(d))
+    assert app.answer(SESSION, "accept")[0] == 200
+    assert audit[-1]["managed"] is True and audit[-1]["ok"] is True
+    assert app.answer(foreign, "decline")[0] == 409
+    assert audit[-1]["managed"] is False and audit[-1]["error"] == "not_waiting"
+    assert app.answer(SESSION, "shrug")[0] == 400
+    assert audit[-1]["managed"] is True and audit[-1]["error"] == "bad verb"
+    assert app.answer("nobody-pr1-r1-000000", "accept")[0] == 404
+    assert audit[-1]["managed"] is False and audit[-1]["error"] == "no_pane"
+    assert app.answer("-rf", "accept")[0] == 400
+    assert "managed" not in audit[-1], "an invalid name has no seat to report"
+
+
 def test_answer_maps_verbs_to_the_dialog_on_screen(tmp_path):
     sent = []
     audit = []

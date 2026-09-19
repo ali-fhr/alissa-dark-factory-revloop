@@ -106,7 +106,10 @@ INBOX_STABILITY = "stability-held"
 INBOX_PROMPT_PAGE = "prompt-page"
 
 # How many INBOX ITEMS reach the payload. `escalations` and `pings` are never
-# pruned (their rows are the daemon's dedupe keys), so the console bounds its
+# pruned as tables (their rows are the daemon's dedupe keys; the one family
+# that is telemetry rather than a key, the responder's per-act `prompt:`
+# rows, is swept by the daemon once its session is gone and never reaches
+# this inbox), so the console bounds its
 # own view the way SPARK_POINTS bounds the snapshot tail -- an inbox that never
 # clears stops being an inbox. The ping read applies the kind filter in SQL, so
 # this counts pages and not the telemetry rows interleaved with them.
@@ -881,9 +884,11 @@ class Sources:
 
         Returns the rows split two ways -- `live` (what the operator still
         owes) and `settled` (the PR has left the poll's candidate set, so the
-        page is exhaust). `escalations` and `pings` are dedupe key stores and
-        must never be pruned, so this read-time split is the only place the
-        distinction can be made, and it is made from the local snapshot alone:
+        page is exhaust). `escalations` and `pings` are dedupe key stores
+        whose page rows must never be pruned (the daemon sweeps only its
+        `prompt:` telemetry family, which is never a page), so this
+        read-time split is the only place the distinction can be made, and
+        it is made from the local snapshot alone:
         a page load still costs the GitHub API nothing. A row raised less than
         INBOX_LIVE_GRACE_INTERVALS poll intervals ago is live whatever the
         snapshot says, and `live_prs` of None (no snapshot) means every row is
