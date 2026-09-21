@@ -21,6 +21,8 @@ from alissa.tools.github.revloop.loop import (
     ROUND_K_DIRECTIVE,
     STABILITY_NOTICE,
     _POST_AS_REVIEWER,
+    _REVIEWER_RULE,
+    _SHELL_RULE,
     directive_data,
 )
 
@@ -192,3 +194,40 @@ def test_a_hostile_path_cannot_break_out_of_the_notice_fence():
     assert "\u2028" not in out and "\u2029" not in out
     assert "`" not in out.split(DATA_OPEN, 1)[1].split(DATA_CLOSE)[0]
     assert "a" * (MAX_DIRECTIVE_ITEM_CHARS + 1) not in out
+
+
+# -- the shell rule and the reviewer's own line (issue #138) ------------------
+
+
+@pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE])
+def test_directive_carries_the_shell_rule_and_the_reviewers_own_line(template):
+    """Both round directives tell the reviewer, up front, never to write the
+    rm shapes the container's PreToolUse guard refuses (devloop #125's rule,
+    word for word), never to start an interactive command, and never to
+    retry a refused command -- plus the seat's own line: a reviewer never
+    pushes and never deletes."""
+    text = template.format(
+        assignment="You've been assigned TASK-1.", round=2, cap=3,
+        session="review-widgets-pr7-r2", credential="", poll=60, wait=30,
+        checks="", stability="",
+    )
+    assert _SHELL_RULE in text
+    assert _REVIEWER_RULE in text
+    assert "Never run rm/rmdir on a glob, a shell variable or a path outside your worktree" in text
+    assert "find <dir> -mindepth 1 -delete" in text and "git clean -fdx -- <path>" in text
+    assert "never start an interactive command" in text
+    assert "If a command is refused by the shell guard, change the command; do not retry it." in text
+    assert (
+        "You never push and never delete: a reviewer that needs scratch files "
+        "writes them under its own checkout and leaves them."
+    ) in text
+    # the rule sits BEFORE the closing contract, where a reviewer reads it
+    # before it starts running anything
+    assert text.index(_SHELL_RULE) < text.index("alissa tmux kill review-widgets-pr7-r2")
+
+
+def test_the_shell_rule_is_devloops_word_for_word():
+    """The two seats share one rule so the sentinel's wedge corpus reads
+    one vocabulary; a drift here is a drift in what every seat is told."""
+    assert _SHELL_RULE.startswith("You are unattended: nothing can answer an interactive prompt.")
+    assert _SHELL_RULE.endswith("change the command; do not retry it. ")

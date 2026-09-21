@@ -180,3 +180,86 @@ def test_replacing_repos_rederives_the_match_set(tmp_path):
     bows = Config.build(tmp_path, {"repos_source": REPOS_BOWS}, environ={})
     assert not bows.watches("acme/widgets")
     assert dataclasses.replace(bows, repos=("acme/widgets",)).watches("ACME/widgets")
+
+
+# -- the prompt responder's knobs (issue #138) --------------------------------
+
+
+def test_prompt_responder_knobs_default_on_with_the_documented_values(tmp_path):
+    cfg = Config.build(tmp_path, {}, environ={})
+    assert cfg.prompt_responder == "on"
+    assert cfg.prompt_quiet_seconds == 90 and cfg.prompt_quiet_floor == 90
+    assert cfg.prompt_kill_minutes == 10 and cfg.prompt_kill_seconds == 600
+    assert cfg.prompt_max_answers == 5 and cfg.prompt_answer_cap == 5
+    assert cfg.waiting_dir == "/workspace/.waiting"
+
+
+def test_prompt_responder_knobs_from_the_config_file(tmp_path):
+    cfg = Config.build(tmp_path, {
+        "prompt_responder": "observe", "prompt_quiet_seconds": 120,
+        "prompt_kill_minutes": 3, "prompt_max_answers": 2, "waiting_dir": "/tmp/w",
+    }, environ={})
+    assert cfg.prompt_responder == "observe"
+    assert cfg.prompt_quiet_seconds == 120 and cfg.prompt_kill_seconds == 180
+    assert cfg.prompt_max_answers == 2 and cfg.waiting_dir == "/tmp/w"
+
+
+@pytest.mark.parametrize("mode", ["on", "observe", "off"])
+def test_prompt_responder_accepts_its_three_modes(tmp_path, mode):
+    assert Config.build(tmp_path, {"prompt_responder": mode}, environ={}).prompt_responder == mode
+
+
+def test_prompt_responder_rejects_an_unknown_mode_by_name(tmp_path):
+    """A typo must not read as 'off' -- the one outcome an operator setting
+    this key cannot want."""
+    with pytest.raises(ValueError, match="prompt_responder must be one of"):
+        Config.build(tmp_path, {"prompt_responder": "yes"}, environ={})
+
+
+def test_prompt_knobs_below_their_floors_are_clamped_up_with_a_warning(tmp_path, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github.revloop.config"):
+        cfg = Config.build(tmp_path, {
+            "prompt_quiet_seconds": 5, "prompt_kill_minutes": 0, "prompt_max_answers": -1,
+        }, environ={})
+    assert cfg.prompt_quiet_seconds == 30 and cfg.prompt_quiet_floor == 30
+    assert cfg.prompt_kill_minutes == 1 and cfg.prompt_kill_seconds == 60
+    assert cfg.prompt_max_answers == 1 and cfg.prompt_answer_cap == 1
+    messages = [r.message for r in caplog.records]
+    assert any("prompt_quiet_seconds=5 is below the 30 s floor" in m for m in messages), messages
+    assert any("prompt_kill_minutes=0 is below the 1 min floor" in m for m in messages), messages
+    assert any("prompt_max_answers=-1 is below the floor of 1" in m for m in messages), messages
+
+
+def test_prompt_floors_apply_without_build(tmp_path):
+    """The properties the loop reads floor on their own, so a Config
+    assembled around build() (dataclasses.replace in a test) can never read
+    a window the daemon would act wrongly on."""
+    import dataclasses
+    cfg = dataclasses.replace(
+        Config.build(tmp_path, {}, environ={}), prompt_quiet_seconds=1, prompt_kill_minutes=0,
+        prompt_max_answers=0,
+    )
+    assert cfg.prompt_quiet_floor == 30
+    assert cfg.prompt_kill_seconds == 60
+    assert cfg.prompt_answer_cap == 1
+
+
+def test_waiting_dir_must_be_a_non_empty_path(tmp_path):
+    with pytest.raises(ValueError, match="waiting_dir must be a non-empty path"):
+        Config.build(tmp_path, {"waiting_dir": "   "}, environ={})
+
+
+def test_the_prompt_keys_are_known_config_keys_and_in_the_example_file(tmp_path):
+    """The renderer's skew probe reads CONFIG_KEYS, and the example file is
+    what an operator copies: both must know every knob."""
+    from pathlib import Path
+    from alissa.tools.github.revloop.config import CONFIG_KEYS
+    keys = ("prompt_responder", "prompt_quiet_seconds", "prompt_kill_minutes",
+            "prompt_max_answers", "waiting_dir")
+    for key in keys:
+        assert key in CONFIG_KEYS, key
+    example = json.loads((Path(__file__).resolve().parents[7] / "revloop.config.example.json").read_text())
+    for key in keys:
+        assert key in example, key
+    assert Config.build(tmp_path, {k: v for k, v in example.items() if not k.startswith("_")}, environ={})

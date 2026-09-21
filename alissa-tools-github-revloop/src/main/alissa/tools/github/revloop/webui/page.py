@@ -244,6 +244,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .inbox-kind { font-family: var(--mono); font-size: 0.75rem; color: var(--status-blocked); }
 .inbox-kind.cap-out { color: var(--status-cancelled); }
 .inbox-kind.stability-held { color: var(--status-cancelled); }
+.inbox-kind.prompt-page { color: var(--status-cancelled); }
 .inbox-settled > summary { cursor: pointer; list-style: none; padding: 0.55rem 0;
   border-top: 1px solid var(--surface-border); color: var(--text-muted);
   font-family: var(--mono); font-size: 0.75rem; }
@@ -340,7 +341,17 @@ _DASHBOARD = """<!doctype html>
 
 <section class="panel"><p class="overline">Operator Inbox</p><div id="inbox"></div></section>
 
+<section class="panel"><p class="overline">Waiting on a prompt (<span id="waiting-count">0</span>)
+  &middot; <span class="muted">reviewer sessions the prompt responder sees parked on a dialog</span></p>
+  <div id="waiting"></div></section>
+
 <section class="panel"><p class="overline">Sessions</p><div id="sessions"></div></section>
+
+<section class="panel" id="pane-panel" hidden>
+  <p class="overline">Pane &middot; <span id="pane-session" class="mono"></span>
+    &middot; <span id="pane-kind" class="muted"></span></p>
+  <div class="log" id="pane"></div>
+</section>
 
 <section class="panel">
   <p class="overline">Top Processes &middot; by RSS, host-wide</p>
@@ -605,12 +616,66 @@ _JS = r"""
         act('/action/kill', {session: s.name}, kill);
       });
       cell.appendChild(kill);
+      var pane = document.createElement('button');
+      pane.className = 'btn sm'; pane.textContent = 'Pane'; pane.style.marginLeft = '0.4rem';
+      pane.addEventListener('click', function () { showPane(s.name); });
+      cell.appendChild(pane);
       if (s.retry) {
         var retry = document.createElement('button');
         retry.className = 'btn sm'; retry.textContent = 'Retry'; retry.style.marginLeft = '0.4rem';
         retry.addEventListener('click', function () { act('/action/retry', s.retry, retry); });
         cell.appendChild(retry);
       }
+    });
+  }
+
+  // GET /api/pane: the last 40 lines of one session, scrubbed server-side,
+  // plus what the daemon's classifier makes of it (issue #138).
+  function showPane(name) {
+    fetch('/api/pane?session=' + encodeURIComponent(name), {headers: {'X-CSRF-Token': CSRF}})
+      .then(function (r) { return r.json(); })
+      .then(function (p) {
+        el('pane-panel').hidden = false;
+        el('pane-session').textContent = name;
+        el('pane-kind').textContent = p.kind ? 'classified: ' + p.kind : (p.error || 'working / idle');
+        el('pane').textContent = (p.lines || []).join('\n') || '(no pane)';
+        el('pane').scrollTop = el('pane').scrollHeight;
+      }).catch(function () {});
+  }
+
+  // The prompt responder's parked sessions (issue #138), with the console's
+  // bounded verbs: accept / decline / escape map to keys server-side against
+  // the dialog actually on screen -- never a keystroke from here.
+  function renderWaiting(parked) {
+    parked = parked || [];
+    el('waiting-count').textContent = parked.length;
+    if (!parked.length) { el('waiting').innerHTML = '<div class="empty">Nothing is waiting.</div>'; return; }
+    var head = '<table><thead><tr><th>Session</th><th>Kind</th><th class="num">Since</th>' +
+      '<th class="num">Answers</th><th></th></tr></thead><tbody>';
+    var now = Date.now() / 1000;
+    el('waiting').innerHTML = head + parked.map(function (w, i) {
+      return '<tr><td class="mono">' + esc(w.session) + '</td><td>' + esc(w.kind) + '</td>' +
+        '<td class="num">' + dur(Math.max(0, now - w.since)) + '</td>' +
+        '<td class="num">' + esc(w.answers) + '</td>' +
+        '<td class="num" data-wait="' + i + '"></td></tr>';
+    }).join('') + '</tbody></table>';
+    parked.forEach(function (w, i) {
+      var cell = el('waiting').querySelector('td[data-wait="' + i + '"]');
+      if (!cell) return;
+      var view = document.createElement('button');
+      view.className = 'btn sm'; view.textContent = 'Pane';
+      view.addEventListener('click', function () { showPane(w.session); });
+      cell.appendChild(view);
+      ['accept', 'decline', 'escape'].forEach(function (verb) {
+        var b = document.createElement('button');
+        b.className = 'btn sm' + (verb === 'accept' ? ' danger' : ''); b.textContent = verb;
+        b.style.marginLeft = '0.4rem';
+        b.addEventListener('click', function () {
+          if (verb === 'accept' && !confirm('Accept the dialog on ' + w.session + '?')) return;
+          act('/action/answer', {session: w.session, verb: verb}, b);
+        });
+        cell.appendChild(b);
+      });
     });
   }
 
@@ -667,6 +732,7 @@ _JS = r"""
     renderPipeline(d.pipeline);
     renderInbox(d.inbox, d.inbox_settled, d.inbox_truncated,
                 d.inbox_settled_dropped);
+    renderWaiting(d.waiting);
     renderSessions(d.sessions);
     renderTopProcs(d.top_procs);
     renderLog(d.log);

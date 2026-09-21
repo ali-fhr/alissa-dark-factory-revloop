@@ -57,6 +57,7 @@ from typing import Callable
 from ..alissa import REVIEW_SESSION_PREFIX
 from ..config import Config
 from ..loop import (
+    ESCALATION_PROMPT_PAGE,
     ESCALATION_STABILITY,
     ESCALATION_STALLED,
     STALE_ROUND_SECONDS,
@@ -96,9 +97,19 @@ INBOX_STALLED = "stalled"
 # enough?", a stability hold says "the product has not moved since <sha>", and
 # the two shas are the whole of what makes that checkable.
 INBOX_STABILITY = "stability-held"
+# The prompt responder's account-level page (issue #138): an expired login, a
+# hit usage limit or an empty credit balance on a reviewer's screen. Its own
+# kind: the remedy is the ACCOUNT, and while it stands the daemon holds every
+# new spawn. The responder's per-act `prompt:` rows are telemetry (the
+# `waiting` list is their surface) and never reach the inbox -- the ping reads
+# below narrow by prefix in SQL, so they are never even read here.
+INBOX_PROMPT_PAGE = "prompt-page"
 
 # How many INBOX ITEMS reach the payload. `escalations` and `pings` are never
-# pruned (their rows are the daemon's dedupe keys), so the console bounds its
+# pruned as tables (their rows are the daemon's dedupe keys; the one family
+# that is telemetry rather than a key, the responder's per-act `prompt:`
+# rows, is swept by the daemon once its session is gone and never reaches
+# this inbox), so the console bounds its
 # own view the way SPARK_POINTS bounds the snapshot tail -- an inbox that never
 # clears stops being an inbox. The ping read applies the kind filter in SQL, so
 # this counts pages and not the telemetry rows interleaved with them.
@@ -129,6 +140,7 @@ INBOX_LIVE_GRACE_INTERVALS = 2
 # it in SQL; `_inbox` re-checks it to split the session out of the kind.
 PING_STALLED_PREFIX = f"{ESCALATION_STALLED}:"
 PING_STABILITY_PREFIX = f"{ESCALATION_STABILITY}:"
+PING_PROMPT_PAGE_PREFIX = f"{ESCALATION_PROMPT_PAGE}:"
 
 # retry_now outcomes. Distinguishing "no row" from "the write was lost" keeps
 # the audit line honest: both degrade to a failed action, only one means the
@@ -153,6 +165,19 @@ def _pr_key(repo: object, number: object) -> "tuple[str, int] | None":
         return (str(repo), int(number))
     except ValueError:
         return None
+
+
+def parse_prompt_page_kind(kind: str) -> "tuple[str, str] | None":
+    """`prompt-page:<kind>@<session>#<bucket>` -> (kind, session), or None
+    for any other kind (issue #138)."""
+    if not kind.startswith(PING_PROMPT_PAGE_PREFIX):
+        return None
+    rest = kind[len(PING_PROMPT_PAGE_PREFIX):]
+    prompt_kind, sep, tail = rest.partition("@")
+    if not sep or not prompt_kind:
+        return None
+    session = tail.rsplit("#", 1)[0]
+    return (prompt_kind, session) if session else None
 
 
 def is_managed(name: "str | None") -> bool:
@@ -304,7 +329,7 @@ class Sources:
         it is a lookup table read by key, not a display list bounded by recency
         -- `sessions` reads it for exactly the session names it renders."""
         empty: "dict[str, list]" = {
-            "escalations": [], "pings": [], "stability_pings": []
+            "escalations": [], "pings": [], "stability_pings": [], "prompt_pages": []
         }
         return self._read_state(empty, lambda st: {
             "escalations": st.read_escalations(INBOX_READ_LIMIT),
@@ -318,7 +343,30 @@ class Sources:
             "stability_pings": st.read_pings(
                 INBOX_READ_LIMIT, kind_prefix=PING_STABILITY_PREFIX
             ),
+            # The prompt responder's account-level pages (issue #138); its
+            # per-act `prompt:` telemetry rows are a different prefix and are
+            # never read here.
+            "prompt_pages": st.read_pings(
+                INBOX_READ_LIMIT, kind_prefix=PING_PROMPT_PAGE_PREFIX
+            ),
         })
+
+    def waiting(self) -> "list[dict]":
+        """The sessions the daemon's prompt responder currently sees parked
+        on a prompt (issue #138): `{session, kind, since, sightings,
+        answers}`, oldest first, off the `prompt_sightings` ledger. The
+        responder writes it; the console only reads."""
+        rows = self._read_state([], lambda st: st.read_prompt_sightings())
+        return [
+            {
+                "session": row["session"],
+                "kind": row["kind"],
+                "since": int(row["first_seen"]),
+                "sightings": int(row["sightings"]),
+                "answers": int(row["answers"]),
+            }
+            for row in rows
+        ]
 
     # -- local process state -----------------------------------------------
 
@@ -695,6 +743,10 @@ class Sources:
             # older rows this payload never looked at. The panel refuses to
             # claim `Inbox clear.` on a window it knows was truncated.
             "inbox_truncated": inbox["truncated"],
+            # The prompt responder's parked sessions (issue #138) -- the
+            # surface of its per-act telemetry, which the inbox above never
+            # carries.
+            "waiting": self.waiting(),
             "sessions": sessions,
             # Host-wide, not per session: when the memory tile says the charge
             # IS resident, this is what names the holder.
@@ -725,6 +777,7 @@ class Sources:
             ledgers["pings"],
             ledgers.get("stability_pings", []),
             live_prs=self._live_prs(latest, items),
+            prompt_pages=ledgers.get("prompt_pages", []),
         )
 
     def _pipeline(self, latest: "dict | None") -> "list[dict]":
@@ -800,9 +853,16 @@ class Sources:
         pings: "list[dict]",
         stability_pings: "list[dict] | None" = None,
         live_prs: "set[tuple[str, int]] | None" = None,
+        prompt_pages: "list[dict] | None" = None,
     ) -> dict:
         """The operator inbox: everything the daemon paged a human about, in
         one list, newest first.
+
+        `prompt_pages` (issue #138) are the prompt responder's account-level
+        pages -- `prompt-page:<kind>@<session>#<bucket>` ping rows, one per
+        kind per six hours, anchored on the PR of the session that showed
+        the notice. The responder's per-act `prompt:` rows are a different
+        prefix and are never read into any of these lists.
 
         Two tables feed it, because the daemon pages twice for different
         reasons: `escalations` is the CR9 cap-out (terminal for that head --
@@ -824,9 +884,11 @@ class Sources:
 
         Returns the rows split two ways -- `live` (what the operator still
         owes) and `settled` (the PR has left the poll's candidate set, so the
-        page is exhaust). `escalations` and `pings` are dedupe key stores and
-        must never be pruned, so this read-time split is the only place the
-        distinction can be made, and it is made from the local snapshot alone:
+        page is exhaust). `escalations` and `pings` are dedupe key stores
+        whose page rows must never be pruned (the daemon sweeps only its
+        `prompt:` telemetry family, which is never a page), so this
+        read-time split is the only place the distinction can be made, and
+        it is made from the local snapshot alone:
         a page load still costs the GitHub API nothing. A row raised less than
         INBOX_LIVE_GRACE_INTERVALS poll intervals ago is live whatever the
         snapshot says, and `live_prs` of None (no snapshot) means every row is
@@ -853,7 +915,7 @@ class Sources:
         grace = INBOX_LIVE_GRACE_INTERVALS * self.config.poll_interval
         truncated = any(
             len(rows) >= INBOX_READ_LIMIT
-            for rows in (escalations, pings, stability_pings or [])
+            for rows in (escalations, pings, stability_pings or [], prompt_pages or [])
         )
         out: list[dict] = []
         for row in escalations:
@@ -899,6 +961,23 @@ class Sources:
                     # the product stopped moving at, then the head it is still
                     # at. One sha would say "held" without saying since when.
                     "detail": f"{base[:8]}…{head[:8]}",
+                    "age_seconds": max(0, now - int(row["pinged_at"])),
+                    "url": f"https://github.com/{row['repo']}/pull/{row['number']}",
+                }
+            )
+        for row in prompt_pages or []:
+            page = parse_prompt_page_kind(str(row["kind"]))
+            if page is None:
+                continue
+            kind, session = page
+            out.append(
+                {
+                    "kind": INBOX_PROMPT_PAGE,
+                    "repo_slug": row["repo"],
+                    "number": row["number"],
+                    # The notice and the session that showed it: the remedy
+                    # is the account, the session is where to look.
+                    "detail": f"{kind} on {session}",
                     "age_seconds": max(0, now - int(row["pinged_at"])),
                     "url": f"https://github.com/{row['repo']}/pull/{row['number']}",
                 }

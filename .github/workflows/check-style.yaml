@@ -12,6 +12,9 @@ jobs:
       matrix:
         path:
           - alissa-tools-github-revloop
+          # The image ships Python (the Claude Code hooks, issue #138); the
+          # same line length applies to them (PR #139 round 1, nit).
+          - docker/claude/hooks
     name: Python Style Check for ${{ matrix.path }}
     runs-on: ubuntu-latest
     steps:

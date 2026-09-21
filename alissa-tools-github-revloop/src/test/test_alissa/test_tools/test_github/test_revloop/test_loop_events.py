@@ -791,3 +791,59 @@ def test_a_cleartext_or_schemeless_endpoint_is_refused_at_load(tmp_path, bad):
 def test_https_and_loopback_http_endpoints_are_accepted(tmp_path, ok):
     config = Config.build(tmp_path, {"alissa_endpoint": ok}, environ={})
     assert config.alissa_endpoint == ok
+
+
+# -- the prompt responder's rows (issue #138) --------------------------------
+
+
+def _ping_event(ledger, kind, number=7):
+    ledger.record_ping(REPO, number, kind)
+    events = [e for e in derive_events(ledger) if e["kind"].startswith("escalation.prompt")]
+    assert len(events) == 1, events
+    return events[0]
+
+
+def test_a_prompt_row_derives_escalation_prompt_with_kind_action_and_session(ledger):
+    raw = "prompt:dangerous_rm:accept@review-widgets-pr7-r1-abcdef#1758300000"
+    event = _ping_event(ledger, raw)
+    assert event["kind"] == "escalation.prompt"
+    assert event["session"] == "review-widgets-pr7-r1-abcdef"
+    assert event["prNumber"] == 7 and event["repo"] == REPO
+    assert event["data"] == {
+        "kind": "dangerous_rm", "action": "accept",
+        "session": "review-widgets-pr7-r1-abcdef", "ledgerKind": raw,
+    }
+    assert event["reason"] == "dangerous_rm → accept"
+    assert event["dedupeKey"] == f"revloop:escalation.prompt:{REPO}:7:{raw}"
+    assert event["seat"] == "revloop"
+
+
+def test_a_prompt_page_row_derives_escalation_prompt_page(ledger):
+    raw = "prompt-page:login_expired@review-pr-7#81234"
+    event = _ping_event(ledger, raw)
+    assert event["kind"] == "escalation.prompt_page"
+    assert event["prNumber"] == 7
+    assert event["data"]["action"] == "page" and event["data"]["kind"] == "login_expired"
+    assert event["session"] == "review-pr-7"
+    assert "operator paged" in event["reason"]
+
+
+def test_prompt_events_never_carry_pane_text(ledger):
+    """The kind grammar admits no free text: only the vocabulary tokens,
+    the session name and a sequence number reach the event."""
+    raw = "prompt:dangerous_rm:accept@review-widgets-pr7-r1-abcdef#1"
+    event = _ping_event(ledger, raw)
+    assert "Dangerous rm operation" not in json.dumps(event)
+
+
+def test_a_malformed_prompt_kind_derives_nothing(ledger):
+    ledger.record_ping(REPO, 7, "prompt:garbage")
+    ledger.record_ping(REPO, 7, "prompt-page:no-session")
+    assert [e for e in derive_events(ledger) if e["kind"].startswith("escalation.prompt")] == []
+
+
+def test_prompt_prefixes_match_the_loops_own_constants():
+    assert loop_events.PROMPT_PREFIX == loop_module.ESCALATION_PROMPT + ":"
+    assert loop_events.PROMPT_PAGE_PREFIX == loop_module.ESCALATION_PROMPT_PAGE + ":"
+    assert loop_module.prompt_event_kind("trust", "accept", "review-pr-7", 5) == "prompt:trust:accept@review-pr-7#5"
+    assert loop_module.prompt_page_kind("usage_limit", "review-pr-7", 3) == "prompt-page:usage_limit@review-pr-7#3"

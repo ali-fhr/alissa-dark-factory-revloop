@@ -131,6 +131,27 @@ CREATE TABLE IF NOT EXISTS pings (
     PRIMARY KEY (repo, number, kind)
 );
 
+-- The prompt responder's per-session ladder (issue #138; devloop #127's
+-- table, same columns). One row per reviewer session the responder has seen
+-- parked: the SAME pane (kind and hash unchanged) one poll later bumps
+-- `sightings` and keeps `first_seen` -- that is the unknown-dialog ladder's
+-- clock and the account-hold expiry's; a different pane starts a new episode.
+-- `answers` is the session's LIFETIME keystroke count (the per-session cap),
+-- kept when the ladder resets (`kind` = '') and dropped only when the session
+-- leaves the roster.
+CREATE TABLE IF NOT EXISTS prompt_sightings (
+    session     TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    pane_hash   TEXT    NOT NULL,
+    repo_slug   TEXT    NOT NULL,
+    number      INTEGER NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    sightings   INTEGER NOT NULL,
+    answers     INTEGER NOT NULL,
+    PRIMARY KEY (session)
+);
+
 CREATE TABLE IF NOT EXISTS verdict_posts (
     repo          TEXT    NOT NULL,
     number        INTEGER NOT NULL,
@@ -758,6 +779,176 @@ class State:
             (repo, number, kind, int(time.time())),
         )
         self._db.commit()
+
+    def prune_pings(self, kind_prefix: str, keep: "Callable[[str], bool]") -> int:
+        """Drop the rows of ONE ping family (a literal prefix, matched like
+        `read_pings`) that `keep` rejects. Returns how many went (0 when the
+        store refused the write).
+
+        `pings` is otherwise never pruned, and that is right for every family
+        the daemon reads back BY KEY (`stalled:`, `activity-deferred:`,
+        `stability:`, `checks-hold:`, `prompt-page:`, ...): those rows are
+        the proof an episode was already raised, and their key space is
+        bounded by the workload. The prompt responder's per-act `prompt:`
+        rows are the one family that is NOT a key -- a clock is folded in so
+        every act is its own row, and nothing reads one back (issue #138;
+        PR #139 round 1). Its owner passes the test a row must pass to stay
+        (the session it names is still in the roster), once per pass. A
+        predicate rather than a keep-set because the subject is folded into
+        the kind, and parsing it here would teach this module the daemon's
+        grammar: kinds are free-form strings, exactly as `record_ping` takes
+        them. The SELECT rides inside the telemetry write like
+        `prune_prompt_sightings`, and a pass with nothing to drop executes
+        no write."""
+        dropped = 0
+
+        def write() -> None:
+            nonlocal dropped
+            rows = self._db.execute(
+                "SELECT repo, number, kind FROM pings WHERE substr(kind, 1, ?) = ?",
+                (len(kind_prefix), kind_prefix),
+            ).fetchall()
+            gone = [row for row in rows if not keep(str(row["kind"]))]
+            if not gone:
+                return
+            for row in gone:
+                self._db.execute(
+                    "DELETE FROM pings WHERE repo=? AND number=? AND kind=?",
+                    (row["repo"], row["number"], row["kind"]),
+                )
+            self._db.commit()
+            dropped = len(gone)
+
+        self._write_telemetry(write, f"prune_pings({kind_prefix}*)")
+        return dropped
+
+    def ping_seen_since(self, kind_prefix: str, since: int) -> bool:
+        """Whether ANY ping of a kind family (by prefix) was raised at or
+        after `since` (unix seconds). The prompt responder's once-per-kind-
+        per-window page dedupe (issue #138): the row carries the session and
+        the window bucket for the loop event's sake, so the gate has to ask
+        by family and age rather than by exact key. Matched with `substr`
+        like `read_pings`: the prefix is a literal."""
+        row = self._db.execute(
+            "SELECT 1 FROM pings WHERE substr(kind, 1, ?) = ? AND pinged_at >= ? LIMIT 1",
+            (len(kind_prefix), kind_prefix, int(since)),
+        ).fetchone()
+        return row is not None
+
+    # -- prompt sightings (the responder's per-session ladder) -------------
+
+    def prompt_sighting(self, session: str) -> "dict | None":
+        """The responder's row for one session, or None when it has never
+        seen this session parked. A row whose `kind` is '' is a session the
+        responder answered (or watched move on): its `answers` count is kept
+        -- the per-session cap is a lifetime cap -- and its ladder is reset."""
+        row = self._db.execute(
+            "SELECT session, kind, pane_hash, repo_slug, number, first_seen, "
+            "last_seen, sightings, answers FROM prompt_sightings WHERE session=?",
+            (session,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_prompt_sighting(
+        self, session: str, kind: str, pane_hash: str, *,
+        repo_slug: str, number: int, answered: bool,
+    ) -> "dict":
+        """Upsert one sighting and return the row as it now stands.
+
+        The SAME pane (kind and hash unchanged) one poll later bumps
+        `sightings` and keeps `first_seen` -- that is the unknown-dialog
+        ladder's clock; a different pane starts a new episode (sightings 1,
+        first_seen now). `answered` bumps the lifetime `answers` count
+        whether or not the pane moved: the cap counts keystrokes SENT, since
+        an answer that did not land is the divergence it exists to stop.
+
+        TELEMETRY-CLASS (see _write_telemetry): a row that does not land
+        costs one rung of the ladder -- the next poll reads the episode as
+        new -- and never a keystroke the policy did not decide."""
+        ts = int(time.time())
+        state: "dict[str, dict]" = {}
+
+        def write() -> None:
+            row = self._db.execute(
+                "SELECT kind, pane_hash, first_seen, sightings, answers "
+                "FROM prompt_sightings WHERE session=?", (session,),
+            ).fetchone()
+            same = row is not None and row["kind"] == kind and row["pane_hash"] == pane_hash
+            first_seen = int(row["first_seen"]) if same else ts
+            sightings = (int(row["sightings"]) + 1) if same else 1
+            answers = (int(row["answers"]) if row is not None else 0) + (1 if answered else 0)
+            self._db.execute(
+                "INSERT INTO prompt_sightings (session, kind, pane_hash, repo_slug, "
+                "number, first_seen, last_seen, sightings, answers) "
+                "VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(session) DO UPDATE SET kind=excluded.kind, "
+                "pane_hash=excluded.pane_hash, repo_slug=excluded.repo_slug, "
+                "number=excluded.number, first_seen=excluded.first_seen, "
+                "last_seen=excluded.last_seen, sightings=excluded.sightings, "
+                "answers=excluded.answers",
+                (session, kind, pane_hash, repo_slug, number, first_seen, ts,
+                 sightings, answers),
+            )
+            self._db.commit()
+            state["row"] = {
+                "session": session, "kind": kind, "pane_hash": pane_hash,
+                "repo_slug": repo_slug, "number": number,
+                "first_seen": first_seen, "last_seen": ts,
+                "sightings": sightings, "answers": answers,
+            }
+
+        self._write_telemetry(write, f"record_prompt_sighting({session}, {kind})")
+        return state.get("row") or {
+            "session": session, "kind": kind, "pane_hash": pane_hash,
+            "repo_slug": repo_slug, "number": number, "first_seen": ts,
+            "last_seen": ts, "sightings": 1, "answers": 1 if answered else 0,
+        }
+
+    def clear_prompt_sighting(self, session: str) -> None:
+        """The session moved on (its pane is working, idle, or changed after
+        an answer): reset the ladder, keep the lifetime `answers` count.
+        A no-op for a session with no row."""
+
+        def write() -> None:
+            self._db.execute(
+                "UPDATE prompt_sightings SET kind='', pane_hash='', sightings=0, "
+                "last_seen=? WHERE session=? AND kind<>''",
+                (int(time.time()), session),
+            )
+            self._db.commit()
+
+        self._write_telemetry(write, f"clear_prompt_sighting({session})")
+
+    def prune_prompt_sightings(self, keep: "set[str]") -> int:
+        """Drop the rows of sessions no longer in the roster (`keep` is the
+        pass's live session names). A session that is gone has no ladder
+        and no cap to carry; a name that comes back is a new round with a
+        new nonce anyway. Returns how many rows went."""
+        dropped = 0
+
+        def write() -> None:
+            nonlocal dropped
+            rows = self._db.execute("SELECT session FROM prompt_sightings").fetchall()
+            gone = [row["session"] for row in rows if row["session"] not in keep]
+            if not gone:
+                return
+            for name in gone:
+                self._db.execute("DELETE FROM prompt_sightings WHERE session=?", (name,))
+            self._db.commit()
+            dropped = len(gone)
+
+        self._write_telemetry(write, "prune_prompt_sightings")
+        return dropped
+
+    def read_prompt_sightings(self) -> "list[dict]":
+        """Every session currently parked on a prompt (kind non-empty),
+        oldest first -- the console's `waiting` list."""
+        rows = self._db.execute(
+            "SELECT session, kind, pane_hash, repo_slug, number, first_seen, "
+            "last_seen, sightings, answers FROM prompt_sightings "
+            "WHERE kind<>'' ORDER BY first_seen ASC, session ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_verdict(
         self, repo: str, number: int, head_sha: str, posted_at: int,
@@ -1687,9 +1878,12 @@ class State:
     #
     # Rows come back newest-first, and every reader takes the same optional
     # `limit` read_snapshots does. Unlike poll_snapshots, `escalations` and
-    # `pings` are NEVER pruned (they are per-head / per-episode dedupe keys the
-    # daemon must keep), so a reader that returned all of them would grow an
-    # operator inbox that never clears. Bounding belongs here, in SQL, not in
+    # `pings` are never pruned as tables (they are per-head / per-episode
+    # dedupe keys the daemon must keep -- the one exception is the prompt
+    # responder's per-act `prompt:` family, telemetry that `prune_pings`
+    # drops once its session has left the roster), so a reader that returned
+    # all of them would grow an operator inbox that never clears. Bounding
+    # belongs here, in SQL, not in
     # the caller's slice -- and, for `pings`, AFTER the kind filter rather than
     # before it, or the noisier telemetry kind evicts the operator pages.
     #

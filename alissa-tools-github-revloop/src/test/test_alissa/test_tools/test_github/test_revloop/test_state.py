@@ -10,7 +10,9 @@ that predates it.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import time
 
 import pytest
 
@@ -935,3 +937,126 @@ def test_the_stability_table_is_added_to_a_database_that_predates_it(tmp_path):
     with State(path) as st:
         st.record_stability_notice(REPO, 7, 4, 3, 0)
         assert st.stability_notice(REPO, 7)["rc_rounds"] == 3
+
+
+# -- prompt sightings and the ping family gate (issue #138) -------------------
+
+
+def test_prompt_sighting_ladder_counts_the_same_pane_and_resets_on_a_new_one(tmp_path):
+    st = State(tmp_path / "s.db")
+    assert st.prompt_sighting("review-widgets-pr7-r1-abcdef") is None
+
+    first = st.record_prompt_sighting(
+        "review-widgets-pr7-r1-abcdef", "unknown_dialog", "h1",
+        repo_slug="acme/widgets", number=7, answered=False,
+    )
+    assert (first["sightings"], first["answers"]) == (1, 0)
+    second = st.record_prompt_sighting(
+        "review-widgets-pr7-r1-abcdef", "unknown_dialog", "h1",
+        repo_slug="acme/widgets", number=7, answered=True,
+    )
+    assert (second["sightings"], second["answers"]) == (2, 1)
+    assert second["first_seen"] == first["first_seen"], "the same pane keeps its clock"
+
+    other = st.record_prompt_sighting(
+        "review-widgets-pr7-r1-abcdef", "permission", "h2",
+        repo_slug="acme/widgets", number=7, answered=True,
+    )
+    assert other["sightings"] == 1, "a different pane is a new episode"
+    assert other["answers"] == 2, "the answer count is per session, for life"
+    assert st.read_prompt_sightings()[0]["kind"] == "permission"
+
+
+def test_clear_prompt_sighting_keeps_the_answer_count_and_leaves_the_waiting_list(tmp_path):
+    st = State(tmp_path / "s.db")
+    st.record_prompt_sighting("s", "permission", "h", repo_slug="a/b", number=1, answered=True)
+    st.clear_prompt_sighting("s")
+    row = st.prompt_sighting("s")
+    assert row["kind"] == "" and row["sightings"] == 0 and row["answers"] == 1
+    assert st.read_prompt_sightings() == []
+    st.clear_prompt_sighting("never-seen")  # a no-op, never an error
+
+
+def test_prune_prompt_sightings_drops_sessions_that_left_the_roster(tmp_path):
+    st = State(tmp_path / "s.db")
+    st.record_prompt_sighting("gone", "permission", "h", repo_slug="a/b", number=1, answered=False)
+    st.record_prompt_sighting("live", "permission", "h", repo_slug="a/b", number=2, answered=False)
+    assert st.prune_prompt_sightings({"live"}) == 1
+    assert st.prompt_sighting("gone") is None and st.prompt_sighting("live") is not None
+    assert st.prune_prompt_sightings({"live"}) == 0
+
+
+def test_prune_pings_drops_one_family_by_predicate_and_nothing_else(tmp_path):
+    """The `prompt:` family is the one telemetry family in `pings`
+    (PR #139 round 1): its owner passes the test a row must pass to stay;
+    the other families -- dedupe keys -- are never touched, whatever the
+    predicate says about them."""
+    st = State(tmp_path / "s.db")
+    st.record_ping("a/b", 1, "prompt:dangerous_rm:accept@live#10")
+    st.record_ping("a/b", 1, "prompt:dangerous_rm:accept@live#20")
+    st.record_ping("a/b", 2, "prompt:unknown:kill@gone#30")
+    st.record_ping("a/b", 2, "prompt-page:login_expired@gone#4")
+    st.record_ping("a/b", 3, "stalled:gone")
+    assert st.prune_pings("prompt:", lambda kind: "@live#" in kind) == 1
+    assert sorted(r["kind"] for r in st.read_pings()) == [
+        "prompt-page:login_expired@gone#4",
+        "prompt:dangerous_rm:accept@live#10",
+        "prompt:dangerous_rm:accept@live#20",
+        "stalled:gone",
+    ]
+    assert st.prune_pings("prompt:", lambda kind: "@live#" in kind) == 0
+    assert st.prune_pings("prompt:", lambda kind: False) == 2
+    assert sorted(r["kind"] for r in st.read_pings()) == ["prompt-page:login_expired@gone#4", "stalled:gone"]
+    assert st.prune_pings("nothing:", lambda kind: False) == 0
+
+
+def test_prompt_sightings_table_is_added_to_an_older_db(tmp_path):
+    """The schema is `CREATE TABLE IF NOT EXISTS`, so a state.db that predates
+    the responder gains the table on its next open."""
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE spawns (repo TEXT, number INTEGER, round INTEGER, head_sha TEXT, "
+                "session TEXT PRIMARY KEY, task_ref TEXT, spawned_at INTEGER)")
+    con.commit()
+    con.close()
+    with State(path) as st:
+        assert st.read_prompt_sightings() == []
+        st.record_prompt_sighting("s", "trust", "h", repo_slug="a/b", number=1, answered=False)
+        assert st.prompt_sighting("s")["kind"] == "trust"
+
+
+def test_ping_seen_since_asks_by_kind_family_and_age(tmp_path):
+    st = State(tmp_path / "s.db")
+    st.record_ping("acme/widgets", 7, "prompt-page:login_expired@review-x#1")
+    now = int(time.time())
+    assert st.ping_seen_since("prompt-page:login_expired@", now - 60)
+    assert not st.ping_seen_since("prompt-page:login_expired@", now + 60)
+    assert not st.ping_seen_since("prompt-page:usage_limit@", now - 60)
+    assert not st.ping_seen_since("prompt-page:login", now + 60)
+    # a literal prefix: `_` and `%` are not wildcards
+    st.record_ping("acme/widgets", 7, "prompt-pageXlogin_expired@review-y#1")
+    assert not st.ping_seen_since("prompt-page:usage_limit@", now - 60)
+
+
+def test_record_prompt_sighting_is_telemetry_class(tmp_path, monkeypatch, caplog):
+    """A ladder row that cannot be written is one WARNING and a fallback
+    row, never an exception: the responder's keystroke was already
+    decided, and a lost rung costs one poll of the ladder."""
+    st = State(tmp_path / "s.db")
+
+    class Broken:
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(st, "_db", Broken())
+    monkeypatch.setattr(st, "_reconnect", lambda: False)
+    with caplog.at_level(logging.WARNING):
+        row = st.record_prompt_sighting("s", "permission", "h", repo_slug="a/b", number=1, answered=True)
+    assert row["sightings"] == 1 and row["answers"] == 1
+    assert "record_prompt_sighting(s, permission) failed" in caplog.text

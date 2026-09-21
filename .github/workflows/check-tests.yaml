@@ -33,3 +33,22 @@ jobs:
         run: |
           bash tests-unit.sh ${{ matrix.path }}
           bash tests-coverage.sh ${{ matrix.path }}
+
+  # The Claude Code hooks the image ships (docker/claude/hooks, issue #138 —
+  # devloop #125's guard and marker, same deny/pass table): the rm guard's
+  # deny/pass table, its fail-open paths and time budget, and the
+  # waiting-marker pair. Plain python3 + bash, no docker — so it runs here
+  # next to the unit tests rather than inside the image-contract job, and a
+  # red table never waits on a minutes-long image build to be seen.
+  hooks-guard:
+    name: Hooks table (guard-shell deny/pass, waiting marker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run the hooks table
+        run: bash docker/claude/tests-hooks-guard.sh

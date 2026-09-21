@@ -288,6 +288,12 @@ welcome / theme / bypass-mode / **"trust this folder?"** dialog (`"stuck — wai
 at a prompt"`); the trust dialog in particular is **not** suppressed by
 `--dangerously-skip-permissions`.
 
+Even with the bypass flag, an `rm` on a glob, a variable or a path outside
+the reviewer's checkout still prompts — the image's `PreToolUse` guard
+refuses those shapes before the dialog exists, and the daemon's prompt
+responder answers whatever still appears; see *The shell guard, the waiting
+marker and the prompt responder* under Configuration.
+
 **The bows-mode trust rule (issue #136).** The entrypoint can only trust hubs
 it can *name* at boot: `{root}/{basename}` and `{root}/{basename}/main` for
 every `ALISSA_REVIEW_REPOS` entry, plus every hub (root, `main/`, any
@@ -437,6 +443,12 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_TASK_LIST_SELF_SCOPE` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` narrows `alissa task list` to this actor's own rows (`--self`), dropping the sponsor's corpus; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. Off by default on measured evidence: it saves ~4% of the payload, and a small minority of review tasks on the live fleet are owned by another actor — one the list cannot see is a round the daemon cannot count. Set it only where every review task is created by this daemon's own reviewer sessions. The other narrowings (status filter, digest view) are probed from the installed CLI and need no variable. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.18.0` |
 | `ALISSA_REV_LOOP_EVENTS_ENABLED` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` makes the daemon push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` once per poll pass — one idempotent, ledger-derived batch, best-effort and never fatal, authenticated with the container's existing `ALISSA_API_TOKEN`; `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false`. The daemon library also reads this exact variable directly and it **wins over the rendered config and the CLI flags**, so the render can never contradict the env. Off by default: telemetry is an outbound write and an image upgrade must not start posting on its own. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.28.0` |
 | `ALISSA_REV_FLEET_VITALS_ENABLED` | *(unset ⇒ library default `false`)* | `1`/`true`/`yes`/`on` makes the daemon push **one fleet-vitals snapshot** of its live state (heartbeat, poll durations, the reviewer-session roster with rounds, GitHub rate, cgroup memory, spawn-gate queue depth, the live operator inbox) to Studio's `POST /v1/loop/fleet-vitals` at the end of every completed poll pass, after the loop-events push — so a Factory with **no** `FACTORY_REVLOOP_URL` still renders this seat's card, with `ALISSA_UI_ENABLED` unset. Built in-process from the console's own builders (the sidecar need not run); best-effort and never fatal (one WARNING per failed pass; a `403 not_activated` warns once per boot with the activate URL); nothing sent in dry-run; authenticated with the container's existing `ALISSA_API_TOKEN`. `0`/`false`/`no`/`off` is the explicit opposite and **anything else is refused** rather than rendered as `false` — on every pin, before the skew gate. The daemon library also reads this exact variable directly and it **wins over the rendered config and the CLI flags**. Off by default: an outbound write, and an image upgrade must not start posting on its own. **pass-through** — unset ⇒ library default. Needs `REVLOOP_VERSION >= 0.30.0`; on an older pin the renderer drops the key with a WARN naming the re-pin |
+| `ALISSA_PROMPT_RESPONDER` | *daemon default* (currently `on`) | the **prompt responder** (issue #138): `on` answers a reviewer session parked on a Claude Code dialog within one poll from the policy table; `observe` classifies and narrates but sends no key, kills nothing and pages nobody; `off` never reads a pane. Passed through as a string; the daemon refuses any other spelling by name at load (a typo must not read as `off`). **pass-through, runtime env** (not a build ARG — see *The shell guard, the waiting marker and the prompt responder*). Needs `REVLOOP_VERSION >= 0.31.3`; on an older pin the renderer drops the key with a WARN naming the re-pin |
+| `ALISSA_PROMPT_QUIET_SECONDS` | *daemon default* (currently 90) | how long a reviewer session must have been quiet (the roster's `lastActivity`) before the responder reads its pane **without** a waiting marker; floored at 30 by the daemon. **pass-through, runtime env**. Needs `REVLOOP_VERSION >= 0.31.3` |
+| `ALISSA_PROMPT_KILL_MINUTES` | *daemon default* (currently 10) | the unknown-dialog ladder's last rung: a dialog no signature knows is waited out one poll, dismissed with Escape on its second sighting, and after this many minutes still on screen the session is killed so the stale-round edge re-enters the same round; floored at 1. **pass-through, runtime env**. Needs `REVLOOP_VERSION >= 0.31.3` |
+| `ALISSA_PROMPT_MAX_ANSWERS` | *daemon default* (currently 5) | the per-session answer cap: after this many keystroke answers the session is killed and its round re-entered — a reviewer that keeps producing prompts is diverging; floored at 1. **pass-through, runtime env**. Needs `REVLOOP_VERSION >= 0.31.3` |
+| `ALISSA_WAITING_DIR` | `/workspace/.waiting` | where the image's `note-waiting.py` hook leaves the `<tmux session>.json` "waiting for input" markers **and** where the daemon reads them (the renderer writes the same value into `waiting_dir`). Read at run time by the hooks; **pass-through** to the daemon. Needs `REVLOOP_VERSION >= 0.31.3` for the daemon half |
+| `ALISSA_SHELL_GUARD` | *(unset — **on**)* | `off` / `0` / `false` / `no` skips the rm guard's `PreToolUse` registration **and removes one a previous boot wrote** into the persisted `$CLAUDE_CONFIG_DIR/settings.json` — the rollback lever, effective on the next boot. Runtime env only, deliberately not a build ARG: a baked `off` would be a fleet-wide rollback nobody can see in a running container |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
 | `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
@@ -460,7 +472,10 @@ The optional tuning knobs `ALISSA_POLL_INTERVAL`, `ALISSA_ROUND_CAP`,
 `ALISSA_TASK_LIST_SELF_SCOPE`, `ALISSA_REV_LOOP_EVENTS_ENABLED`,
 `ALISSA_REV_FLEET_VITALS_ENABLED`,
 `ALISSA_REVIEW_REPOS_SOURCE`, `ALISSA_REVIEW_BOWS_REFRESH_POLLS`,
-`ALISSA_REVIEW_BOW_OWNERS` and `ALISSA_REVIEW_OPERATORS` are
+`ALISSA_REVIEW_BOW_OWNERS`, `ALISSA_REVIEW_OPERATORS`,
+`ALISSA_PROMPT_RESPONDER`, `ALISSA_PROMPT_QUIET_SECONDS`,
+`ALISSA_PROMPT_KILL_MINUTES`, `ALISSA_PROMPT_MAX_ANSWERS` and
+`ALISSA_WAITING_DIR` are
 **pass-through**: their build `ARG` default is empty, and when they are unset the
 entrypoint **omits the key entirely** from the generated `revloop.config.json`
 so the daemon library applies its own current default. There is no hidden
@@ -616,6 +631,73 @@ an optimization, and only one of those may delay a boot.
 If you turn this off (`ALISSA_WORKSPACE_PRUNE=0`), nothing else reclaims the
 volume; plan on pruning by hand.
 
+### The shell guard, the waiting marker and the prompt responder: `ALISSA_SHELL_GUARD`, `ALISSA_WAITING_DIR`, `ALISSA_PROMPT_*` (runtime env)
+
+`--dangerously-skip-permissions` does not silence everything (issue #138;
+devloop's #125 and #127, ported to this seat). Claude Code's **critical-path
+removal check** — `rm`/`rmdir` on a glob, an unexpanded variable, a command
+substitution, `~`, `/`, the working directory or a parent of it — prompts
+*"Dangerous rm operation on statically-unresolvable target … Do you want to
+proceed?"* in **every** mode, and neither a `permissions.allow` rule nor a
+`PreToolUse` hook answering `allow` can approve it. A reviewer parked on it
+reads alive forever (the sentinel's wedge corpus records
+`wedge-dialog:revloop:pr808-r10`). Two closures, both devloop's:
+
+**Prevention.** A hook *can* **deny with a reason**: Claude reads the reason
+and retries with a safe command, and no dialog is ever raised. So the image
+ships three Claude Code hooks at `/usr/local/share/alissa/hooks/` (stdlib
+python, executable, fail-open; the same bytes devloop ships) and the
+entrypoint's step 3 **merges** them into `~/.claude/settings.json` and its
+`$CLAUDE_CONFIG_DIR` mirror on every boot — an operator's own hooks survive, a
+re-run adds nothing twice:
+
+| hook | event | what it does |
+|---|---|---|
+| `guard-shell.py` | `PreToolUse` (`Bash`) | walks every segment of a compound command — the one-line `for …; do rm …; done` / `if …; then rm …` included — and **denies** an `rm`/`rmdir` (also via `sudo`, `command`, `env`, `xargs rm`, `find … -exec rm`) whose any operand has a glob, a variable, a substitution or `~`, or resolves to `/`, the cwd, a parent of it, the workspace root, any direct child of it (a hub), a hub's `.source` **subtree** or a hub's `main` directory; the reason tells the reviewer what to run instead (literal paths, `find <dir> -mindepth 1 -delete`, `git clean -fdx -- <path>`). A literal removal inside the reviewer's own `REVIEW-<task>` checkout passes silently, as it does in a developer's `TASK-*` worktree. |
+| `note-waiting.py` | `Notification` (`permission_prompt`, `idle_prompt`) | writes `${ALISSA_WAITING_DIR}/<tmux session name>.json` = `{session, sessionId, cwd, kind, message, at}` atomically — the "this session is waiting for input" signal the daemon's responder reads first (the pane is its confirmation). The name is `$ALISSA_TMUX_SESSION` (exported by `alissa tmux new`), else asked of `tmux`, else the hook's `session_id`. |
+| `clear-waiting.py` | `UserPromptSubmit`, `PostToolUse` | removes that marker: either event proves the session moved on. One env lookup and one unlink per tool call in a managed seat. |
+
+`ALISSA_SHELL_GUARD=off` (or `0`/`false`/`no`) skips the guard's registration
+**and removes one a previous boot wrote** — the rollback lever, effective on
+the next boot; the marker pair is always registered. Both variables are read
+at runtime only, deliberately not build `ARG`s. The boot log line `seeded
+claude first-run config …; hooks: shell guard ON, waiting marker ON` says
+what was registered. The merge also **prunes** any registration under
+`/usr/local/share/alissa/hooks/` that the running image does not make itself,
+so a rollback or roll-forward between two images that carry the hooks heals
+the file on the next boot; a rollback to an image **older than 0.31.3**
+cannot — its entrypoint knows nothing about hooks, the three commands fail
+with exit 127, and Claude Code reports a non-blocking hook error per event
+(the session keeps working); to silence it, delete the `hooks` block from
+`$CLAUDE_CONFIG_DIR/settings.json` on the volume. Both round directives carry
+the matching shell rule (never rm a glob, a variable or a path outside your
+worktree; never start an interactive command; never retry a command the
+guard refused) plus the reviewer's own line — *you never push and never
+delete: a reviewer that needs scratch files writes them under its own checkout
+and leaves them* — so a well-behaved session never meets the guard at all.
+Tested by [`tests-hooks-guard.sh`](./tests-hooks-guard.sh) (devloop's
+deny/pass table plus the reviewer's `REVIEW-*` cwd rows, run by the
+check-tests workflow's `hooks-guard` job) and asserted in the image contract.
+
+**Cure.** Whatever still parks a reviewer — the rm dialog from a shape the
+guard does not know, the trust gate, the resume picker, an expired login, a
+usage limit, an empty credit balance, a dialog nobody has seen yet — the
+daemon's **prompt responder** answers within one poll from a policy table
+(the daemon README, *The prompt responder*): the container passes
+`ALISSA_PROMPT_RESPONDER` (`on` | `observe` | `off`),
+`ALISSA_PROMPT_QUIET_SECONDS`, `ALISSA_PROMPT_KILL_MINUTES`,
+`ALISSA_PROMPT_MAX_ANSWERS` and `ALISSA_WAITING_DIR` straight through to the
+daemon's config (unset ⇒ the library default; skew-gated, so an older pin
+drops them with a WARN). `ALISSA_WAITING_DIR` is the **same** variable the
+hooks read, so the daemon looks where they wrote. The reviewer's "own
+worktree" for the accept rule is its `REVIEW-<task>` checkout; an
+account-level notice pages once per kind per 6 h and **holds new review
+spawns** (live rounds keep running) — the operator's remedy is the claude
+login on this container (`gosu alissa bash -lc 'claude /login'`, above), the
+plan, or the credit balance. A session the ladder kills is re-entered by the
+stale-round edge under the **same** round number: the cap counts verdicts,
+so a kill never costs a round.
+
 ### Reviewer console (runtime env only — `ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`, `PORT`)
 
 The image can also serve the **reviewer console**
@@ -623,8 +705,11 @@ The image can also serve the **reviewer console**
 read-only operator dashboard sidecar — alongside the worker and daemon. It
 renders the daemon's own local exhaust from this container's volume
 (`/workspace/.revloop/state.db`: poll snapshots, the spawn ledger, escalations,
-pings) plus the live `review-*` tmux sessions, so it costs **no** GitHub API
-budget beyond two cached checks. It is **opt-in and off by default**, and its
+pings, the prompt responder's `waiting` list) plus the live `review-*` tmux
+sessions, so it costs **no** GitHub API budget beyond two cached checks. Its
+actions are **kill**, **retry-now** and, since 0.31.3, the prompt responder's
+bounded verbs (`GET /api/pane`, `POST /action/answer` with `accept | decline |
+escape` — devloop W2's contract, behind the same passcode + CSRF gate). It is **opt-in and off by default**, and its
 knobs are **runtime-only** (not build `ARG`s), for the reasons in each row:
 
 | variable | default | meaning |
@@ -666,7 +751,8 @@ and with the sidecar killed under it (CLIs stubbed, sidecar real, no docker
 required); it runs in CI beside the config-renderer suite.
 
 > ⚠️ Enabling the console and turning on the service's public networking puts the
-> operator dashboard — including its **kill** and **retry-now** actions — on the
+> operator dashboard — including its **kill**, **retry-now** and **answer**
+> (press a parked dialog's buttons) actions — on the
 > public internet, gated **only** by `ALISSA_UI_PASSCODE`. Use a long, random
 > passcode, or leave the console disabled and reach it over a private network /
 > port-forward instead.
@@ -1119,7 +1205,12 @@ volumes:
 2b. Seed claude's first-run flags into `$HOME` and `$CLAUDE_CONFIG_DIR` —
    pre-trusting the `ALISSA_REVIEW_REPOS` hubs, the hubs the daemon **derived**
    on a previous boot (read from `${ALISSA_WORKSPACE_ROOT}/.alissa-derived-repos`;
-   bows mode, issue #136) and every hub already on disk, root and `main/` each
+   bows mode, issue #136) and every hub already on disk, root and `main/` each;
+   merge the three Claude Code hooks (the `rm` guard unless
+   `ALISSA_SHELL_GUARD=off`, the waiting marker and its clearer — see *The
+   shell guard, the waiting marker and the prompt responder*) into
+   `settings.json` and its `$CLAUDE_CONFIG_DIR` mirror without touching an
+   operator's own hooks
    — and —
    when `CLAUDE_CONFIG_DIR` is non-blank — pin the alissa CLI's `skillsDir` to
    `$CLAUDE_CONFIG_DIR/skills` (merged into its `config.json`, the directory

@@ -14,6 +14,12 @@ Route map:
   POST /logout      -> clear the session cookie
   POST /action/kill -> `alissa tmux kill <session>` (session + CSRF required)
   POST /action/retry-> age a round's ledger row for retry (session + CSRF)
+  GET  /api/pane    -> the last 40 pane lines of one session, scrubbed
+                       (session cookie required, like /api/state)
+  POST /action/answer -> press a parked dialog's buttons by a bounded VERB
+                       (accept | decline | escape; session + CSRF required;
+                       409 not_waiting when the pane is not parked on one,
+                       409 not_answerable for an account-level notice)
 
 Every action POST is gated on BOTH the signed session cookie AND a CSRF token
 bound to it, and every action is audit-logged to stdout as a JSON line.
@@ -30,6 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
+from .. import prompts
+from ..alissa import SAFE_SESSION, capture_pane_argv, send_keys_argv
 from ..proc import CommandError, run as proc_run
 from .auth import SESSION_COOKIE, Auth
 from .page import dashboard_page, login_page
@@ -39,8 +47,10 @@ from .sources import RETRY_OK, Sources, is_managed
 # it starts with a letter and carries only these characters. Validating against
 # it makes the kill argv impossible to weaponise -- the argv is already pinned
 # to `alissa tmux kill <name>` (a name arg, never a raw `tmux kill-server`), and
-# the leading-char rule additionally forbids a `-flag`-shaped name.
-_SAFE_SESSION = re.compile(r"\A[A-Za-z0-9._][A-Za-z0-9._-]{0,199}\Z")
+# the leading-char rule additionally forbids a `-flag`-shaped name. Stated
+# once, in `alissa.SAFE_SESSION`, so the raw tmux argv builders the prompt
+# responder and this console share can never drift from it (issue #138).
+_SAFE_SESSION = SAFE_SESSION
 
 # A `<owner>/<repo>` slug, validated before it reaches a SQL parameter or an
 # audit line. Parameterised queries already make injection a non-issue; this
@@ -134,6 +144,97 @@ class App:
             return False, str(exc)
         self._audit("kill", {"session": name, "managed": managed, "ok": True})
         return True, "killed"
+
+    def _capture(self, name: str) -> "str | None":
+        """The session's last PANE_LINES pane lines over raw tmux, or None
+        when tmux cannot answer (no such session). The same argv the daemon's
+        responder uses (`alissa.capture_pane_argv`), so the two never read a
+        different pane."""
+        try:
+            argv = capture_pane_argv(name, prompts.PANE_LINES)
+            return self._run(argv, timeout=15)
+        except (ValueError, CommandError):
+            return None
+
+    def pane(self, name: "str | None") -> "tuple[int, dict]":
+        """`GET /api/pane`: the last 40 lines of ONE managed session's pane,
+        SECRETS-SCRUBBED line by line, plus what the classifier makes of it
+        (`kind`, or null for a working/idle pane). (status, payload).
+
+        Scope, deliberately (issue #138, devloop W2's contract): ANY
+        well-formed managed session (`_SAFE_SESSION`, the `ali-` prefix added
+        by the argv), not only this daemon's own reviewers. The console is
+        the operator's lever over the whole container -- the Sessions panel
+        wires Pane and Kill onto every roster row, and `kill_session` has
+        reached any managed session since the console was built -- so an
+        operator who can kill a developer seat can read its screen, behind
+        the passcode and the CSRF token, scrubbed. The daemon's own
+        responder is narrower on purpose (`ReviewWatcher._respond_to_prompts`
+        captures only sessions that parse as its reviewers): it acts
+        unattended, the operator does not."""
+        if not name or not _SAFE_SESSION.match(name):
+            return 400, {"error": "invalid session name"}
+        pane = self._capture(name)
+        if pane is None:
+            return 404, {"error": "no_pane", "session": name}
+        finding = prompts.classify(pane)
+        lines = [prompts.scrub(prompts.strip_ansi(ln)) for ln in pane.splitlines()]
+        return 200, {
+            "session": name,
+            "kind": finding.kind if finding else None,
+            "lines": lines[-prompts.PANE_LINES:],
+        }
+
+    def answer(self, name: "str | None", verb: "str | None") -> "tuple[int, dict]":
+        """`POST /action/answer`: press the dialog on ONE session's pane by a
+        bounded verb. The verb maps to keys through `prompts.keys_for`
+        against the dialog actually on screen -- so `accept` on a 3-option
+        prompt is the numbered "Yes", never a blind Enter -- and the keys go
+        through the same allowlisted `send-keys` argv the daemon uses.
+        Refused with 409 `not_waiting` when the pane is not parked on a
+        dialog, and 409 `not_answerable` for the account-level notices
+        (an expired login, a hit limit, no credits) that no keystroke
+        answers. (status, payload); every outcome is audited. Same session
+        scope as `pane`: any managed session, an operator's deliberate act
+        on a screen they have just read."""
+        if not name or not _SAFE_SESSION.match(name):
+            self._audit("answer", {"session": name, "verb": verb, "ok": False,
+                                   "error": "invalid name"})
+            return 400, {"ok": False, "error": "invalid session name"}
+        # WHOSE seat receives the keystrokes -- this daemon's reviewer, or
+        # another daemon's worker (both are answerable by design) -- on every
+        # outcome past the name check, exactly as the kill trail records it.
+        managed = is_managed(name)
+        if verb not in prompts.CONSOLE_VERBS:
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "bad verb"})
+            return 400, {"ok": False, "error": "verb must be one of "
+                         + ", ".join(prompts.CONSOLE_VERBS)}
+        pane = self._capture(name)
+        if pane is None:
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "no_pane"})
+            return 404, {"ok": False, "error": "no_pane"}
+        finding = prompts.classify(pane)
+        if finding is None:
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "not_waiting"})
+            return 409, {"ok": False, "error": "not_waiting"}
+        if not finding.answerable:
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "error": "not_answerable", "kind": finding.kind})
+            return 409, {"ok": False, "error": "not_answerable", "kind": finding.kind}
+        keys = prompts.keys_for(finding, verb)
+        try:
+            self._run(send_keys_argv(name, keys), timeout=15)
+        except (ValueError, CommandError) as exc:
+            self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                                   "ok": False, "kind": finding.kind, "error": str(exc)})
+            return 400, {"ok": False, "error": str(exc), "kind": finding.kind}
+        self._audit("answer", {"session": name, "verb": verb, "managed": managed,
+                               "ok": True, "kind": finding.kind, "keys": list(keys)})
+        return 200, {"ok": True, "message": "answered", "kind": finding.kind,
+                     "keys": list(keys)}
 
     def retry(
         self, repo_slug: "str | None", number: Any, round_: Any
@@ -254,6 +355,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(self.app.sources.dashboard())
             return
+        if path == "/api/pane":
+            if not self._authed():
+                self._send_json({"error": "unauthorized"},
+                                status=HTTPStatus.UNAUTHORIZED)
+                return
+            values = parse_qs(self.path.partition("?")[2]).get("session") or []
+            status, payload = self.app.pane(values[0] if values else None)
+            self._send_json(payload, status=status)
+            return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -278,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         # Everything below is a state-changing action: session + CSRF required.
-        if path in ("/action/kill", "/action/retry"):
+        if path in ("/action/kill", "/action/retry", "/action/answer"):
             if not self._authed():
                 self._send_json({"error": "unauthorized"},
                                 status=HTTPStatus.UNAUTHORIZED)
@@ -287,6 +397,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "csrf"}, status=HTTPStatus.FORBIDDEN)
                 return
             payload = self._json_body()
+            if path == "/action/answer":
+                status, body = self.app.answer(
+                    payload.get("session"), payload.get("verb")
+                )
+                self._send_json(body, status=status)
+                return
             if path == "/action/kill":
                 ok, msg = self.app.kill_session(payload.get("session"))
             else:

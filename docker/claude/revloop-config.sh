@@ -41,6 +41,14 @@
 #     pass-through, same spellings, same refusal, same env-wins rule through
 #     ALISSA_REV_FLEET_VITALS_ENABLED; skew-gated like the bows keys below,
 #     because it landed in 0.30.0 and an older pin rejects the unknown key),
+#     prompt_responder / prompt_quiet_seconds / prompt_kill_minutes /
+#     prompt_max_answers / waiting_dir (issue #138: the prompt responder --
+#     `on`/`observe`/`off`, the quiet window before an unmarked pane is read,
+#     the unknown-dialog kill rung, the per-session answer cap, and the
+#     directory the container's note-waiting hook writes its markers to.
+#     ALISSA_WAITING_DIR is the SAME variable the hooks read at run time, so
+#     the daemon looks where they wrote. All five skew-gated: they landed in
+#     revloop 0.31.3 and an older pin rejects the unknown keys),
 #     operators (an EMPTY operator
 #     allowlist is the library's fail-closed default -- emitting `[]` would say
 #     the same thing, but omitting it keeps "unset means the library decides"
@@ -226,6 +234,17 @@ render_revloop_config() {
        return 1 ;;
   esac
   fvitals="$(_skew_value fleet_vitals_enabled ALISSA_REV_FLEET_VITALS_ENABLED "${ALISSA_REV_FLEET_VITALS_ENABLED:-}" "fleet vitals landed in revloop 0.30.0")"
+  # The prompt responder (issue #138). The master switch is an enum the
+  # library validates by NAME (a typo fails the boot rather than reading as
+  # `off`), the three ladders are integers, and waiting_dir is the SAME
+  # variable the hooks read at run time. All five are skew-gated.
+  local promptmode promptquiet promptkill promptanswers waitingdir
+  local _landed="the prompt responder landed in revloop 0.31.3"
+  promptmode="$(_skew_value prompt_responder ALISSA_PROMPT_RESPONDER "$(printf '%s' "${ALISSA_PROMPT_RESPONDER:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" "${_landed}")"
+  promptquiet="$(_skew_value prompt_quiet_seconds ALISSA_PROMPT_QUIET_SECONDS "$(printf '%s' "${ALISSA_PROMPT_QUIET_SECONDS:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" "${_landed}")"
+  promptkill="$(_skew_value prompt_kill_minutes ALISSA_PROMPT_KILL_MINUTES "$(printf '%s' "${ALISSA_PROMPT_KILL_MINUTES:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" "${_landed}")"
+  promptanswers="$(_skew_value prompt_max_answers ALISSA_PROMPT_MAX_ANSWERS "$(printf '%s' "${ALISSA_PROMPT_MAX_ANSWERS:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" "${_landed}")"
+  waitingdir="$(_skew_value waiting_dir ALISSA_WAITING_DIR "$(printf '%s' "${ALISSA_WAITING_DIR:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" "${_landed}")"
   # --arg (string) + tonumber for the numeric pass-through keys: an unset/empty
   # env var yields "" and the key is dropped, so the library default wins.
   jq -n \
@@ -248,6 +267,11 @@ render_revloop_config() {
     --arg     selfsc  "${ALISSA_TASK_LIST_SELF_SCOPE:-}" \
     --arg     levents "${ALISSA_REV_LOOP_EVENTS_ENABLED:-}" \
     --arg     fvitals "${fvitals}" \
+    --arg     promptmode "${promptmode}" \
+    --arg     promptquiet "${promptquiet}" \
+    --arg     promptkill "${promptkill}" \
+    --arg     promptanswers "${promptanswers}" \
+    --arg     waitingdir "${waitingdir}" \
     --arg     rlogin "${ALISSA_REVIEWER_LOGIN:-}" \
     --arg     rtoken "${ALISSA_REVIEWER_TOKEN_ENV:-}" \
     '{ repos: $repos, on_missing_hub: $hub, agent_profile: $agent }
@@ -275,6 +299,11 @@ render_revloop_config() {
          elif . == "0" or . == "false" or . == "no" or . == "off" then false
          else error("ALISSA_REV_FLEET_VITALS_ENABLED must be a boolean (1/0, true/false, yes/no, on/off)")
          end) } end)
+     + (if $promptmode == "" then {} else { prompt_responder: $promptmode } end)
+     + (if $promptquiet == "" then {} else { prompt_quiet_seconds: ($promptquiet | tonumber) } end)
+     + (if $promptkill == "" then {} else { prompt_kill_minutes: ($promptkill | tonumber) } end)
+     + (if $promptanswers == "" then {} else { prompt_max_answers: ($promptanswers | tonumber) } end)
+     + (if $waitingdir == "" then {} else { waiting_dir: $waitingdir } end)
      + (if $rlogin == "" then {} else { reviewer_login:     $rlogin } end)
      + (if $rtoken == "" then {} else { reviewer_token_env: $rtoken } end)
      + (if ($operators | length) == 0 then {} else { operators: $operators } end)

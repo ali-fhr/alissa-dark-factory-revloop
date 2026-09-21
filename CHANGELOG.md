@@ -4,6 +4,111 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.3
+
+- **The shell guard, the waiting marker and the prompt responder on the
+  reviewer seat** (issue #138, origin TASK-1910446095; the reviewer-side port
+  of devloop W1 — PR #126 / issue #125 — and W2 — PR #128 / issue #127 — with
+  the seat difference the issue names and nothing else invented). A reviewer
+  parked on an interactive Claude Code prompt read ALIVE forever: the
+  stale-round probe declined to respawn over a live session every poll (the
+  sentinel's corpus records `wedge-dialog:revloop:pr808-r10`), and the only
+  responder was a human over `railway ssh` + `tmux send-keys`.
+  - **Prevention (W1, byte for byte).** The image ships devloop's three
+    Claude Code hooks at `/usr/local/share/alissa/hooks/`: `guard-shell.py`
+    (`PreToolUse` on `Bash`; denies, with an instructive reason, an
+    `rm`/`rmdir` on a glob, a variable, a substitution, `~`, `/`, `.`,
+    `..`, an outside-cwd operand, the workspace root, a hub, a hub's
+    `.source` subtree or `main/`, across compound commands and reserved
+    words, fail-open), `note-waiting.py` (`Notification`
+    `permission_prompt|idle_prompt` → `${ALISSA_WAITING_DIR:-/workspace/.waiting}/<tmux
+    session>.json`) and `clear-waiting.py` (`UserPromptSubmit`,
+    `PostToolUse`). The entrypoint's 3a seeding MERGES them into
+    `~/.claude/settings.json` and `$CLAUDE_CONFIG_DIR/settings.json` —
+    idempotent, foreign hooks kept in place, stale registrations under the
+    image-owned dir pruned, `ALISSA_SHELL_GUARD=off` skips the guard AND
+    removes one a previous boot persisted. The image contract asserts the
+    hook bytes, mode, owner, one deny + one pass in the image's python and
+    both registrations; `tests-hooks-guard.sh` (the same deny/pass table)
+    runs as the new `hooks-guard` CI job. Both round directives carry
+    devloop's shell rule word for word plus the reviewer's own line: *"You
+    never push and never delete: a reviewer that needs scratch files writes
+    them under its own checkout and leaves them."*
+  - **Cure (W2, same kinds, verbs, keys and knob names).** New `prompts.py`
+    (classifier + policy, devloop's verbatim); `Alissa.capture_pane` /
+    `pane_path` / `send_keys` over raw `tmux -S $TMUX_TMPDIR/tmux-<uid>/default`
+    with the allowlisted key enum (`Enter`, `Escape`, `1`, `2`, `3`, `Down`,
+    `Up`) and the console's session-name rule (`alissa.SAFE_SESSION`, stated
+    once); the roster's real tmux name rides on `ManagedSession.session`.
+    Every poll, on the sweep's post-reap roster (every ALIVE session of this
+    daemon's own grammar — its spawns and the skill's `review-pr-<n>`
+    rounds — never a foreign session), a waiting marker OR a session quiet
+    past `prompt_quiet_seconds` triggers capture → classify → decide → act;
+    re-capture after 3 s; `prompt_responder` = `on` | `observe` | `off`;
+    `prompt_quiet_seconds`, `prompt_kill_minutes`, `prompt_max_answers`,
+    `waiting_dir` with devloop's floors. **The seat difference:** the
+    "own worktree" a `dangerous_rm` target is measured against is the
+    reviewer's `REVIEW-<task>` checkout (marker cwd — an observation, so a
+    cwd anywhere else, `main/` included, declines outright; then the spawn
+    row's task ref — an assumption, so it contains an absolute target only
+    and never serves as the base of a relative one; then the pane path) —
+    inside it `accept`, anything else `decline`; the reason strings stay
+    devloop's so the sentinel reads one vocabulary. Narration is one line
+    on the PR's marker-identified
+    **Review-loop activity** comment (`prompt-answered: dangerous_rm →
+    accept (target inside worktree) · target REVIEW-TASK-9/build · 14 s
+    after it appeared`) and one `escalation.prompt` loop event (`prompt:`
+    ping rows; `escalation.prompt_page` for `prompt-page:` rows) — never
+    pane text beyond the scrubbed signature. Account-level kinds
+    (`login_expired`, `usage_limit`, `out_of_credits`) press nothing: one
+    operator page per kind per 6 h on the session's PR and a **hold on new
+    review spawns** through the spawn gate (`prompt-held` stage; live
+    rounds keep running; the hold expires into a kill after 1 h on one
+    pane). **A reviewer killed by the ladder never consumes a round**
+    (pinned): the kill ages the round's spawn row past the stale window, so
+    the stale-round edge re-enters THE SAME round next pass, and the cap
+    counts verdicts (`completed`), not attempts. The stalled comment now
+    ends with what the responder classified the pane as. Dry-run
+    classifies and logs, sends nothing, kills nothing, pages nobody, and
+    keeps its sighting ladder in memory (the `_dry_run_drift` split) so a
+    diagnostic pass can never advance production's clock.
+  - **Console parity.** `GET /api/pane?session=<name>` (last 40 lines,
+    scrubbed, plus the classification) and `POST /action/answer {session,
+    verb}` with `verb` ∈ `accept | decline | escape` (`409 not_waiting`, `409
+    not_answerable`), both behind the existing passcode + CSRF gate;
+    `/api/state` gains `waiting: [{session, kind, since, sightings,
+    answers}]`; a *Waiting on a prompt* panel with Pane / accept / decline /
+    escape buttons, a Pane button on every roster row, and `prompt-page`
+    rows in the operator inbox (linked to the PR). Scope as devloop's: any
+    managed session for the operator, own sessions only for the daemon; the
+    `answer` audit line records `managed` like the kill trail does.
+  - **Review round 1 (PR #139).** A marker cwd outside a `REVIEW-` checkout
+    now settles a `dangerous_rm` as `decline` instead of yielding to the
+    named checkout (the spawn cwd `main/` was resolving relative targets
+    into the shared mirror); the named leg contains absolute targets only.
+    `prompt_responder = off` clears the sighting ladder, so the waiting
+    panel empties instead of freezing. The per-act `prompt:` ping rows of a
+    session that left the roster are dropped once per pass
+    (`State.prune_pings`); the hooks join the style matrix.
+  - **Container.** `ALISSA_PROMPT_RESPONDER`, `ALISSA_PROMPT_QUIET_SECONDS`,
+    `ALISSA_PROMPT_KILL_MINUTES`, `ALISSA_PROMPT_MAX_ANSWERS` and
+    `ALISSA_WAITING_DIR` render pass-through (skew-gated on this release)
+    into `revloop.config.json`; `ALISSA_SHELL_GUARD` and `ALISSA_WAITING_DIR`
+    are read by the entrypoint/hooks at run time. Docker README, README
+    (*Behaviour* rows, *The prompt responder*, settings and telemetry
+    tables, console, tests), example config.
+  - **Tests.** `test_hooks_guard.py` + `tests-hooks-guard.sh` (96 shell
+    assertions: devloop's table, the reviewer's `REVIEW-*` cwd rows),
+    `test_entrypoint_hooks.py`, `test_prompts.py` (devloop's fixtures
+    verbatim, the checkout as the worktree), `test_alissa.py` (the raw tmux
+    surface), the responder wiring in `test_loop.py` (marker/quiet
+    triggers, foreign sessions never read, observe/dry-run send nothing,
+    narration + event rows, the account hold through `poll_once` and its
+    expiry, the ladder and the cap ending in the daemon's kill, **the
+    round-cap pin**), console (`/api/pane`, `/action/answer`, CSRF, 409s,
+    `waiting`, the inbox split), state, loop-events, config, directives,
+    and the renderer's shell suite.
+
 ## 0.31.2
 
 - **Pre-trust hubs in bows mode; classify the first-run dialog as a wedge**

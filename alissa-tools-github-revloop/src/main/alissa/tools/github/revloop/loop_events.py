@@ -51,6 +51,7 @@ Design rules, all load-bearing:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .alissa_client import (
@@ -73,6 +74,20 @@ SEAT = "revloop"
 STALLED_PREFIX = "stalled:"
 STABILITY_PREFIX = "stability:"
 CHECKS_UNSETTLED_PREFIX = "checks-unsettled:"
+# The prompt responder's two families (issue #138; devloop #127's grammar).
+# `prompt:<kind>:<verb>@<session>#<seq>` is one act (`escalation.prompt`);
+# `prompt-page:<kind>@<session>#<bucket>` is one operator page
+# (`escalation.prompt_page`). Both anchor on the session's PR -- the reviewer
+# edge has no issue edge -- and carry no pane text: the grammar admits only
+# the vocabulary tokens, the session name and a number.
+PROMPT_PREFIX = "prompt:"
+PROMPT_PAGE_PREFIX = "prompt-page:"
+_PROMPT_RE = re.compile(
+    r"^prompt:(?P<kind>[a-z_]+):(?P<verb>[a-z_]+)@(?P<session>[^#]+)#(?P<seq>\d+)$"
+)
+_PROMPT_PAGE_RE = re.compile(
+    r"^prompt-page:(?P<kind>[a-z_]+)@(?P<session>[^#]+)#(?P<bucket>\d+)$"
+)
 
 
 def _ms(seconds: "int | float") -> int:
@@ -303,6 +318,40 @@ def _ping_events(
                 pr=number,
                 round_=round_,
                 data={"headSha": head, "gate": "verdict"},
+            ))
+        elif kind.startswith(PROMPT_PAGE_PREFIX):
+            match = _PROMPT_PAGE_RE.match(kind)
+            if match is None:
+                continue
+            out.append(_event(
+                "escalation.prompt_page",
+                at,
+                f"revloop:escalation.prompt_page:{repo}:{number}:{kind}",
+                repo=repo,
+                pr=number,
+                session=match.group("session"),
+                reason=f"{match.group('kind')} — operator paged, spawns held",
+                data={
+                    "kind": match.group("kind"), "action": "page",
+                    "session": match.group("session"), "ledgerKind": kind,
+                },
+            ))
+        elif kind.startswith(PROMPT_PREFIX):
+            match = _PROMPT_RE.match(kind)
+            if match is None:
+                continue
+            out.append(_event(
+                "escalation.prompt",
+                at,
+                f"revloop:escalation.prompt:{repo}:{number}:{kind}",
+                repo=repo,
+                pr=number,
+                session=match.group("session"),
+                reason=f"{match.group('kind')} → {match.group('verb')}",
+                data={
+                    "kind": match.group("kind"), "action": match.group("verb"),
+                    "session": match.group("session"), "ledgerKind": kind,
+                },
             ))
     return out
 

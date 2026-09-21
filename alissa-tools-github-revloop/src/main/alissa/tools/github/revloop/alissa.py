@@ -4,12 +4,15 @@ reviewer session (orchestration P1)."""
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from .proc import CommandError, run, run_json
+from .prompts import ALLOWED_KEYS
 
 log = logging.getLogger(__name__)
 
@@ -336,6 +339,83 @@ class Task:
 # kill on.
 REVIEW_SESSION_PREFIX = "review-"
 
+# `alissa tmux new` names the REAL tmux session `ali-<name>`; the roster's
+# `name` is the managed name without it. The raw tmux surface below addresses
+# the real one, and the waiting marker (docker/claude/hooks/note-waiting.py)
+# is named after it too.
+MANAGED_PREFIX = "ali-"
+
+# The console's session-name rule (webui.server), stated once so the raw
+# tmux argv builders and the HTTP surface can never drift: a managed name
+# starts with a letter or digit and carries only these characters, which is
+# what keeps a `-flag`-shaped or shell-metacharacter name out of any argv.
+SAFE_SESSION = re.compile(r"\A[A-Za-z0-9._][A-Za-z0-9._-]{0,199}\Z")
+
+
+def tmux_socket() -> str:
+    """The path of the tmux server socket the reviewer sessions live on:
+    `$TMUX_TMPDIR/tmux-<uid>/default` (tmux's own default). Spelled out
+    rather than left to tmux because the daemon may run without `TMUX` in
+    its environment and must still reach the SAME server `alissa tmux new`
+    created for the reviewers -- same container, same user, same socket."""
+    base = os.environ.get("TMUX_TMPDIR", "").strip() or "/tmp"
+    return os.path.join(base, f"tmux-{os.getuid()}", "default")
+
+
+def tmux_target(name: str) -> str:
+    """The `-t` target for a managed session: the real tmux name, prefixed
+    with `=` so tmux matches it EXACTLY (its default is prefix matching, and
+    `review-widgets-pr1-r1-abcdef` is a prefix of `…-r1-abcdef0`) and
+    suffixed with `:` so the target is the session's CURRENT WINDOW (and its
+    active pane) -- a bare `=name` is a session target, which `capture-pane`
+    and `send-keys` refuse with "can't find pane" (tmux 3.3a)."""
+    real = name if name.startswith(MANAGED_PREFIX) else MANAGED_PREFIX + name
+    return "=" + real + ":"
+
+
+def check_session_name(name: "str | None") -> str:
+    """`name` when it passes SAFE_SESSION, else ValueError. Every raw tmux
+    argv builder calls this first."""
+    if not name or not SAFE_SESSION.match(name):
+        raise ValueError(f"invalid session name {name!r}")
+    return name
+
+
+def capture_pane_argv(name: str, lines: int) -> "list[str]":
+    """`tmux -S <socket> capture-pane -p -t =<real> -S -<lines>`: the last
+    `lines` lines of the session's active pane, printed to stdout, with
+    escape sequences stripped (`-p` without `-e`)."""
+    check_session_name(name)
+    return [
+        "tmux", "-S", tmux_socket(), "capture-pane", "-p",
+        "-t", tmux_target(name), "-S", f"-{max(1, int(lines))}",
+    ]
+
+
+def pane_path_argv(name: str) -> "list[str]":
+    check_session_name(name)
+    return [
+        "tmux", "-S", tmux_socket(), "display-message", "-p",
+        "-t", tmux_target(name), "#{pane_current_path}",
+    ]
+
+
+def send_keys_argv(name: str, keys: "tuple[str, ...]") -> "list[str]":
+    """`tmux -S <socket> send-keys -t =<real> <key>…` with every key drawn
+    from `prompts.ALLOWED_KEYS`. Anything else -- a letter, a word, a path --
+    is a ValueError before any process is spawned: the responder presses a
+    dialog's buttons and can never type into a reviewer."""
+    check_session_name(name)
+    if not keys:
+        raise ValueError("send_keys needs at least one key")
+    bad = [k for k in keys if k not in ALLOWED_KEYS]
+    if bad:
+        raise ValueError(
+            f"key(s) not in the allowlist {sorted(ALLOWED_KEYS)}: {bad!r}"
+        )
+    return ["tmux", "-S", tmux_socket(), "send-keys", "-t", tmux_target(name), *keys]
+
+
 # The reviewer-session GRAMMAR. The sweep kills sessions and the worker
 # container is shared with other lanes (`develop-*`, `fix-*`, `maintain-*`,
 # ...), so only a name that parses as one of the two shapes the review loop
@@ -419,10 +499,28 @@ class ManagedSession:
     # not report one -- treated as "long quiet", so a missing field can never
     # indefinitely immunize a session against the sweep.
     last_activity: float = 0.0
+    # The REAL tmux session name (`ali-<name>`, the roster's `session`
+    # field), or None when the CLI did not report one. The prompt responder
+    # names the waiting marker by it; absent, `MANAGED_PREFIX + name`.
+    session: "str | None" = None
 
     @property
     def is_idle(self) -> bool:
         return self.status == "idle"
+
+    @property
+    def tmux_name(self) -> str:
+        """The real tmux session name -- the roster's, else derived."""
+        return self.session or MANAGED_PREFIX + self.name
+
+    @property
+    def quiet_for(self) -> "float | None":
+        """Seconds since the last tmux activity, or None when the CLI
+        reported no timestamp (the sweep reads that 0 as "long quiet"; the
+        prompt responder reads it as "unknown" and waits for a marker)."""
+        if not self.last_activity:
+            return None
+        return max(0.0, time.time() - self.last_activity)
 
     @property
     def ref(self) -> "SessionRef | None":
@@ -1117,11 +1215,13 @@ class Alissa:
             name = row.get("name")
             if isinstance(name, str) and parse_session_name(name) is not None:
                 last = row.get("lastActivity")
+                real = row.get("session")
                 sessions.append(
                     ManagedSession(
                         name=name,
                         status=str(row.get("status") or ""),
                         last_activity=float(last) if isinstance(last, (int, float)) else 0.0,
+                        session=real if isinstance(real, str) and real else None,
                     )
                 )
         return sessions
@@ -1160,6 +1260,72 @@ class Alissa:
         except CommandError as exc:
             log.debug("could not tail %s: %s", session, exc)
             return ""
+
+    def capture_pane(self, name: str, lines: int = 40) -> str:
+        """The last `lines` of ONE managed session's pane over raw tmux
+        (`capture-pane -p`), or "" when tmux cannot answer (no such session,
+        the socket gone, a timeout).
+
+        The responder's evidence seam (issue #138). Like `tail_session` it
+        returns UNTRUSTED, possibly sensitive terminal content: the caller
+        classifies it and lets only the classification -- plus a scrubbed
+        signature line -- reach an operator-facing level. A READ, so it runs
+        under dry-run too: a dry pass has to classify what a live one would.
+        Raw tmux rather than the `alissa` CLI because the CLI's `tail` is a
+        convenience without `send-keys` beside it, and the answer has to land
+        on the very pane the capture read."""
+        try:
+            argv = capture_pane_argv(name, lines)
+        except ValueError as exc:
+            log.warning("capture_pane refused: %s", exc)
+            return ""
+        try:
+            out = run(argv, timeout=15)
+        except CommandError as exc:
+            log.debug("could not capture the pane of %s (%s)", name, exc)
+            return ""
+        return out.rstrip("\n")
+
+    def pane_path(self, name: str) -> str:
+        """The session's pane current path (`#{pane_current_path}`), or ""
+        when tmux cannot answer. One leg of the review-checkout resolution:
+        a reviewer that `cd`ed into its `REVIEW-*` checkout names it here."""
+        try:
+            argv = pane_path_argv(name)
+        except ValueError as exc:
+            log.warning("pane_path refused: %s", exc)
+            return ""
+        try:
+            return run(argv, timeout=15).strip()
+        except CommandError as exc:
+            log.debug("could not read the pane path of %s (%s)", name, exc)
+            return ""
+
+    def send_keys(self, name: str, *keys: str, dry_run: bool = False) -> bool:
+        """Press `keys` -- each one of `prompts.ALLOWED_KEYS`, nothing else
+        -- on ONE managed session's pane. True when tmux accepted them.
+
+        The ONLY key-pressing surface in this daemon, and deliberately
+        narrow: an allowlisted enum, a validated session name, an exact-match
+        target, one `send-keys` per call. A key outside the allowlist is
+        refused before any process is spawned and logged at WARNING (it is a
+        programming error, never a pane's doing -- keys come from the
+        policy table, not from the screen). Dry-run logs the intent and
+        sends nothing."""
+        try:
+            argv = send_keys_argv(name, tuple(keys))
+        except ValueError as exc:
+            log.warning("send_keys refused for %s: %s", name, exc)
+            return False
+        if dry_run:
+            log.info("[dry-run] would send keys %s to %s", " ".join(keys), name)
+            return False
+        try:
+            run(argv, timeout=15)
+        except CommandError as exc:
+            log.warning("could not send keys %s to %s (%s)", " ".join(keys), name, exc)
+            return False
+        return True
 
     def add_repo_to_workspace(
         self, owner: str, repo: str, workspace_root: Path, *, dry_run: bool = False

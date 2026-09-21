@@ -163,6 +163,11 @@ else refused by name.
 | `task_list_bow_id` | `null` | scope `alissa task list` to one body of work (`--bow`), so candidates come from that BOW's junction rows instead of the operator's whole involvement index. The **only key the environment can set** (`ALISSA_REVIEW_TASK_BOW`, which wins over both the file and `--task-list-bow`). Off by default: a review task **outside** the configured BOW is invisible to the daemon, which on the default `on_missing_review_task` means a round spawned *untethered from its task* — see *Bounding the task-list read* for the id's contract, the two ways to get it wrong, and what `--bow` does to the other narrowing flags |
 | `loop_events_enabled` | `false` | push loop telemetry (rounds spawned, verdicts posted, cap-outs, stability holds, stalls, checks holds, grants, reaps) to Studio's `POST /v1/loop-events` **once per poll pass** — one idempotent, ledger-derived batch, best-effort and never fatal. Settable by the environment (`ALISSA_REV_LOOP_EVENTS_ENABLED`, which wins over the file and `--loop-events`/`--no-loop-events`) — see *Loop telemetry (Studio ingest)* |
 | `fleet_vitals_enabled` | `false` | push **one fleet-vitals snapshot** of this daemon's live state — heartbeat, poll durations, the reviewer-session roster with each session's PR and round, the reviewer identity's cached GitHub rate, the container's memory split, the spawn-gate queue depth and the live operator inbox — to Studio's `POST /v1/loop/fleet-vitals` at the end of **every completed poll pass**, after the loop-events push. Studio keeps only the latest snapshot per seat, so a Factory with no console URL for this seat renders its revloop card from it. Best-effort and never fatal; nothing is sent in `--dry-run`. Settable by the environment (`ALISSA_REV_FLEET_VITALS_ENABLED`, which wins over the file and `--fleet-vitals`/`--no-fleet-vitals`) — see *Fleet vitals (Studio ingest)* |
+| `prompt_responder` | `on` | the **prompt responder** (issue #138): `on` answers a reviewer session parked on a Claude Code dialog within one poll under the policy table (see *The prompt responder*); `observe` classifies and narrates but sends no key, kills nothing and pages nobody; `off` never reads a pane. A typo is refused at load by name. Container: `ALISSA_PROMPT_RESPONDER` |
+| `prompt_quiet_seconds` | `90` | how long a reviewer session must have been quiet (the roster's `lastActivity`) before the responder reads its pane **without** a waiting marker; the marker is the fast path, this is the net under it. Floored at 30 (clamped up with a warning). Container: `ALISSA_PROMPT_QUIET_SECONDS` |
+| `prompt_kill_minutes` | `10` | the unknown-dialog ladder's last rung: a dialog no signature knows is waited out one poll, dismissed with Escape on its second sighting, and after this many minutes still on screen the session is killed so the stale-round edge re-enters the **same** round. Floored at 1. Container: `ALISSA_PROMPT_KILL_MINUTES` |
+| `prompt_max_answers` | `5` | the per-session answer cap: after this many keystroke answers (sent, whether or not the pane moved) the session is killed and its round re-entered — a reviewer that keeps producing prompts is diverging, and the activity line says so. Floored at 1. Container: `ALISSA_PROMPT_MAX_ANSWERS` |
+| `waiting_dir` | `/workspace/.waiting` | where the container's `note-waiting.py` hook leaves the `<tmux session>.json` waiting markers; must be a non-empty path (a directory that does not exist means no markers, and the quiet-session net still applies). Container: `ALISSA_WAITING_DIR`, the same variable the hooks read |
 | `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
@@ -602,7 +607,10 @@ Leave it on `skip` unless you want unattended clones.
 | a round is owed but the head's CI has not concluded | **held** — the reviewer is not queued until the checks settle, bounded by `checks_spawn_wait_seconds`; a session that has not started cannot approve ahead of its evidence — see *Never approve a red head* |
 | a round is owed and the head's CI is red | queued **now**, with the failing jobs and run URLs in its directive and no approve permitted |
 | round enqueued >90 min, still no review | reviewer presumed stalled, re-enqueue |
-| round enqueued >90 min, session still alive | **deferred** behind the live session (floored `stalled` ping) — **unless** its pane is parked on claude's first-run dialog: `wedged:first-run-dialog`, kill + seed trust + re-queue, one WARNING — see *Sitting on the first-run dialog* |
+| round enqueued >90 min, session still alive | **deferred** behind the live session (floored `stalled` ping, which now says what the prompt responder classified the pane as) — **unless** its pane is parked on claude's first-run dialog: `wedged:first-run-dialog`, kill + seed trust + re-queue, one WARNING — see *Sitting on the first-run dialog* |
+| a live reviewer session is parked on a Claude Code dialog (a waiting marker from the container's hook, or a pane quiet past `prompt_quiet_seconds`) | **answered within one poll** from the policy table — accept an `rm` inside the reviewer's own `REVIEW-<task>` checkout, decline every other permission prompt, accept the trust gate under `/workspace`, dismiss the resume picker, wait → Escape → kill an unknown dialog, kill after `prompt_max_answers` answers; one line on the activity comment and one `escalation.prompt` event — see *The prompt responder* |
+| a reviewer's screen shows an expired login, a hit usage limit or an empty credit balance | **no keys** — one operator page per kind per 6 h and a **hold on new review spawns** (`prompt-held`; live rounds keep running); the hold lifts when the notice leaves the screen, and in any case after 1 h on one pane (kill + re-entry) |
+| a reviewer session the responder killed | its round is **re-entered by the stale-round edge next poll under the same round number** — the cap counts verdicts, not attempts, so the kill costs no round |
 | a round's review has landed | its reviewer session is reaped (freed) — see below |
 | a round's verdict envelope exists but no reviewer-identity review does | the daemon submits it natively after a short grace; the round is **not** closed until it lands |
 | that post keeps failing | retried with a growing backoff, paged after 5 attempts — the round stays open |
@@ -847,6 +855,102 @@ place — or `alissa tmux kill <session>` and seed the hub's trust
 (`projects["<hub>"].hasTrustDialogAccepted: true` for the hub root and
 `<hub>/main` in both state files), and let the next poll's dead-session read
 respawn the round.
+
+### The prompt responder (a parked reviewer is answered within one poll)
+
+The image's shell guard (docker README, *The shell guard, the waiting marker
+and the prompt responder*) stops the KNOWN `rm` prompt from appearing. This
+is the cure for whatever still appears (issue #138; devloop W2's design,
+ported with one seat difference): a reviewer parked on a dialog reads ALIVE
+forever — the stale-round probe correctly declines to respawn over a live
+session, every poll (the sentinel's corpus records
+`wedge-dialog:revloop:pr808-r10`) — and until 0.31.3 the only responder was
+a human over `railway ssh` + `tmux send-keys`. The tmux server is LOCAL to
+the daemon (same container, same user), it already lists the sessions every
+poll, and it can act in seconds from a table — no SSH, no LLM in the loop.
+
+Every poll, on the reaper's post-reap roster, for every ALIVE session of
+this daemon's own grammar (its `review-<repo>-pr<n>-r<k>-<nonce>` spawns
+and the review skill's hand-driven `review-pr-<n>` rounds; a foreign
+session is never captured, let alone answered), a **waiting marker** left by
+the container's `note-waiting.py` hook (`<waiting_dir>/<tmux session>.json`)
+OR a session **quiet** past `prompt_quiet_seconds` triggers: capture the
+last 40 pane lines over raw tmux → `prompts.classify` → `prompts.decide` →
+act. A dialog is a question AND its options at the bottom of the pane with
+only chrome below them; a pane that merely quotes a signature (this README,
+a diff — and a reviewer reads diffs for a living) is not parked, a spinner
+or "esc to interrupt" in the tail is working, and the bare input prompt is
+idle. The account-level notices are held to the same bar in their own
+shape: a banner is a line of its own at the **bottom** of the pane, its
+signature anchored at the start of the line, never a `●` tool-call or `⎿`
+tool-output row.
+
+| kind | signature | policy |
+| --- | --- | --- |
+| `dangerous_rm` | `Dangerous rm operation on statically-unresolvable target: <path>` + `❯ 1. Yes` | **the seat difference:** target (globs stripped, `..` resolved, relative paths resolved against the checkout) inside the reviewer's OWN `<hub>/REVIEW-<task>` checkout → **accept** (Enter); anything else — `main/`, the hub, another round's checkout, a developer's `TASK-*` worktree, `/tmp`, an escape, an unresolvable target, a session whose checkout could not be named → **decline** (the numbered "No" + Enter, else Escape); the reviewer reads the refusal and adapts. The reason strings are devloop's verbatim (`target inside worktree`, `lane worktree unknown`) so the sentinel reads one vocabulary |
+| `permission` | any other `Do you want to proceed?` | **decline** — bypass mode means a prompt here is an explicit ask-rule or a critical path; never auto-accepted |
+| `trust` | the workspace-trust / bypass-permissions gate | **accept** only for a path under `/workspace` (read from the dialog's own body, never from scrollback), else decline; a gate that names no path (the bypass gate) declines |
+| `resume_picker` | `Resume Session` | Escape |
+| `login_expired`, `usage_limit`, `out_of_credits` | `Login expired · Please run /login`, `You've hit your weekly limit`, `You're out of usage credits` | **no keys** — one operator page per kind per 6 h (a `prompt-page:` ping, an inbox row on the session's PR) and a **hold on new review spawns** while the notice stands: every owed round defers `prompt-held` (`spawns held by the prompt responder — <kind> on <session>`), burning no round number and no attempt; live sessions keep running; the hold lifts on the first pass that no longer sees the notice and **in any case after 1 h on the same pane** (`prompts.ACCOUNT_HOLD_SECONDS`): the session is then killed and the stale-round re-entry re-confirms — a fresh pane showing the banner re-arms the hold, a working one proves the account is back |
+| `unknown_dialog` | a parked dialog no signature knows | first sighting → wait one poll; the same pane again → Escape; still there after `prompt_kill_minutes` → kill |
+| any | — | at most `prompt_max_answers` answers per session, then kill — a reviewer that keeps producing prompts is diverging, and the line says so |
+
+Keys are an **allowlisted enum** — `Enter`, `Escape`, `1`, `2`, `3`,
+`Down`, `Up` — and `Alissa.send_keys` refuses anything else before a process
+is spawned: the responder presses a dialog's buttons and can never type into
+a reviewer. Every keystroke answer is re-captured after 3 s; a pane that did
+not change counts as unanswered (it still counts toward the cap).
+
+The reviewer's own checkout is resolved from the marker's `cwd` (Claude
+Code's tracked cwd, which follows the reviewer into the checkout it
+created) — an observation, so a marker whose cwd is anywhere else (`main/`,
+the spawn cwd, is the common case) settles it: **decline**; only a marker
+with no cwd falls through — then the spawn row's task ref (the review skill
+names the checkout `REVIEW-<task ref>`, deterministically — an assumption,
+so it serves the containment of an *absolute* target only, never as the
+base a relative target is resolved against), then the pane's current path;
+when none names a `REVIEW-*` child of the hub the dangerous-rm rule
+**declines**, because it cannot tell this round's checkout from another's.
+
+**A kill never consumes a round.** The responder's kill (the ladder's last
+rung, the answer cap, an expired account hold) is the session's own
+`alissa tmux kill`, followed by aging the round's spawn row past the stale
+window — the console's own retry-now lever — so the **next** pass's
+stale-round probe reads the session gone and re-enqueues **the same round**
+(`reenqueued`, the `stale_reenqueued` bucket). The cap counts verdicts
+(`completed` substantive reviews), and a killed session submitted none, so
+a reviewer killed by the ladder re-enters through the existing stale edge at
+no cost to `round_cap`; pinned by `test_loop.py`.
+
+Narration: every finding and action is ONE line on the PR's **Review-loop
+activity** comment — `prompt-answered: dangerous_rm → accept (target inside
+worktree) · target REVIEW-TASK-500/build · 14 s after it appeared` — and one
+`escalation.prompt` loop event carrying `kind`, `action` and `session`,
+never pane text beyond the matched signature line (secrets-scrubbed), paths
+relative to the hub. The 3-line excerpt around the signature goes to DEBUG
+only. `prompt_responder` = `on` (default) | `observe` (classify + narrate,
+send nothing, kill nothing, page nobody) | `off` (reads no pane and clears
+the sighting ladder, so the console's *Waiting on a prompt* panel empties
+rather than freezing on the last thing an earlier mode saw); `--dry-run`
+classifies and logs, sends nothing, and keeps its sighting ladder in memory
+so a diagnostic pass never advances production's clock. The `prompt:` ping
+rows of a session that has left the roster are dropped once per pass (the
+act stays on the activity comment and was emitted as a loop event); every
+other ping family is a dedupe key and is never pruned. The 40-minute stalled
+comment now ends with what the responder classified the pane as (`working`
+| `<kind>` | `unreadable` | `responder off`).
+
+The console gains the same surface with bounded verbs (see *Reviewer
+console*): `GET /api/pane?session=<name>` and `POST /action/answer
+{session, verb}` with `verb` ∈ `accept | decline | escape`, refused with
+`409 not_waiting` when the pane is not parked on a dialog and `409
+not_answerable` for an account-level notice; `/api/state` lists `waiting:
+[{session, kind, since, sightings, answers}]` and the inbox carries the
+`prompt-page` rows. Scope, deliberately: the console reaches **any**
+well-formed managed session — like `/action/kill`, the Sessions panel offers
+Pane and Kill on every roster row — while the daemon's own responder
+captures only sessions it can name as its reviewers; the console is the
+operator acting, the responder acts unattended.
 
 ### Reaping finished reviewer sessions
 
@@ -1204,6 +1308,8 @@ built from the ledger's own keys:
 | `stability.hold` | `stability:` pings, enriched from `stability_notices` | `data.headSha`, `data.rcRounds`, `data.grantsSeen` |
 | `stalled` | `stalled:<session>` pings | `session` |
 | `checks.held` | `checks-unsettled:` pings **and** `spawn_checks_holds` | `round`, `data.headSha`, `data.gate` (`verdict` \| `spawn`) |
+| `escalation.prompt` | `prompt:<kind>:<verb>@<session>#<seq>` pings | `session`, `data.kind`, `data.action`, `data.session`, `data.ledgerKind`, `reason` (`<kind> → <verb>`) — one per responder act, never pane text |
+| `escalation.prompt_page` | `prompt-page:<kind>@<session>#<bucket>` pings | `session`, `data.kind`, `data.action` = `page` — one per account-level kind per 6 h |
 | `grant` | `grants` (operator re-entry acks) | `data.author`, `data.rounds` |
 | `reap` | `reaps` | `session` |
 
@@ -1295,9 +1401,10 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   of the cap** → session → stage (`spawned` / `in-flight` / `deferred` /
   `queued` / `checks-held` / `stale-re-enqueued` / `converged` / `capped` /
   `escalated` / `skipped`). The
-  inbox pages the three things the daemon pages a human about: CR9 **cap-outs**
-  (from `escalations`), **stalled** deferral episodes and **stability holds**
-  (both from `pings`, under their own kind prefixes), all linking to the PR.
+  inbox pages the four things the daemon pages a human about: CR9 **cap-outs**
+  (from `escalations`), **stalled** deferral episodes, **stability holds** and
+  the prompt responder's **account pages** (`prompt-page`; all three from
+  `pings`, under their own kind prefixes), all linking to the PR.
   There is no worker-tasks panel — reviewers create no tasks — and no
   maintenance edge.
 - **Settled pages are filed away, not deleted.** `escalations` and `pings` are
@@ -1341,7 +1448,16 @@ alissa-revloop-ui --workspace-root /path/to/workspace   # serves 127.0.0.1:8788
   retry semantics, never a new retry path. Aging is necessary but not sufficient:
   the daemon still defers a respawn behind a session that shows life (that
   liveness signal is what stops a round being double-spent), so kill the wedged
-  session first, then retry.
+  session first, then retry. *Pane* (`GET /api/pane?session=<name>`) shows the
+  last 40 lines of a session's terminal, secrets-scrubbed server-side, with what
+  the daemon's classifier makes of it; *accept* / *decline* / *escape*
+  (`POST /action/answer {session, verb}`) press a parked dialog's buttons by a
+  bounded verb — the keys are resolved server-side against the dialog on
+  screen through the same allowlisted `send-keys` argv the daemon uses, `409
+  not_waiting` when nothing is parked, `409 not_answerable` for an
+  account-level notice (issue #138). A *Waiting on a prompt* panel lists the
+  sessions the responder sees parked (`waiting` in `/api/state`), and the inbox
+  carries its `prompt-page` rows.
 - **Studio design system**, both themes (parchment/ink light + glass-dark), one
   gold accent on the drift chip, status colours kept separate.
 
@@ -1489,6 +1605,7 @@ bash docker/claude/tests-entrypoint-identity.sh  # reviewer-identity preflight
 bash docker/claude/tests-entrypoint-auth.sh      # alissa auth failure triage
 bash docker/claude/tests-entrypoint-executor.sh  # bridge-executor role + gates
 bash docker/claude/tests-entrypoint-ui.sh        # reviewer-console wiring
+bash docker/claude/tests-hooks-guard.sh          # the Claude Code hooks: rm guard deny/pass table, waiting marker
 ```
 
 815 tests cover the decision state machine, the config layering (including the
@@ -1507,9 +1624,19 @@ in-place migration, one-snapshot-per-poll, dry-run capture), the
 never-remove contract, the compare-and-swap under a concurrent writer, the
 derived-repos record, and the first-run-dialog pane classifier with devloop
 PR #124's fixtures verbatim; loop tests for hub-ify seeding before the spawn
-and the `wedged:first-run-dialog` kill + seed + re-queue), and the reviewer console (auth
+and the `wedged:first-run-dialog` kill + seed + re-queue), the prompt
+responder (`test_prompts.py`: devloop's fixtures verbatim with the review
+checkout as the worktree; `test_alissa.py`: the raw tmux surface and its
+allowlist; loop tests for the marker/quiet triggers, foreign sessions never
+read, observe and dry-run sending nothing, the narration line and the
+`escalation.prompt` row, the account hold through `poll_once` and its
+expiry, the ladder and the cap ending in the daemon's kill, and the
+round-cap pin — a killed session's round re-enters under the same number;
+`test_hooks_guard.py` / `test_entrypoint_hooks.py` for the shipped hooks and
+their idempotent settings merge), and the reviewer console (auth
 matrix, endpoint payload shapes off a seeded state.db, `/proc` parsing with
-vanished PIDs, pinned action argv, HTML token presence), with GitHub, Alissa,
+vanished PIDs, pinned action argv, `/api/pane` and `/action/answer` with
+their 409s, HTML token presence), with GitHub, Alissa,
 tmux and `/proc` faked.
 
 **Verified live:** the search query, login resolution, PR/review fetching,
