@@ -58,7 +58,7 @@ This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned by
 both an exact tag and a digest:
 
 ```dockerfile
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1@sha256:4c838a0df55391cfa1feab75568f6c493fe2fe9e9de17495d70988ca8252682a
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:970dfe6f1179d9c5b1c709c47fbb9211c4adeca2b68c0da5d362726be572106e
 ```
 
 The base is **public on GHCR**, so the pull is anonymous — no registry
@@ -109,6 +109,17 @@ and the older CLI wedged every session on it with a 400), `codex` from `0.149.1`
 to `0.153.4`, `pi` stays at `0.73.1`. The leaf contract, the image config and
 the size (~428 MB compressed amd64 layers) are unchanged.
 
+The bump to `0.2.2` (base PR `ali-fhr/alissa-loopwork#5`) is the same kind of
+patch re-snapshot: claude-code goes from `2.1.263` to `2.1.283` — the reason
+for the bump is `claude-opus-5-5`, the model the shared reviewer fleet pins
+(see [Pinning the reviewer model](#pinning-the-reviewer-model)), which only
+claude-code ≥ `2.1.280` knows; an older CLI fails every session on it with a
+400, the way `2.1.241` did for `claude-fable-5-1`. `codex` goes from `0.153.4`
+to `0.157.1`, `pi` stays at `0.73.1`. Nothing else changes: same leaf contract,
+same image config, and `tests-image-contract.sh` now asserts the `2.1.280`
+claude-code floor inside the built image so a base regression cannot land
+green.
+
 #### How the pin is written
 
 Never `:latest`, and never a bare tag either. The reference carries **two values
@@ -116,8 +127,8 @@ that do different jobs**, and a bump changes both together:
 
 | half | job |
 | --- | --- |
-| `:0.2.1` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
-| `@sha256:4c838a0d…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.1` is substituted into every build with no diff to review. |
+| `:0.2.2` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
+| `@sha256:970dfe6f…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.2` is substituted into every build with no diff to review. |
 
 The digest matters more here than for an ordinary base image. This one line is now
 the *entire* review surface for claude-code, a `curl … | bash` CLI install and
@@ -125,19 +136,19 @@ the whole apt layer — none of which this repo builds, or sees, any more. A sil
 substitution should be a build failure, not a successful build of something else.
 
 The pinned digest is the **index** digest (what the registry returns as
-`Docker-Content-Digest` for the tag `0.2.1`), not the digest of the amd64 child
-manifest it currently selects (`sha256:dd2ec8f4…`). Pinning the index keeps
+`Docker-Content-Digest` for the tag `0.2.2`), not the digest of the amd64 child
+manifest it currently selects (`sha256:7e5369da…`). Pinning the index keeps
 platform selection a build-time choice, so when the base gains arm64 this stays an
 ordinary two-value bump instead of a reference that can only ever resolve to
 amd64. Read the current values back with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2
 ```
 
 #### Platform: amd64 only
 
-**The base publishes `linux/amd64` and nothing else.** Its `0.2.1` index contains
+**The base publishes `linux/amd64` and nothing else.** Its `0.2.2` index contains
 exactly one platform manifest plus an attestation manifest — no `arm64`, no
 `arm/v7`. The `python:3.12-slim-bookworm` this image used to build from shipped
 five architectures, so this is a real narrowing and it is worth knowing before you
@@ -387,11 +398,18 @@ for `effective reviewer command:`).
 | `ALISSA_AGENT_MODEL` | reviewer `command:` becomes |
 | --- | --- |
 | *(unset)* → default `claude-fable-5-1` | `claude … --model claude-fable-5-1` |
-| `claude-opus-4-8` (any alias or full id) | `claude … --model claude-opus-4-8` |
+| `claude-opus-5-5` (any alias or full id) | `claude … --model claude-opus-5-5` |
 | `default` *or* empty | `claude …` (no `--model` — restores account default) |
 
+The **shared reviewer fleet** — the Railway service `dark-revloop-shared` — does
+not run the image default: the operator pinned `ALISSA_AGENT_MODEL=claude-opus-5-5`
+as a service variable on 2026-09-26, so every reviewer it spawns runs
+`claude … --model claude-opus-5-5`. That id is known to claude-code ≥ `2.1.280`
+only, which is what base `0.2.2` (claude-code `2.1.283`) is for; on an older
+base the pin is accepted at boot and every session then dies with a 400.
+
 The value passes through **verbatim** — both aliases (`opus`, `sonnet`) and full
-ids (`claude-opus-4-8`) are valid; there is no allowlist. There is a **shape
+ids (`claude-opus-5-5`) are valid; there is no allowlist. There is a **shape
 rule**, though: the value must be one bare token of letters, digits, dot,
 underscore or dash (`[A-Za-z0-9._-]`, the same rule the CLI applies to every
 value it puts on this launch line) that does not start with a dash, and the
@@ -450,7 +468,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_WAITING_DIR` | `/workspace/.waiting` | where the image's `note-waiting.py` hook leaves the `<tmux session>.json` "waiting for input" markers **and** where the daemon reads them (the renderer writes the same value into `waiting_dir`). Read at run time by the hooks; **pass-through** to the daemon. Needs `REVLOOP_VERSION >= 0.31.3` for the daemon half |
 | `ALISSA_SHELL_GUARD` | *(unset — **on**)* | `off` / `0` / `false` / `no` skips the rm guard's `PreToolUse` registration **and removes one a previous boot wrote** into the persisted `$CLAUDE_CONFIG_DIR/settings.json` — the rollback lever, effective on the next boot. Runtime env only, deliberately not a build ARG: a baked `off` would be a fleet-wide rollback nobody can see in a running container |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
-| `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin |
+| `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin. The shared fleet (`dark-revloop-shared`) sets `claude-opus-5-5` here, which needs base ≥ `0.2.2` (claude-code ≥ `2.1.280`) |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |

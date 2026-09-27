@@ -334,6 +334,16 @@ model_boot "${LOG2C}" ALISSA_AGENT_MODEL=claude-opus-4-8
 assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-opus-4-8" \
   "a full model id passes through unchanged (no allowlist)"
 
+# The id the shared fleet (dark-revloop-shared) pins via its Railway variable
+# (issue #140): same shape as any full id, enumerated so the fleet's actual
+# value is exercised by name and its effective command line is on record.
+LOG2C2="${TMPROOT}/model-fullid-opus55.log"
+model_boot "${LOG2C2}" ALISSA_AGENT_MODEL=claude-opus-5-5
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-opus-5-5" \
+  "the fleet's pinned id claude-opus-5-5 passes the shape rule and is pinned verbatim"
+assert_contains "${LOG2C2}" "reviewer model: claude-opus-5-5 (ALISSA_AGENT_MODEL)" \
+  "...and the log names it"
+
 LOG2D="${TMPROOT}/model-default.log"
 model_boot "${LOG2D}" ALISSA_AGENT_MODEL=default
 assert_eq "$(profile_cmd)" "${BASE_CMD}" \
