@@ -239,7 +239,7 @@ _VERDICT_RE = re.compile(
 # The envelope's merge-readiness judgment (issue #130). The alissa-code-review
 # skill writes it as one list line in the verdict envelope:
 #   - **Merge-Readiness:** auto
-#   - **Merge-Readiness:** operator — touches convex/schema.ts
+#   - **Merge-Readiness:** operator — schema-migration: removes users.legacyId
 # Tolerant of the markdown around the label -- an optional bullet, optional
 # `**` bold around the label (with the colon inside or outside it), optional
 # bold around the value -- but NOT of the value's case: `Auto` is not a
@@ -255,19 +255,81 @@ _READINESS_RE = re.compile(
     re.MULTILINE,
 )
 
+# The operator reason's CLASS (issue #142). An `operator` judgment names WHY
+# the merge is a human's, and until now it did so in prose the merge edge
+# could not act on: of 14 operator verdicts on ~40 studio PRs, 3 named real
+# merge risk and 11 were "the PR body lists an unverified item" -- validation
+# work the human does at gate 2 anyway, not a reason to withhold the merge.
+# So the reason now LEADS with one token from this closed enum, in the
+# consumer's grammar:
+#
+#   Merge-Readiness: auto
+#   Merge-Readiness: operator — <class>: <one-line reason>
+#
+# The order below is the SEVERITY order: when more than one row applies, the
+# reviewer names the one nearest the top (the most severe wins), and exactly
+# one. `auto` never carries a class. An operator line whose reason does not
+# lead with a recognised token is still valid grammar -- it parses, value and
+# reason intact -- and reads as UNCLASSED (`klass=None`); the consumer treats
+# unclassed as a hard hold (fail closed), so a reviewer that forgets the
+# class loses throughput, never safety. The token is matched exactly as
+# written here (lowercase, hyphenated): `Schema-Migration:` is not a class
+# this daemon reads, for the same reason `Auto` is not a value it carries.
+READINESS_CLASSES: "tuple[str, ...]" = (
+    "schema-migration",   # schema shape changes needing a migration / removal / rename on live data
+    "data-backfill",      # one-off writes over existing rows (backfills, stored-shape version bumps)
+    "secrets-env",        # new / changed env vars, secrets, credentials the deploy must carry
+    "infra-deploy",       # Dockerfiles, workflows, Railway config, base-image pins -- what runs
+    "billing",            # credit charging, pricing, tiers, quotas
+    "security",           # auth, permission gates, redaction, sandboxing flagged operator-worthy
+    "unverified-ux",      # the PR body's operator gate is a human look at a screen / copy / mockup
+    "unverified-runtime",  # the PR body's operator gate is a live smoke / real-model run / replay
+    "release-act",        # the merge itself is a release (VERSION bump -> publish, tag, npm)
+)
+_READINESS_CLASS_RE = re.compile(
+    r"^(" + "|".join(re.escape(klass) for klass in READINESS_CLASSES) + r")[ \t]*:"
+)
+
 # The reason lands in a GitHub review body (as a line-anchored trailer) and in
 # a log line, so it is bounded and flattened at the parser: one line, no
 # backticks (a fence would swallow the trailer and everything after it), and
-# no more than this many characters.
+# no more than this many characters. The class prefix is PART of the reason
+# and survives the flattening untouched: the native trailer must stay
+# byte-equal to the envelope's line, class included.
 MAX_READINESS_REASON_CHARS = 200
 
 
 def clean_readiness_reason(text: object) -> str:
-    """Flatten a Merge-Readiness reason to one bounded, backtick-free line."""
+    """Flatten a Merge-Readiness reason to one bounded, backtick-free line.
+
+    The `<class>:` prefix, when present, is kept intact at the head of the
+    line -- classify_readiness_reason reads it off the cleaned reason, and the
+    emitter copies the cleaned reason whole.
+    """
     if not isinstance(text, str):
         return ""
     flat = " ".join(text.replace("`", "").split())
     return flat[:MAX_READINESS_REASON_CHARS].rstrip()
+
+
+def classify_readiness_reason(value: object, reason: object) -> "str | None":
+    """The READINESS_CLASSES token an `operator` reason leads with, or None.
+
+    None for `auto` (never classed), for an operator reason that leads with
+    no recognised token (UNCLASSED -- the consumer's hard hold), and for a
+    token in the wrong case or spelling. The reason itself is never altered:
+    the class is read off it, not cut out of it.
+    """
+    if value != READINESS_OPERATOR or not isinstance(reason, str):
+        return None
+    match = _READINESS_CLASS_RE.match(reason)
+    return match.group(1) if match else None
+
+
+def _classed(value: "str | None", raw_reason: object) -> "tuple[str | None, str, str | None]":
+    """The `(value, reason, klass)` triple both parsers hand back."""
+    reason = clean_readiness_reason(raw_reason)
+    return (value, reason, classify_readiness_reason(value, reason))
 
 
 # The trailer's own grammar (issue #134) -- the bare-line sibling of
@@ -288,37 +350,42 @@ _TRAILER_RE = re.compile(
 )
 
 
-def parse_trailer(body: object) -> "tuple[str | None, str]":
-    """`(value, reason)` from the first bare `Merge-Readiness:` line in a
-    review body, or `(None, "")` when no line matches the trailer grammar.
+def parse_trailer(body: object) -> "tuple[str | None, str, str | None]":
+    """`(value, reason, klass)` from the first bare `Merge-Readiness:` line in
+    a review body, or `(None, "", None)` when no line matches the trailer
+    grammar.
 
     Strict where parse_readiness is tolerant: the line inside backticks
     mid-sentence (studio #1258) and the envelope's `- **Merge-Readiness:**`
     bullet both read as MISSING here, because the consumer's regex is what
     decides whether the merge edge sees the judgment at all. CRLF bodies (a
     review typed into the web form) are normalised first; the grammar itself
-    is unchanged.
+    is unchanged. `klass` is the READINESS_CLASSES token an operator reason
+    leads with, or None (auto, or an unclassed operator -- issue #142).
     """
     if not isinstance(body, str):
-        return (None, "")
+        return (None, "", None)
     match = _TRAILER_RE.search(body.replace("\r\n", "\n"))
     if match is None:
-        return (None, "")
-    return (match.group(1), clean_readiness_reason(match.group(2)))
+        return (None, "", None)
+    return _classed(match.group(1), match.group(2))
 
 
-def parse_readiness(blob: object) -> "tuple[str | None, str]":
-    """`(value, reason)` from the first Merge-Readiness line in `blob`.
+def parse_readiness(blob: object) -> "tuple[str | None, str, str | None]":
+    """`(value, reason, klass)` from the first Merge-Readiness line in `blob`.
 
     `value` is READINESS_AUTO / READINESS_OPERATOR, or None when no line
-    parses; `reason` is the cleaned trailing text (empty when there is none).
+    parses; `reason` is the cleaned trailing text (empty when there is none),
+    class prefix included; `klass` is the READINESS_CLASSES token that reason
+    leads with, or None when the value is `auto`, the reason is unclassed, or
+    nothing parsed (issue #142).
     """
     if not isinstance(blob, str):
-        return (None, "")
+        return (None, "", None)
     match = _READINESS_RE.search(blob)
     if match is None:
-        return (None, "")
-    return (match.group(1), clean_readiness_reason(match.group(2)))
+        return (None, "", None)
+    return _classed(match.group(1), match.group(2))
 
 
 @dataclass(frozen=True)
@@ -580,12 +647,17 @@ class VerdictEnvelope:
     envelope has no parseable `Merge-Readiness` line -- the case the native
     post fails closed on. `readiness_reason` is already one bounded,
     backtick-free line (see clean_readiness_reason); empty when the envelope
-    gave none.
+    gave none. `readiness_class` is the READINESS_CLASSES token an operator
+    reason leads with (issue #142), or None: for `auto`, for an unclassed
+    operator reason, and for a missing line alike -- the reason keeps the
+    prefix either way, so the class is never lost between here and the
+    native trailer.
     """
 
     verdict: str
     readiness: "str | None" = None
     readiness_reason: str = ""
+    readiness_class: "str | None" = None
 
 
 @dataclass(frozen=True)
@@ -1086,9 +1158,9 @@ class Alissa:
                     continue
                 match = _VERDICT_RE.search(blob)
                 if match:
-                    readiness, reason = parse_readiness(content)
+                    readiness, reason, klass = parse_readiness(content)
                     if readiness is None:
-                        readiness, reason = parse_readiness(title)
+                        readiness, reason, klass = parse_readiness(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
@@ -1096,6 +1168,7 @@ class Alissa:
                              verdict=match.group(1).lower(),
                              readiness=readiness,
                              readiness_reason=reason,
+                             readiness_class=klass,
                          ))
                     )
                     break

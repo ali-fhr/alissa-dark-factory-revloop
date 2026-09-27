@@ -46,6 +46,7 @@ from alissa.tools.github.revloop.alissa import (
     Alissa,
     VerdictEnvelope,
     _TRAILER_RE,
+    classify_readiness_reason,
     parse_readiness,
     parse_trailer,
     ManagedSession,
@@ -466,10 +467,14 @@ class FakeAlissa:
         self.verdict_calls.append(task_ref)
         if self.verdict is None:
             return None
+        # The class is derived exactly as production derives it -- off the
+        # reason with the shared classifier (issue #142) -- so a fake
+        # envelope can never carry a class its reason does not.
         return VerdictEnvelope(
             verdict=self.verdict,
             readiness=self.readiness,
             readiness_reason=self.readiness_reason,
+            readiness_class=classify_readiness_reason(self.readiness, self.readiness_reason),
         )
 
     def count_verdicts(self, task_ref):
@@ -1735,15 +1740,15 @@ def envelope_from(monkeypatch, payload, ref="TASK-500"):
 @pytest.mark.parametrize(
     "line, expected",
     [
-        ("- **Merge-Readiness:** auto", ("auto", "")),
+        ("- **Merge-Readiness:** auto", ("auto", "", None)),
         ("- **Merge-Readiness:** operator — touches convex/schema.ts",
-         ("operator", "touches convex/schema.ts")),
-        ("* **Merge-Readiness**: operator - hyphen separator", ("operator", "hyphen separator")),
-        ("Merge-Readiness: auto", ("auto", "")),
-        ("Merge-Readiness: operator – en dash", ("operator", "en dash")),
-        ("- **Merge-Readiness:** **auto**", ("auto", "")),
-        ("  - **Merge-Readiness:**   operator   ", ("operator", "")),
-        ("- **Merge-Readiness:** operator —", ("operator", "")),
+         ("operator", "touches convex/schema.ts", None)),
+        ("* **Merge-Readiness**: operator - hyphen separator", ("operator", "hyphen separator", None)),
+        ("Merge-Readiness: auto", ("auto", "", None)),
+        ("Merge-Readiness: operator – en dash", ("operator", "en dash", None)),
+        ("- **Merge-Readiness:** **auto**", ("auto", "", None)),
+        ("  - **Merge-Readiness:**   operator   ", ("operator", "", None)),
+        ("- **Merge-Readiness:** operator —", ("operator", "", None)),
     ],
     ids=["bullet-bold", "bullet-bold-reason", "star-bold-outside-colon", "plain",
          "en-dash", "bold-value", "padded", "empty-reason"],
@@ -1768,22 +1773,22 @@ def test_readiness_line_variants_parse(line, expected):
 def test_readiness_line_that_misses_the_grammar_is_missing(line):
     """`Auto` is not a judgment the daemon carries: value case is part of the
     contract, and anything that misses it fails closed downstream."""
-    assert parse_readiness(f"body\n{line}\n") == (None, "")
+    assert parse_readiness(f"body\n{line}\n") == (None, "", None)
 
 
 def test_readiness_reason_is_one_bounded_backtick_free_line():
-    readiness, reason = parse_readiness(
+    readiness, reason, _ = parse_readiness(
         "- **Merge-Readiness:** operator — `a`  b\nnext line\n"
     )
     assert (readiness, reason) == ("operator", "a b")
-    _, long = parse_readiness("- **Merge-Readiness:** operator — " + "r" * 300)
+    _, long, _ = parse_readiness("- **Merge-Readiness:** operator — " + "r" * 300)
     assert len(long) == MAX_READINESS_REASON_CHARS
 
 
 def test_the_first_readiness_line_wins():
     assert parse_readiness(
         "- **Merge-Readiness:** operator — first\n- **Merge-Readiness:** auto\n"
-    ) == ("operator", "first")
+    ) == ("operator", "first", None)
 
 
 def test_the_envelope_carries_its_readiness_with_the_verdict(monkeypatch):
@@ -3889,7 +3894,7 @@ def test_an_approve_envelope_posts_a_native_approve(config, no_post_grace):
 # -- the Merge-Readiness trailer (issue #130) --------------------------------
 #
 # orcloop's merge edge reads the reviewer's judgment off the native APPROVE:
-# one line-anchored `Merge-Readiness: auto | operator — <reason>` line, the
+# one line-anchored `Merge-Readiness: auto | operator — <class>: <reason>` line, the
 # last non-empty line before the hidden verdict marker. The daemon carries
 # the envelope's line; it never invents `auto`, and an envelope without the
 # line fails closed to `operator`.
@@ -4313,12 +4318,12 @@ def _envelope(readiness=None, reason=""):
 @pytest.mark.parametrize(
     "envelope, expected",
     [
-        (_envelope(READINESS_AUTO), (READINESS_AUTO, "")),
-        (_envelope(READINESS_OPERATOR), (READINESS_OPERATOR, "")),
+        (_envelope(READINESS_AUTO), (READINESS_AUTO, "", None)),
+        (_envelope(READINESS_OPERATOR), (READINESS_OPERATOR, "", None)),
         (_envelope(READINESS_OPERATOR, "touches convex/schema.ts"),
-         (READINESS_OPERATOR, "touches convex/schema.ts")),
-        (_envelope(), (READINESS_OPERATOR, "envelope carries no Merge-Readiness line")),
-        (None, (READINESS_OPERATOR, "envelope carries no Merge-Readiness line")),
+         (READINESS_OPERATOR, "touches convex/schema.ts", None)),
+        (_envelope(), (READINESS_OPERATOR, "envelope carries no Merge-Readiness line", None)),
+        (None, (READINESS_OPERATOR, "envelope carries no Merge-Readiness line", None)),
     ],
 )
 def test_the_emitter_and_the_shared_trailer_regex_agree(envelope, expected):
@@ -4346,18 +4351,19 @@ def test_the_emitter_and_the_shared_trailer_regex_agree(envelope, expected):
     ],
 )
 def test_the_trailer_regex_rejects_the_backticked_bold_and_bulleted_shapes(body):
-    assert parse_trailer(f"verdict\n{body}\nmore\n") == (None, "")
+    assert parse_trailer(f"verdict\n{body}\nmore\n") == (None, "", None)
 
 
 @pytest.mark.parametrize(
     "body, expected",
     [
-        ("Merge-Readiness: auto", ("auto", "")),
-        ("Merge-Readiness:auto", ("auto", "")),
-        ("Merge-Readiness: operator", ("operator", "")),
-        ("Merge-Readiness: operator — touches convex/schema.ts", ("operator", "touches convex/schema.ts")),
-        ("Merge-Readiness: operator - hyphen", ("operator", "hyphen")),
-        ("Merge-Readiness: auto   ", ("auto", "")),
+        ("Merge-Readiness: auto", ("auto", "", None)),
+        ("Merge-Readiness:auto", ("auto", "", None)),
+        ("Merge-Readiness: operator", ("operator", "", None)),
+        ("Merge-Readiness: operator — touches convex/schema.ts",
+         ("operator", "touches convex/schema.ts", None)),
+        ("Merge-Readiness: operator - hyphen", ("operator", "hyphen", None)),
+        ("Merge-Readiness: auto   ", ("auto", "", None)),
     ],
 )
 def test_the_trailer_regex_reads_the_bare_line(body, expected):
@@ -4369,9 +4375,9 @@ def test_the_trailer_regex_reads_the_bare_line(body, expected):
 def test_parse_trailer_takes_the_first_bare_line_and_flattens_the_reason():
     assert parse_trailer(
         "Merge-Readiness: operator — `first`  reason\nMerge-Readiness: auto\n"
-    ) == ("operator", "first reason")
-    assert parse_trailer(None) == (None, "")
-    assert parse_trailer("") == (None, "")
+    ) == ("operator", "first reason", None)
+    assert parse_trailer(None) == (None, "", None)
+    assert parse_trailer("") == (None, "", None)
 
 
 def test_a_non_approve_close_names_no_readiness(config, no_post_grace, caplog):
@@ -4389,7 +4395,7 @@ def test_the_trailer_reason_arrives_flat_bounded_and_fence_free(config, no_post_
     once); the post trusts what it is handed, so this pins the whole path from
     a hostile envelope body to the posted trailer."""
     hostile = "touches `convex/schema.ts`\nand also\n```\nfenced\n```\n" + "x" * 300
-    readiness, reason = parse_readiness(f"- **Merge-Readiness:** operator — {hostile}")
+    readiness, reason, _ = parse_readiness(f"- **Merge-Readiness:** operator — {hostile}")
     assert readiness == READINESS_OPERATOR
     w, gh, _ = envelope_ahead(
         config, VERDICT_APPROVE, readiness=readiness, readiness_reason=reason

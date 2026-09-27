@@ -429,6 +429,56 @@ every other field: flags, `mode`, `quietSeconds`, and `promptPatterns` are
 untouched, and reviewer posture (CR6: reviewers never write) stays enforced by the
 round directive, independent of the model.
 
+### The `Merge-Readiness` class the reviewer writes
+
+Every approve a reviewer from this image posts ends with the merge-readiness
+trailer the round directive dictates, and since `REVLOOP_VERSION >= 0.31.4` its
+`operator` form is **classed** (issue #142):
+
+```
+Merge-Readiness: auto
+Merge-Readiness: operator — <class>: <one-line reason>
+```
+
+`<class>` is exactly one token from a closed enum, lowercase and hyphenated,
+and the directive states the table to the reviewer in every round — the verdict
+round and every fix-round re-review alike. In **severity order**:
+
+| class | when the reviewer uses it |
+| --- | --- |
+| `schema-migration` | schema shape changes that need a migration, removal or rename on live data |
+| `data-backfill` | one-off writes over existing rows (backfills, version bumps of stored shapes) |
+| `secrets-env` | new or changed env vars, secrets or credentials the deploy must carry |
+| `infra-deploy` | Dockerfiles, workflows, Railway config, base-image pins — anything that changes what runs |
+| `billing` | credit charging, pricing, tiers, quotas |
+| `security` | auth, permission gates, redaction, sandboxing — anything the rubric's security dimension flagged as operator-worthy |
+| `unverified-ux` | the PR body's operator gate is a human look at a screen, copy or mockup |
+| `unverified-runtime` | the PR body's operator gate is a live smoke, real-model run or replay the worker could not run |
+| `release-act` | the merge itself is a release (VERSION bump → publish, tag, npm) |
+
+Three rules an operator reading a verdict should know:
+
+- **the most severe row wins.** When several apply, the reviewer names the one
+  nearest the top, and only it;
+- **an unclassed `operator` line is a hard hold.** A reason that does not lead
+  with one of the nine tokens (prose, a capitalised or misspelt token, the
+  token without its colon) still parses — `operator`, reason intact — but
+  carries **no class**, and the merge edge treats that as the strictest hold.
+  The envelope-less fallback the daemon posts (`operator — envelope carries no
+  Merge-Readiness line`) is unclassed by construction. Forgetting the class
+  costs throughput, never safety;
+- **`auto` never carries a class**, and the daemon never adds, drops or
+  rewrites one: the native line is the envelope's value, class and reason byte
+  for byte. The daemon's round-close log line and the PR's activity row name
+  the class (`class=<token>`, or `class=unclassed`).
+
+The point of the class is a **merge policy**: `unverified-*` holds are
+validation work the human does at gate 2 anyway, not merge risk, so a
+consumer may merge those while it keeps holding the rows above. That policy is
+the orchestrator's own task; the grammar, the enum and the parser live in the
+daemon library — see the repository README's *The `Merge-Readiness` trailer on
+a native approve* for the consumer contract.
+
 ## Configuration (build ARGs — Railway-friendly)
 
 Every non-secret knob is a build `ARG` baked into an `ENV` of the same name.

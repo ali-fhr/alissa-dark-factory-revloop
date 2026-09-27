@@ -4,6 +4,54 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.4
+
+- **Classed `Merge-Readiness`: `operator — <class>: <reason>`** (issue #142,
+  origin TASK-173324447). The reviewer's operator judgment was binary in
+  effect — `auto`, or `operator` with a prose reason the merge edge could
+  not act on. Of 14 operator verdicts on the last ~40 studio PRs, 3 named
+  real merge risk and 11 named validation work the human does at gate 2
+  anyway; the orchestrator held all 14 alike. The operator reason now
+  **leads with one token from a closed, severity-ordered enum** —
+  `schema-migration`, `data-backfill`, `secrets-env`, `infra-deploy`,
+  `billing`, `security`, `unverified-ux`, `unverified-runtime`,
+  `release-act` — so the orchestrator's forthcoming merge policy (its own
+  task) can merge the second kind and keep holding the first. Rules: exactly
+  one class, the **most severe** applicable row (top of the table wins);
+  `auto` never carries a class; an operator line whose reason leads with no
+  recognised token is still valid grammar and reads as **unclassed** — the
+  consumer's hard hold (fail closed), so a reviewer that forgets the class
+  loses throughput, never safety. The consumer regex is unchanged: the class
+  rides inside the reason group.
+  - `parse_readiness` and `parse_trailer` (`alissa.py`) return
+    `(value, reason, klass | None)`; `READINESS_CLASSES` is the enum in
+    severity order, `classify_readiness_reason` reads the class off the
+    cleaned reason, and `clean_readiness_reason` keeps the prefix intact so
+    the native trailer stays byte-equal to the envelope's line, class
+    included. `VerdictEnvelope` gains `readiness_class`. The envelope-less
+    fallback (`operator — envelope carries no Merge-Readiness line`) carries
+    no class.
+  - Both round directives (`_MERGE_READINESS_LINE`) state the operator form,
+    the compact table (each token exactly once — pinned by test), the
+    most-severe rule and the reasoning that makes honest classification the
+    reviewer's interest ("unverified-* holds are validation work, not merge
+    risk"); the envelope-less fallback is named as `operator` with no class.
+  - The round-close log line and activity row (daemon-posted path) and the
+    session-posted observation (issue #134) name the class:
+    `class=<token>` on a classed operator, `class=unclassed` on one without,
+    nothing on `auto`.
+  - README (*The `Merge-Readiness` trailer on a native approve* → *The
+    operator class*) and `docker/claude/README.md` (*The `Merge-Readiness`
+    class the reviewer writes*) document the enum, the most-severe rule and
+    unclassed = hard hold. New `test_readiness.py`: every class through both
+    parsers and both dash separators, the unclassed and near-miss shapes,
+    the directive's one-statement table, byte-equality of the copied native
+    line, the class-free fallback, and the class on every narration surface.
+  - Not in this release: the `alissa-code-review` skill's own envelope line
+    (`references/verdict-envelope.md`, `references/merge-readiness.md`) still
+    reads `operator — <reason>`; it lives outside this repository and is the
+    operator's follow-up. No config key.
+
 ## 0.31.3
 
 - **The shell guard, the waiting marker and the prompt responder on the
