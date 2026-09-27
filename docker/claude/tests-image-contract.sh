@@ -24,7 +24,10 @@
 #
 #   1. the build itself succeeds
 #   2. `alissa-revloop`, `alissa-revloop-ui`, `claude`, `alissa`, `gh`, `tmux`,
-#      `codex`, `pi` all resolvable on PATH. The last two are base-contract only:
+#      `codex`, `pi` all resolvable on PATH — and `claude --version` is at least
+#      2.1.280, the first claude-code that knows `claude-opus-5-5`, the model
+#      the shared fleet pins (issue #140; base 0.2.2 ships 2.1.283). The
+#      version is printed so the CI log records what each build inherited. The last two are base-contract only:
 #      this daemon never spawns them (base 0.2.0 made the base multi-agent), and
 #      they are asserted precisely BECAUSE nothing here would notice them going
 #      missing — which is the same reason every other inherited item is listed.
@@ -154,6 +157,21 @@ for b in alissa-revloop alissa-revloop-ui claude alissa gh tmux codex pi; do
   p="$(command -v "$b" 2>/dev/null)"
   if [ -n "$p" ]; then ok "command -v $b -> $p"; else no "command -v $b -> NOT FOUND"; fi
 done
+
+# --- the inherited claude-code is new enough for the fleet's model pin ---
+# The base leaves claude-code unpinned and re-snapshots it per release, so the
+# FROM bump is the only thing that moves it. `claude-opus-5-5` (the id the
+# shared fleet sets in ALISSA_AGENT_MODEL) is known to >= 2.1.280 only; an
+# older CLI accepts the pin at boot and then fails every session with a 400,
+# which nothing in this repo would otherwise notice. Printed as well as
+# asserted so the CI log records the version each build actually inherited.
+CLAUDE_FLOOR=2.1.280
+cv="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -n "$cv" ] && [ "$(printf '%s\n' "$CLAUDE_FLOOR" "$cv" | sort -V | head -1)" = "$CLAUDE_FLOOR" ]; then
+  ok "claude --version = $cv (>= $CLAUDE_FLOOR, knows claude-opus-5-5)"
+else
+  no "claude --version = '${cv:-<none>}' — below the $CLAUDE_FLOOR floor claude-opus-5-5 needs"
+fi
 
 # --- the non-root user ---
 eq "id -u alissa" 1000 "$(id -u alissa 2>/dev/null)"

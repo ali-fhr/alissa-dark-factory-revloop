@@ -64,7 +64,7 @@
 #     deliberate, reviewable change to this line, and that is the ONLY thing that
 #     advances the shared infrastructure layers;
 #   * the `@sha256:` is the ENFORCING half — a tag is mutable, so without it a
-#     re-push of `0.2.1` is substituted into every build with no diff to review.
+#     re-push of `0.2.2` is substituted into every build with no diff to review.
 #     That matters more here than for an ordinary base: this pin is now the whole
 #     review surface for claude-code, the `curl … | bash` CLI install and the apt
 #     layer, none of which this repo builds any more.
@@ -77,10 +77,17 @@
 # into the reference, so an arm64 base, once published, needs only the ordinary
 # two-value bump. Read the current one back with:
 #
-#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1
+#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2
 #
 # The base is linux/amd64-ONLY today; see "Base image" in README.md.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.1@sha256:4c838a0df55391cfa1feab75568f6c493fe2fe9e9de17495d70988ca8252682a
+#
+# What 0.2.2 ships that matters to this leaf: claude-code 2.1.283 (0.2.1 had
+# 2.1.263). The reviewer model the shared fleet pins, `claude-opus-5-5`, is
+# known to claude-code >= 2.1.280 only -- an older CLI answers every session
+# with a 400, exactly as 2.1.241 did for `claude-fable-5-1` (which needs
+# >= 2.1.251, satisfied since 0.2.1). tests-image-contract.sh asserts the
+# 2.1.280 floor inside the built image. Base release: ali-fhr/alissa-loopwork#5.
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:970dfe6f1179d9c5b1c709c47fbb9211c4adeca2b68c0da5d362726be572106e
 
 # Version of the daemon to install from PyPI. Bump per release: 0.29.0 is the
 # release this repo publishes on merge (it must match the dist's version file,
@@ -348,8 +355,11 @@ ARG ALISSA_AGENT_PROFILE="claude"
 # usage-throttled account). Default `claude-fable-5-1`: the latest and most
 # capable generally available Claude model, one tier above Opus (operator
 # decision 2026-09-01).
-# Alias (`opus`/`sonnet`) or full id (`claude-opus-4-8`) pass through verbatim;
+# Alias (`opus`/`sonnet`) or full id (`claude-opus-5-5`) pass through verbatim;
 # `default` or empty omits the --model flag. See the entrypoint (step 2e) + README.
+# The shared reviewer fleet (`dark-revloop-shared`) overrides this default with
+# the Railway variable ALISSA_AGENT_MODEL=claude-opus-5-5 (operator, 2026-09-26);
+# that id needs the base pinned above (claude-code >= 2.1.280).
 ARG ALISSA_AGENT_MODEL="claude-fable-5-1"
 ARG ALISSA_ON_MISSING_HUB="add"
 # Worker reconcile tick, seconds.
