@@ -46,7 +46,6 @@ from alissa.tools.github.revloop.alissa import (
     Alissa,
     VerdictEnvelope,
     _TRAILER_RE,
-    classify_readiness_reason,
     parse_readiness,
     parse_trailer,
     ManagedSession,
@@ -467,14 +466,14 @@ class FakeAlissa:
         self.verdict_calls.append(task_ref)
         if self.verdict is None:
             return None
-        # The class is derived exactly as production derives it -- off the
-        # reason with the shared classifier (issue #142) -- so a fake
-        # envelope can never carry a class its reason does not.
+        # No class here, as in production: the class is a function of the
+        # reason (classify_readiness_reason), read off the line the daemon
+        # emits, so a fake envelope can never carry a class its reason does
+        # not.
         return VerdictEnvelope(
             verdict=self.verdict,
             readiness=self.readiness,
             readiness_reason=self.readiness_reason,
-            readiness_class=classify_readiness_reason(self.readiness, self.readiness_reason),
         )
 
     def count_verdicts(self, task_ref):

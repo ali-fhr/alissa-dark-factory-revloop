@@ -6,14 +6,17 @@
 `<class>` is one token from a closed, severity-ordered enum. This module pins
 the enum itself, the parse of every token through both parsers and both dash
 separators, the unclassed operator (valid grammar, `klass=None`, reason kept
-whole), the directive's one-statement table, the byte-equality of the copied
-native line with the envelope's, the class-free fallback, and the class on
-every narration surface. The pre-#142 readiness tests (value and reason)
-stay in test_loop.py; the shared fakes are imported from there.
+whole), the directive's one-statement table and its no-row-fits rule, the
+byte-equality of the copied native line with the envelope's, the class-free
+fallback, the class on every narration surface, and that the envelope holds
+the class only inside its reason (PR #143 round 1). The pre-#142 readiness
+tests (value and reason) stay in test_loop.py; the shared fakes are imported
+from there.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import pytest
@@ -171,29 +174,41 @@ def test_no_line_at_all_is_the_class_free_triple():
     assert parse_trailer("no line here") == (None, "", None)
 
 
-# -- the envelope carries the class ------------------------------------------
+# -- the envelope carries the class inside its reason, and nowhere else -------
 
 
-def test_the_envelope_carries_its_class_with_the_verdict(monkeypatch):
+def test_the_envelope_has_no_class_field_of_its_own():
+    """One source for the fact (PR #143 round 1): the class is a function of
+    the reason, the emitter copies the reason whole, and the narration reads
+    the class back off the emitted line -- a field here would be a second
+    copy nothing reads, free to drift."""
+    assert [f.name for f in dataclasses.fields(VerdictEnvelope)] == [
+        "verdict", "readiness", "readiness_reason",
+    ]
+
+
+def test_the_envelope_carries_its_class_inside_the_reason(monkeypatch):
     item = envelope("approve", 2, "2026-09-27T20:20:00Z")
     item["markdownContent"] += "\n- **Merge-Readiness:** operator — infra-deploy: Dockerfile FROM pin\n"
-    assert envelope_from(monkeypatch, {"evidence": [item]}) == VerdictEnvelope(
-        "approve", "operator", "infra-deploy: Dockerfile FROM pin", "infra-deploy",
-    )
+    got = envelope_from(monkeypatch, {"evidence": [item]})
+    assert got == VerdictEnvelope("approve", "operator", "infra-deploy: Dockerfile FROM pin")
+    assert classify_readiness_reason(got.readiness, got.readiness_reason) == "infra-deploy"
 
 
-def test_an_unclassed_envelope_carries_none(monkeypatch):
+def test_an_unclassed_envelope_classifies_to_none(monkeypatch):
     item = envelope("approve", 2, "2026-09-27T20:20:00Z")
     item["markdownContent"] += "\n- **Merge-Readiness:** operator — touches convex/schema.ts\n"
     got = envelope_from(monkeypatch, {"evidence": [item]})
-    assert got.readiness_class is None
+    assert classify_readiness_reason(got.readiness, got.readiness_reason) is None
     assert got.readiness_reason == "touches convex/schema.ts"
 
 
 def test_the_class_is_read_from_the_title_when_the_body_has_none(monkeypatch):
     item = envelope("approve", 1, "2026-09-27T20:20:00Z")
     item["title"] += "\nMerge-Readiness: operator — release-act: VERSION 0.31.4"
-    assert envelope_from(monkeypatch, {"evidence": [item]}).readiness_class == "release-act"
+    got = envelope_from(monkeypatch, {"evidence": [item]})
+    assert got.readiness_reason == "release-act: VERSION 0.31.4"
+    assert classify_readiness_reason(got.readiness, got.readiness_reason) == "release-act"
 
 
 # -- the directive states the table once ---------------------------------------
@@ -231,6 +246,24 @@ def test_the_directive_states_the_rules_of_the_class(template):
     assert "posts as `operator` with no class" in text
 
 
+@pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE], ids=["round-1", "round-k"])
+def test_the_directive_says_what_to_do_when_no_row_fits(template):
+    """The enum is closed, so the directive must name the way out (PR #143
+    round 1): a hold no row names is written UNCLASSED on purpose, and that is
+    the correct hard hold -- not shoehorned into the nearest row, which for a
+    vague reason is one of the `unverified-*` pair the policy may merge."""
+    text = _formatted(template)
+    assert "If NO row fits" in text
+    assert "write the reason with NO class" in text
+    assert "the correct hard hold, never a failure" in text
+    assert "shoehorning such a reason into the nearest row" in text
+    # the rule names the triggers the enum does not, so the reviewer
+    # recognises them instead of guessing a row
+    for trigger in ("dependency change", "public surface", "waived `[major]`",
+                    "judgment residual", "human ACTION"):
+        assert trigger in text, trigger
+
+
 # -- the copied native line is the envelope's, byte for byte ------------------
 
 
@@ -241,7 +274,7 @@ def test_the_native_trailer_equals_the_envelope_line_class_included(klass):
     native review is the envelope's value, class and reason byte for byte."""
     envelope_line = f"- **Merge-Readiness:** operator — {klass}: touches convex/schema.ts"
     value, reason, got = parse_readiness(f"# Review verdict: o/r#1 — approve\n\n{envelope_line}\n")
-    trailer = readiness_trailer(VerdictEnvelope(VERDICT_APPROVE, value, reason, got))
+    trailer = readiness_trailer(VerdictEnvelope(VERDICT_APPROVE, value, reason))
     assert trailer == f"Merge-Readiness: operator — {klass}: touches convex/schema.ts"
     assert trailer == envelope_line.replace("- **Merge-Readiness:**", "Merge-Readiness:")
     assert parse_trailer(trailer) == (READINESS_OPERATOR, reason, klass), "and reads back whole"
@@ -265,7 +298,7 @@ def test_the_posted_approve_carries_the_class_byte_for_byte(config, no_post_grac
 
 @pytest.mark.parametrize(
     "envelope_",
-    [None, VerdictEnvelope(VERDICT_APPROVE), VerdictEnvelope(VERDICT_APPROVE, None, "", None)],
+    [None, VerdictEnvelope(VERDICT_APPROVE), VerdictEnvelope(VERDICT_APPROVE, None, "")],
     ids=["no-envelope", "no-line", "explicit-none"],
 )
 def test_the_envelope_less_fallback_is_operator_with_no_class(envelope_):

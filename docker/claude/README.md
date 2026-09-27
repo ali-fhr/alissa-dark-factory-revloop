@@ -456,7 +456,7 @@ round and every fix-round re-review alike. In **severity order**:
 | `unverified-runtime` | the PR body's operator gate is a live smoke, real-model run or replay the worker could not run |
 | `release-act` | the merge itself is a release (VERSION bump → publish, tag, npm) |
 
-Three rules an operator reading a verdict should know:
+Four rules an operator reading a verdict should know:
 
 - **the most severe row wins.** When several apply, the reviewer names the one
   nearest the top, and only it;
@@ -467,6 +467,13 @@ Three rules an operator reading a verdict should know:
   The envelope-less fallback the daemon posts (`operator — envelope carries no
   Merge-Readiness line`) is unclassed by construction. Forgetting the class
   costs throughput, never safety;
+- **no row fits → no class, on purpose.** A hold the table does not name (a
+  dependency change, a deleted or renamed public surface, a waived
+  `[major]`, a judgment residual, an operator gate that is a human action
+  rather than a look or a smoke run) is written **unclassed** — the
+  directive says so. Read it as the correct hard hold, not as a reviewer
+  that forgot: the tempting alternative, the nearest `unverified-*` row, is
+  exactly what the merge policy may merge unattended;
 - **`auto` never carries a class**, and the daemon never adds, drops or
   rewrites one: the native line is the envelope's value, class and reason byte
   for byte. The daemon's round-close log line and the PR's activity row name

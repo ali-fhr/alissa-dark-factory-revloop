@@ -647,17 +647,20 @@ class VerdictEnvelope:
     envelope has no parseable `Merge-Readiness` line -- the case the native
     post fails closed on. `readiness_reason` is already one bounded,
     backtick-free line (see clean_readiness_reason); empty when the envelope
-    gave none. `readiness_class` is the READINESS_CLASSES token an operator
-    reason leads with (issue #142), or None: for `auto`, for an unclassed
-    operator reason, and for a missing line alike -- the reason keeps the
-    prefix either way, so the class is never lost between here and the
-    native trailer.
+    gave none, and it keeps the class prefix an operator reason leads with
+    (issue #142) -- so the class is never lost between here and the native
+    trailer.
+
+    The class is deliberately NOT a field. It is a function of the reason
+    (classify_readiness_reason), the emitter copies the reason whole, and
+    the narration reads the class back off the emitted line -- so the fact
+    has one source, and a second copy here would be a reader-less field
+    that could only ever drift from it (PR #143 round 1).
     """
 
     verdict: str
     readiness: "str | None" = None
     readiness_reason: str = ""
-    readiness_class: "str | None" = None
 
 
 @dataclass(frozen=True)
@@ -1158,9 +1161,12 @@ class Alissa:
                     continue
                 match = _VERDICT_RE.search(blob)
                 if match:
-                    readiness, reason, klass = parse_readiness(content)
+                    # The class the triple carries is not stored: the
+                    # reason keeps its prefix, and the envelope's readers
+                    # re-derive the class from the line they emit.
+                    readiness, reason, _ = parse_readiness(content)
                     if readiness is None:
-                        readiness, reason, klass = parse_readiness(title)
+                        readiness, reason, _ = parse_readiness(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
@@ -1168,7 +1174,6 @@ class Alissa:
                              verdict=match.group(1).lower(),
                              readiness=readiness,
                              readiness_reason=reason,
-                             readiness_class=klass,
                          ))
                     )
                     break
