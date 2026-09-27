@@ -387,18 +387,72 @@ plain-text trailer — the last non-empty line before the hidden
 
 ```
 Merge-Readiness: auto
-Merge-Readiness: operator — <one-line reason>
+Merge-Readiness: operator — <class>: <one-line reason>
 ```
 
 The judgment is the reviewer session's, not the daemon's: the
 `alissa-code-review` verdict envelope carries a
-`- **Merge-Readiness:** auto | operator — <reason>` line, and the trailer
-**carries** it onto the native review so a consumer (orcloop's opt-in merge
-edge, which merges only on an approve of the current head that reads `auto`)
-can parse it without reading Alissa. The grammar a consumer should use, and the
-one this daemon's tests pin, is
+`- **Merge-Readiness:** auto | operator — <class>: <reason>` line, and the
+trailer **carries** it onto the native review so a consumer (orcloop's opt-in
+merge edge, which merges only on an approve of the current head that reads
+`auto`) can parse it without reading Alissa. The grammar a consumer should use,
+and the one this daemon's tests pin, is
 `^Merge-Readiness:[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$` —
-first match wins, value case-sensitive.
+first match wins, value case-sensitive. The class rides inside the reason
+group, so a consumer written against that regex keeps parsing unchanged.
+
+##### The operator class (issue #142)
+
+An `operator` reason **leads with one class**: a token from the closed enum
+below, lowercase and hyphenated, followed by a colon and the one-line reason.
+The class exists so the merge edge can apply a **policy** to the hold instead
+of holding every `operator` alike: on the last ~40 closed studio PRs, 14
+verdicts were `operator`, and 11 of those named validation work the human does
+at gate 2 anyway (an unverified item in the PR body) — not merge risk. Prose
+could not tell the two apart; the class can.
+
+| class | when the reviewer uses it |
+| --- | --- |
+| `schema-migration` | schema shape changes that need a migration, removal or rename on live data |
+| `data-backfill` | one-off writes over existing rows (backfills, version bumps of stored shapes) |
+| `secrets-env` | new or changed env vars, secrets or credentials the deploy must carry |
+| `infra-deploy` | Dockerfiles, workflows, Railway config, base-image pins — anything that changes what runs |
+| `billing` | credit charging, pricing, tiers, quotas |
+| `security` | auth, permission gates, redaction, sandboxing — anything the rubric's security dimension flagged as operator-worthy |
+| `unverified-ux` | the PR body's operator gate is a human look at a screen, copy or mockup |
+| `unverified-runtime` | the PR body's operator gate is a live smoke, real-model run or replay the worker could not run |
+| `release-act` | the merge itself is a release (VERSION bump → publish, tag, npm) |
+
+The rules, which both round directives state to the reviewer:
+
+- **exactly one class**, and it is the **most severe** applicable row — the
+  table is in severity order, top wins. The rows below it belong in the
+  envelope's side-effects line or summary, not on the trailer;
+- **`auto` never carries a class**. A class-looking prefix on an `auto` line
+  is just reason text; the parser reports no class for it;
+- **an unclassed operator line is still valid grammar, and a hard hold.** An
+  `operator` reason that does not lead with a recognised token — prose, a
+  capitalised or misspelt token, the token without its colon — parses as
+  `operator` with its reason whole and **no class** (`klass=None` from
+  `parse_readiness` / `parse_trailer`). The merge edge treats unclassed as the
+  strictest hold (fail closed): a reviewer that forgets the class loses
+  throughput, never safety. Tokens are matched exactly as written above, for
+  the same reason `Auto` is not a value the daemon carries;
+- **classify honestly, not defensively.** The `unverified-*` rows are the
+  reviewer saying "the human still has validation work" — the policy may
+  merge those while it keeps holding every row above them, so naming
+  `unverified-runtime` when that is the truth is what makes the throughput
+  gain real; naming `security` for a gate that is really a smoke run only
+  moves the hold back to a human;
+- the daemon **never adds, drops or rewrites a class**: the native trailer is
+  the envelope's value, class and reason byte for byte, and the envelope-less
+  fallback (`operator — envelope carries no Merge-Readiness line`) carries no
+  class by construction. The round-close log line, the activity row and the
+  session-posted observation all name it — `class=<token>` on a classed
+  operator, `class=unclassed` on one without, nothing on `auto`.
+
+The orchestrator's policy over these classes is its own task; this daemon
+owns the grammar and the enum, and the orchestrator copies them verbatim.
 
 There are **two paths** onto the review, and which one a round takes decides
 who writes the line (issue #134):
@@ -407,14 +461,15 @@ who writes the line (issue #134):
   native review (`gh pr review`, or the reviews-API POST), and that body passes
   through nothing in this daemon. The session writes the trailer itself, per
   the skill and per both round directives: the bare `Merge-Readiness: auto` or
-  `Merge-Readiness: operator — <one-line reason>` line as the review body's
-  **last non-empty line**, plain text at the start of the line — not inside
-  backticks, not bold, not mid-sentence — and byte-equal in value and reason
-  to the envelope's line. The daemon **verifies and warns**: the first poll
+  `Merge-Readiness: operator — <class>: <one-line reason>` line as the review
+  body's **last non-empty line**, plain text at the start of the line — not
+  inside backticks, not bold, not mid-sentence — and byte-equal in value,
+  class and reason to the envelope's line. The daemon **verifies and warns**: the first poll
   that sees a reviewer-identity `APPROVE` on the current head reads the body
   of the **newest such approve** — the review the merge edge reads, whatever
   the identity posted after it — with that same grammar and logs
-  `readiness=auto|operator` (log line and an activity-comment row) when it
+  `readiness=auto|operator` (log line and an activity-comment row, with
+  `class=<token>` or `class=unclassed` after an `operator`) when it
   parses. When it does not, it logs **one `WARNING` per (PR, head)** —
 
   ```
@@ -442,10 +497,11 @@ The emitter and the check share one regex (`parse_trailer`), so a line the
 daemon writes is by construction a line it — and the consumer — reads back.
 On the daemon-posted path:
 
-- **carried from the envelope; missing = operator.** An envelope with no
-  parseable line (absent, `Auto` capitalised, any other word) posts
-  `Merge-Readiness: operator — envelope carries no Merge-Readiness line`. The
-  daemon never invents `auto`;
+- **carried from the envelope; missing = operator, unclassed.** An envelope
+  with no parseable line (absent, `Auto` capitalised, any other word) posts
+  `Merge-Readiness: operator — envelope carries no Merge-Readiness line` — no
+  class, so the merge edge's hard hold. The daemon never invents `auto`, and
+  never invents a class;
 - **approve events only.** A `request_changes` envelope carries no trailer
   whatever it says, and neither does an approve the CI checks gate downgraded
   to `REQUEST_CHANGES` or `COMMENT` — `auto` on anything but an APPROVE is the

@@ -427,19 +427,42 @@ NATIVE_VERDICT_BODY = (
 # the last non-empty line before the hidden verdict marker --
 #
 #   Merge-Readiness: auto
-#   Merge-Readiness: operator — <one-line reason>
+#   Merge-Readiness: operator — <class>: <one-line reason>
 #
 # The rules that make it safe to consume: it is emitted on APPROVE events
 # ONLY (a request_changes envelope with a stray `auto` line carries nothing;
 # an approve the checks gate downgraded carries nothing), and an envelope
 # with no parseable line fails CLOSED to `operator`, with a reason that tells
-# the operator why the merge waited on them.
+# the operator why the merge waited on them -- and NO class (issue #142): the
+# fallback is unclassed by construction, the consumer's hard hold.
+#
+# The operator reason leads with one token from alissa.READINESS_CLASSES
+# (issue #142) so the consumer can apply a POLICY to the hold instead of
+# holding every operator alike. The emitter copies the envelope's cleaned
+# reason whole, class prefix included, so the native line is byte-equal to
+# the envelope's; it never adds, drops or rewrites a class -- an unclassed
+# envelope posts unclassed, and the narration says so.
 #
 # The label and the grammar live in alissa.py (READINESS_TRAILER_LABEL,
 # parse_trailer): the emitter below builds from the label the regex is built
 # from, and _observe_session_readiness reads a session's own review with that
 # same regex (issue #134) -- one grammar, two writers, no drift.
 READINESS_MISSING_REASON = "envelope carries no Merge-Readiness line"
+
+# What the log line and the activity row say about an operator judgment whose
+# reason leads with no recognised class (issue #142). Named because it is a
+# state the merge policy acts on (hard hold), not an absence.
+READINESS_UNCLASSED = "unclassed"
+
+
+def readiness_class_term(value: "str | None", klass: "str | None") -> str:
+    """` class=<klass>` (or ` class=unclassed`) for an operator judgment, and
+    nothing at all for `auto` or a missing one -- `auto` never carries a
+    class, so naming one there would be noise the consumer must never read.
+    """
+    if value != READINESS_OPERATOR:
+        return ""
+    return f" class={klass or READINESS_UNCLASSED}"
 
 
 def readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
@@ -449,7 +472,9 @@ def readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
     the envelope onto the grammar. `auto` is emitted bare -- the consumer
     keys on the value, and an operator reads a reason only when the merge is
     theirs to make. A missing or unparseable judgment (None envelope, or one
-    whose readiness did not parse) is `operator` with a reason saying so.
+    whose readiness did not parse) is `operator` with a reason saying so and
+    no class. The reason is copied whole, so an envelope's `<class>:` prefix
+    reaches the native line byte for byte (issue #142).
     """
     if envelope is not None and envelope.readiness == READINESS_AUTO:
         return f"{READINESS_TRAILER_LABEL} {READINESS_AUTO}"
@@ -679,18 +704,53 @@ _RECORD_THE_CAP = (
 # envelope without the line posts as `operator` -- so a reviewer who skips it
 # has silently withheld auto-merge. The two grammar sentences are the
 # README's ("The `Merge-Readiness` trailer on a native approve"), verbatim.
+#
+# The operator form carries a CLASS (issue #142): `operator — <class>:
+# <reason>`, one token from alissa.READINESS_CLASSES, so the merge edge can
+# apply a policy to the hold. The compact table below is the ONE place the
+# directive states the enum (each token exactly once -- test_readiness pins
+# it), in severity order with the most-severe rule and the reasoning the
+# reviewer needs to classify honestly: an unverified-* hold is validation
+# work, not merge risk, and saying so lets the policy merge it. The table's
+# rows are the README's, condensed; the README is the long form.
 _MERGE_READINESS_LINE = (
     "Your verdict envelope MUST carry the skill's `- **Merge-Readiness:** auto | "
-    "operator — <reason>` line, AND your OWN native review (every `gh pr review` "
-    "form and the reviews-API POST alike) MUST END with the bare line "
-    "`Merge-Readiness: auto` or `Merge-Readiness: operator — <one-line reason>` "
-    "as its last non-empty line — plain text at the start of the line, not in "
-    "backticks, not bold, not mid-sentence — byte-equal in value and reason to "
-    "the envelope's line; `auto` only on an APPROVE of the reviewed head. The "
-    "merge edge reads that line off the review and holds an approve without "
-    "it. The daemon copies the envelope's line onto a native review only when "
-    "it posts the verdict itself, and an envelope without the line posts as "
-    "`operator`. "
+    "operator — <class>: <reason>` line, AND your OWN native review (every `gh pr "
+    "review` form and the reviews-API POST alike) MUST END with the bare line "
+    "`Merge-Readiness: auto` or `Merge-Readiness: operator — <class>: <one-line "
+    "reason>` as its last non-empty line — plain text at the start of the line, "
+    "not in backticks, not bold, not mid-sentence — byte-equal in value, class "
+    "and reason to the envelope's line; `auto` only on an APPROVE of the "
+    "reviewed head. `<class>` is exactly ONE token from this closed enum, "
+    "lowercase and hyphenated, followed by a colon and the reason; the rows are "
+    "in severity order, most severe first: "
+    "`schema-migration` (schema shape changes that need a migration, removal or "
+    "rename on live data); "
+    "`data-backfill` (one-off writes over existing rows — backfills, version "
+    "bumps of stored shapes); "
+    "`secrets-env` (new or changed env vars, secrets or credentials the deploy "
+    "must carry); "
+    "`infra-deploy` (Dockerfiles, workflows, Railway config, base-image pins — "
+    "anything that changes what runs); "
+    "`billing` (credit charging, pricing, tiers, quotas); "
+    "`security` (auth, permission gates, redaction, sandboxing — anything the "
+    "rubric's third dimension flagged as operator-worthy); "
+    "`unverified-ux` (the PR body's operator gate is a human look at a screen, "
+    "copy or mockup); "
+    "`unverified-runtime` (the PR body's operator gate is a live smoke, "
+    "real-model run or replay the worker could not run); "
+    "`release-act` (the merge itself is a release — VERSION bump → publish, tag, "
+    "npm). "
+    "When more than one row applies, name the MOST SEVERE one — the row listed "
+    "first — and only it. Classify honestly, not defensively: an unverified-* "
+    "hold is validation work the human does at gate 2 anyway, not merge risk, "
+    "and the merge policy may merge it while it keeps holding every row above; "
+    "an operator line whose reason leads with no recognised token still parses "
+    "but reads as UNCLASSED — a hard hold that costs throughput, never safety. "
+    "`auto` never carries a class. The merge edge reads that line off the "
+    "review and holds an approve without it. The daemon copies the envelope's "
+    "line onto a native review only when it posts the verdict itself, and an "
+    "envelope without the line posts as `operator` with no class. "
 )
 
 # -- the reviewer session's own CI gate (issue #84) ---------------------------
@@ -3732,9 +3792,14 @@ class ReviewWatcher:
             pr.full_name, pr.number, judged, int(time.time()), url or ""
         )
         # The readiness carried on the post, in the same three records. Only
-        # an APPROVE carries one, so only an APPROVE names it.
+        # an APPROVE carries one, so only an APPROVE names it. The class is
+        # read BACK off the emitted line with the shared grammar (issue
+        # #142), so what the narration names is what the consumer will parse
+        # -- an unclassed operator says `class=unclassed`, the hard hold.
         readiness_value = trailer[len(READINESS_TRAILER_LABEL):].strip()
-        readiness_note = f" readiness={readiness_value}" if trailer else ""
+        posted_value, _, posted_class = parse_trailer(trailer)
+        class_term = readiness_class_term(posted_value, posted_class)
+        readiness_note = f" readiness={readiness_value}{class_term}" if trailer else ""
         log.info(
             "%s round %d closed: native %s review submitted as %s (%s)%s%s",
             pr.slug, round_, event, self.github.login, url or "no url",
@@ -3744,7 +3809,7 @@ class ReviewWatcher:
             pr,
             f"- {_now()} — round {round_} — native `{event}` review submitted "
             f"as `{self.github.login}` (verdict of record){gate_note}"
-            + (f" — merge-readiness: `{readiness_value}`" if trailer else ""),
+            + (f" — merge-readiness: `{readiness_value}`{class_term}" if trailer else ""),
         )
         if event == EVENT_COMMENT:
             # A degraded verdict takes the PR out of the loop (the review
@@ -4458,7 +4523,7 @@ class ReviewWatcher:
         if self.state.readiness_observed(pr.full_name, pr.number, pr.head_sha) is not None:
             return
 
-        value, reason = parse_trailer(newest.body)
+        value, reason, klass = parse_trailer(newest.body)
         head7 = pr.head_sha[:7]
         if value is None:
             readiness = READINESS_MISSING
@@ -4476,7 +4541,10 @@ class ReviewWatcher:
             )
         else:
             readiness = value
-            term = f"{value} — {reason}" if reason else value
+            # The class rides along (issue #142): `class=<token>` when the
+            # operator reason leads with one, `class=unclassed` when it does
+            # not, nothing for `auto`.
+            term = (f"{value} — {reason}" if reason else value) + readiness_class_term(value, klass)
             log.info(
                 "%s approve at %s by %s carries readiness=%s",
                 pr.slug, head7, self.github.login, term,
