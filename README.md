@@ -444,6 +444,16 @@ The rules, which both round directives state to the reviewer:
   `unverified-runtime` when that is the truth is what makes the throughput
   gain real; naming `security` for a gate that is really a smoke run only
   moves the hold back to a human;
+- **when no row fits, write no class.** The skill's merge-readiness
+  checklist has operator triggers the enum does not name — a dependency
+  change, a deleted or renamed public surface, a waived `[major]`, a
+  judgment residual, an operator gate that is a human *action* rather than
+  a look or a smoke run. Both directives tell the reviewer to leave such a
+  reason unclassed on purpose: that is the correct hard hold, never a
+  failure. Shoehorning it into the nearest row — for a vague reason,
+  usually one of the `unverified-*` pair — is the one misclassification
+  the policy cannot recover from, because those are the rows it may merge
+  unattended;
 - the daemon **never adds, drops or rewrites a class**: the native trailer is
   the envelope's value, class and reason byte for byte, and the envelope-less
   fallback (`operator — envelope carries no Merge-Readiness line`) carries no

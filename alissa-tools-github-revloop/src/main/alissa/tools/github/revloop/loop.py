@@ -713,6 +713,16 @@ _RECORD_THE_CAP = (
 # reviewer needs to classify honestly: an unverified-* hold is validation
 # work, not merge risk, and saying so lets the policy merge it. The table's
 # rows are the README's, condensed; the README is the long form.
+#
+# The table is closed, so the directive must also say what to do when NO
+# row fits (PR #143 round 1): the skill's checklist has operator triggers
+# the enum does not name (dependencies, a deleted public surface, a waived
+# `[major]`, a judgment residual, an operator gate that is a human action).
+# A reviewer told the class is mandatory would shoehorn such a reason into
+# the nearest row, and the nearest row for a vague reason is one of the
+# `unverified-*` pair -- exactly what the policy may merge unattended. So
+# the directive names the way out: no row, no class, and unclassed is the
+# correct hard hold, never a failure.
 _MERGE_READINESS_LINE = (
     "Your verdict envelope MUST carry the skill's `- **Merge-Readiness:** auto | "
     "operator — <class>: <reason>` line, AND your OWN native review (every `gh pr "
@@ -742,7 +752,13 @@ _MERGE_READINESS_LINE = (
     "`release-act` (the merge itself is a release — VERSION bump → publish, tag, "
     "npm). "
     "When more than one row applies, name the MOST SEVERE one — the row listed "
-    "first — and only it. Classify honestly, not defensively: an unverified-* "
+    "first — and only it. If NO row fits — a dependency change, a deleted or "
+    "renamed public surface, a waived `[major]`, a judgment residual, an "
+    "operator gate that is a human ACTION rather than a look or a smoke run — "
+    "write the reason with NO class: an unclassed operator line is the correct "
+    "hard hold, never a failure, and shoehorning such a reason into the nearest "
+    "row is the one misclassification the merge policy cannot recover from. "
+    "Classify honestly, not defensively: an unverified-* "
     "hold is validation work the human does at gate 2 anyway, not merge risk, "
     "and the merge policy may merge it while it keeps holding every row above; "
     "an operator line whose reason leads with no recognised token still parses "

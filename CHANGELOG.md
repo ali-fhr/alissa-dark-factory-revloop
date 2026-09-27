@@ -4,6 +4,30 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.5
+
+- **The directive says what to do when no class row fits, and the envelope
+  keeps the class in one place** (follow-up to PR #143 round 1, issue #142;
+  origin TASK-173324447, implementation TASK-1831487098). The class enum is
+  closed, and the round-1 review noted that a directive which makes the class
+  mandatory but never says what to do when **no row applies** would push a
+  reviewer to shoehorn such a hold — a dependency change, a deleted or
+  renamed public surface, a waived `[major]`, a judgment residual, an
+  operator gate that is a human action — into the nearest row, which for a
+  vague reason is one of the `unverified-*` pair the merge policy may merge
+  unattended. Both round directives now name the way out: **no row, no
+  class** — an unclassed operator line is the correct hard hold, never a
+  failure. `test_readiness` pins the sentence and its named triggers next to
+  the exactly-once enum check; the README (*The operator class*) and
+  `docker/claude/README.md` carry the rule.
+  - `VerdictEnvelope.readiness_class` is removed. Nothing read it: the
+    native trailer copies the reason whole, and the narration re-derives the
+    class from the emitted line with `parse_trailer`, so the field was a
+    second copy of one fact with no consumer. The class is a function of the
+    reason (`classify_readiness_reason`); `parse_readiness` and
+    `parse_trailer` still return `(value, reason, klass | None)`. No config
+    key; the grammar, the enum and the consumer regex are unchanged.
+
 ## 0.31.4
 
 - **Classed `Merge-Readiness`: `operator — <class>: <reason>`** (issue #142,
