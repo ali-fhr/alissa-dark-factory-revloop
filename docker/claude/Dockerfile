@@ -87,7 +87,16 @@
 # with a 400, exactly as 2.1.241 did for `claude-fable-5-1` (which needs
 # >= 2.1.251, satisfied since 0.2.1). tests-image-contract.sh asserts the
 # 2.1.280 floor inside the built image. Base release: ali-fhr/alissa-loopwork#5.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:970dfe6f1179d9c5b1c709c47fbb9211c4adeca2b68c0da5d362726be572106e
+#
+# 0.2.3 is the same shape once more, built 2026-09-28 so the inherited alissa CLI
+# carries the paste lead-in (ali-fhr/studio.alissa.app#1590): Claude Code
+# >= 2.1.283 classifies one input chunk over 800 chars as a paste, wraps it in
+# <pasted_content>, and by system prompt refuses a paste-only message -- which
+# was every paste-sized dispatch this daemon typed into a session. The lead-in
+# lives in the CLI, so only a base rebuilt after share.alissa.app republished
+# it can carry the fix. Base release: ali-fhr/alissa-loopwork#6. Inherited tool
+# versions are unasserted as before; tests-image-contract.sh prints them.
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c26cefc718a67cde94195668dc9341c07e14b0fd
 
 # Version of the daemon to install from PyPI. Bump per release: 0.29.0 is the
 # release this repo publishes on merge (it must match the dist's version file,
