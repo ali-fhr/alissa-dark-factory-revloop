@@ -467,6 +467,26 @@ def pane_path_argv(name: str) -> "list[str]":
     ]
 
 
+# What `#{pane_current_command}` reads on a reviewer pane whose `claude` has
+# EXITED (issue #146, devloop #140's set): the shell `alissa tmux new`
+# launched it from, back in the foreground. A live reviewer reads `node`
+# (Claude Code's runtime); a name here means the process the session was
+# spawned for is gone, whatever the session listing says about liveness.
+SHELL_COMMANDS = frozenset((
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "ash", "tcsh", "csh",
+))
+
+
+def pane_command_argv(name: str) -> "list[str]":
+    """`tmux -S <socket> display-message -p -t =<real>: #{pane_current_command}`:
+    the foreground process of the session's active pane, by name."""
+    check_session_name(name)
+    return [
+        "tmux", "-S", tmux_socket(), "display-message", "-p",
+        "-t", tmux_target(name), "#{pane_current_command}",
+    ]
+
+
 def send_keys_argv(name: str, keys: "tuple[str, ...]") -> "list[str]":
     """`tmux -S <socket> send-keys -t =<real> <key>…` with every key drawn
     from `prompts.ALLOWED_KEYS`. Anything else -- a letter, a word, a path --
@@ -1377,6 +1397,23 @@ class Alissa:
             return run(argv, timeout=15).strip()
         except CommandError as exc:
             log.debug("could not read the pane path of %s (%s)", name, exc)
+            return ""
+
+    def pane_command(self, name: str) -> str:
+        """The session's pane current command (`#{pane_current_command}`),
+        or "" when tmux cannot answer. The first-turn death check's one
+        liveness probe (issue #146): a reviewer whose pane reads a shell
+        (`SHELL_COMMANDS`) has lost its `claude`, however alive the tmux
+        session itself is. A READ: runs under dry-run too."""
+        try:
+            argv = pane_command_argv(name)
+        except ValueError as exc:
+            log.warning("pane_command refused: %s", exc)
+            return ""
+        try:
+            return run(argv, timeout=15).strip()
+        except CommandError as exc:
+            log.debug("could not read the pane command of %s (%s)", name, exc)
             return ""
 
     def send_keys(self, name: str, *keys: str, dry_run: bool = False) -> bool:

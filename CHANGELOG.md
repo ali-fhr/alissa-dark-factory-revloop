@@ -4,6 +4,47 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.6
+
+- **A reviewer refused by Claude is a named `auth.rejected` loop event, not
+  a silent stale round** (issue #146, devloop #140's lane ported; Studio
+  design `managed-dark-factory-claude-auth.md` §2.6, lane L5; origin
+  TASK-2055621468, implementation TASK-1389509388). Two detectors feed one
+  signal:
+  - **The pane detector.** `prompts._AUTH_REJECTED_RE` beside
+    `_LOGIN_EXPIRED_RE` matches the five documented 401 wordings
+    (`API Error: 401`, `Invalid authentication credentials`, `Invalid API
+    key`, `OAuth token has expired`, `OAuth token revoked`) as a new
+    `auth_rejected` account kind, with `matched` (`api_error_401` /
+    `invalid_api_key` / `oauth_expired` / `oauth_revoked`); the existing
+    `login_expired` banner is the same signal (`matched: "login_expired"`).
+    The classifier is devloop's byte for byte, including its two review
+    rounds' rules for telling Claude Code's own `⎿ API Error: 401` row from
+    a reviewer quoting the wording.
+  - **The first-turn death check.** A reviewer session this ledger spawned
+    inside its round's first stale window whose pane's current command is a
+    shell (`alissa.SHELL_COMMANDS`, read with `Alissa.pane_command`) has its
+    last lines captured **once** and read by `prompts.classify_exit`
+    (`source: "exit"`); a match is re-asserted from memory while the pane
+    stays a shell, and no match is the ordinary "died, not auth" and emits
+    nothing new.
+  - Either finding runs the `login_expired` row: the PR is paged once per
+    kind per six hours (the page names the `auth_rejected` remedy), new
+    reviewer spawns are held, and the one-hour expiry kills the session and
+    ages its spawn row so the stale-round edge re-enters **the same round**
+    — no verdict was submitted, so an auth death never burns a round number.
+  - **The event.** One `auth-rejected:` ping row per session, written at
+    observation, derives `auth.rejected` (`seat: "revloop"`, `prNumber`,
+    `round`, `session`, a fixed `reason`, dedupe key
+    `revloop:auth.rejected:<session>`) with devloop's `data: { status: 401,
+    source, matched, envName, tokenSuffix }`. `envName` is which of
+    `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` the container carries,
+    read by name; `tokenSuffix` is its last four characters and nothing
+    more, captured when the refusal is seen so a later backfill still names
+    the token that was refused. `observe` mode and dry-run write no row.
+  - No config key. After merge the operator re-pins `REVLOOP_VERSION` on
+    `dark-revloop-shared`.
+
 ## 0.31.5
 
 - **The directive says what to do when no class row fits, and the envelope

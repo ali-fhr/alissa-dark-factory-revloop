@@ -66,6 +66,12 @@ KIND_PERMISSION = "permission"
 KIND_TRUST = "trust"
 KIND_RESUME_PICKER = "resume_picker"
 KIND_LOGIN_EXPIRED = "login_expired"
+# A 401 from the API on a reviewer's turn (issue #146, devloop #140, Studio design
+# managed-dark-factory-claude-auth §2.6): the credential the container
+# carries -- an env token or the persisted login -- was REFUSED. Same
+# family as login_expired (an account-level notice: page, hold spawns, no
+# keys) and the same loop-event signal (`auth.rejected`, see `matched`).
+KIND_AUTH_REJECTED = "auth_rejected"
 KIND_USAGE_LIMIT = "usage_limit"
 KIND_OUT_OF_CREDITS = "out_of_credits"
 KIND_UNKNOWN_DIALOG = "unknown_dialog"
@@ -76,6 +82,7 @@ KINDS = (
     KIND_TRUST,
     KIND_RESUME_PICKER,
     KIND_LOGIN_EXPIRED,
+    KIND_AUTH_REJECTED,
     KIND_USAGE_LIMIT,
     KIND_OUT_OF_CREDITS,
     KIND_UNKNOWN_DIALOG,
@@ -84,7 +91,38 @@ KINDS = (
 # The account-level kinds: nothing a keystroke can fix. The policy pages the
 # operator and holds NEW spawns while the condition stands, so attempts are
 # not burned against a dead account.
-ACCOUNT_KINDS = frozenset((KIND_LOGIN_EXPIRED, KIND_USAGE_LIMIT, KIND_OUT_OF_CREDITS))
+ACCOUNT_KINDS = frozenset((
+    KIND_LOGIN_EXPIRED, KIND_AUTH_REJECTED, KIND_USAGE_LIMIT, KIND_OUT_OF_CREDITS,
+))
+
+# The two kinds that ARE the `auth.rejected` loop event (issue #146, devloop #140): a
+# refused credential, whichever wording Claude Code chose for it. The
+# existing login_expired banner is the same signal under its old name.
+AUTH_KINDS = frozenset((KIND_LOGIN_EXPIRED, KIND_AUTH_REJECTED))
+
+# -- the auth.rejected vocabulary (design §2.6) ---------------------------
+
+# `data.matched` -- WHICH documented wording the pane showed. A closed list,
+# settled in the design before any daemon emits it; Studio's reducer reads
+# the suffix, not this, so the token is for the operator's eyes.
+MATCHED_API_ERROR_401 = "api_error_401"
+MATCHED_INVALID_API_KEY = "invalid_api_key"
+MATCHED_OAUTH_EXPIRED = "oauth_expired"
+MATCHED_OAUTH_REVOKED = "oauth_revoked"
+MATCHED_LOGIN_EXPIRED = "login_expired"
+AUTH_MATCHED = (
+    MATCHED_API_ERROR_401,
+    MATCHED_INVALID_API_KEY,
+    MATCHED_OAUTH_EXPIRED,
+    MATCHED_OAUTH_REVOKED,
+    MATCHED_LOGIN_EXPIRED,
+)
+
+# `data.source` -- where the detector read the wording: a still-open pane
+# (the banner classifier) or the last lines of a pane whose `claude`
+# already exited back to the shell (the first-turn death check).
+SOURCE_PANE = "pane"
+SOURCE_EXIT = "exit"
 
 # -- keys ----------------------------------------------------------------
 
@@ -138,6 +176,16 @@ BANNER_LINES = 3
 # excerpt the issue allows: three lines, secrets-scrubbed, never more).
 EXCERPT_LINES = 3
 
+# How many non-blank lines from the bottom the first-turn death check reads
+# (issue #146, devloop #140). A `claude` that 401s prints the error and exits; the shell
+# then draws its prompt (and, on some shells, a blank line or two) under it,
+# so the wording sits a few lines above the bottom -- never as the LAST
+# thing on screen, which is why the banner rule cannot see it. Twelve lines
+# hold the error, the JSON body Claude Code sometimes wraps it in, and the
+# shell chrome, and nothing older: the scrollback above is the reviewer's own
+# turn, where a quoted phrase would be a false positive.
+EXIT_SCAN_LINES = 12
+
 # The default per-kind page cadence for the account-level kinds: one
 # operator page per kind per six hours through the escalation ledger.
 PAGE_WINDOW_SECONDS = 6 * 3600
@@ -177,6 +225,34 @@ _LOGIN_EXPIRED_RE = re.compile(
     r"(?:Your )?(?:session|login|token) (?:has )?expired\b)",
     re.IGNORECASE,
 )
+# The 401 wordings Anthropic documents (issue #146, devloop #140; design §1.4: the Claude
+# Code *Errors* page and the Platform *Authentication* page): `API Error:
+# 401 …`, `Invalid authentication credentials`, `Invalid API key`, `OAuth
+# token has expired`, `OAuth token revoked`. Anchored like the banners
+# above (an optional error glyph is the only thing allowed before the
+# wording), and read on the de-decorated line: Claude Code draws the API
+# error on a `⎿` row of its own under the turn that failed, so
+# `_banner_line` admits THAT row for this one family -- a `●` turn or tool
+# call above it in the same paragraph still makes it a reviewer's output.
+_AUTH_REJECTED_RE = re.compile(
+    r"^(?:[✗✘⚠]\s*)?(?:API Error:\s*401\b|Invalid authentication credentials\b|"
+    r"Invalid API key\b|OAuth token (?:has )?expired\b|"
+    r"OAuth token (?:has been |was )?revoked\b)",
+    re.IGNORECASE,
+)
+# The specific wordings, tested on an auth line AFTER `_AUTH_REJECTED_RE`
+# admitted it, most specific first; a line none of them names is the bare
+# 401 (`api_error_401`), which is also what `API Error: 401 Invalid
+# authentication credentials` reads as -- the credentials sentence is the
+# 401's own message.
+_AUTH_MATCHED_RES = (
+    (MATCHED_INVALID_API_KEY, re.compile(r"Invalid API key\b", re.IGNORECASE)),
+    (MATCHED_OAUTH_EXPIRED, re.compile(r"OAuth token (?:has )?expired\b", re.IGNORECASE)),
+    (MATCHED_OAUTH_REVOKED, re.compile(r"OAuth token (?:has been |was )?revoked\b", re.IGNORECASE)),
+)
+# A `⎿` tool-OUTPUT row specifically (the `●` turn row is the other half of
+# `_OUTPUT_ROW_RE`): the row Claude Code draws its own API error on.
+_TOOL_OUTPUT_ROW_RE = re.compile(r"^\s*⎿")
 _USAGE_LIMIT_RE = re.compile(
     r"^(?:(?:You've|You have) hit your (?:(?:weekly|daily|5-hour|session|usage) )?limit\b|"
     r"(?:Weekly|Daily|Session|Usage) limit reached\b|Usage limit\b|"
@@ -194,6 +270,11 @@ _OUT_OF_CREDITS_RE = re.compile(
 # (`⎿  ...`): a worker's output, which Claude Code never uses to draw a
 # notice of its own. Tested on the ANSI-stripped line, decoration intact.
 _OUTPUT_ROW_RE = re.compile(r"^\s*[●⎿]")
+# The row Claude Code draws for a SUBMITTED prompt (`> implement issue
+# #7`) or the bare input prompt at column 0 (`❯`): the boundary between
+# one reviewer turn and the next, which is what releases the lines below
+# it from the `●` above (issue #146; devloop #140, its PR #141 review round 2).
+_USER_PROMPT_ROW_RE = re.compile(r"^[>❯](?:\s|$)")
 # The dialog's path line, as the trust gate draws it: the path and nothing
 # else on the line.
 _PATH_LINE_RE = re.compile(r"^/[^\s'\"]+$")
@@ -289,14 +370,31 @@ def _is_banner_chrome(text: str) -> bool:
     return text in ("❯", ">") or _is_chrome(text)
 
 
+def auth_matched(text: str) -> "str | None":
+    """Which documented 401 wording this (plain) line is, as the
+    `data.matched` token, or None when it is not an auth-rejected line at
+    all. The login-expired banner is NOT read here (its own regex and kind
+    already exist); `classify` stamps that finding `login_expired`."""
+    if not _AUTH_REJECTED_RE.search(text):
+        return None
+    for token, pattern in _AUTH_MATCHED_RES:
+        if pattern.search(text):
+            return token
+    return MATCHED_API_ERROR_401
+
+
 def _banner_line(lines: "list[str]") -> "tuple[int, str] | None":
     """The one line an account-level banner could be, as (index into
     `lines`, plain text), or None. Bottom-up: chrome and the bare input
     prompt are skipped, then the contiguous paragraph above them is read
     up to the blank line or chrome that bounds it. A `●`/`⎿` tool row
     anywhere in that paragraph makes it a worker's output (the row and its
-    indented continuation lines), never a banner; otherwise the
-    paragraph's last BANNER_LINES lines are the candidates."""
+    indented continuation lines), never a banner -- with ONE exception: a
+    `⎿` row that IS a documented 401 wording is how Claude Code draws its
+    own API error (issue #146, devloop #140), so that row is admitted as a candidate,
+    and a `●` turn above it in the same paragraph still voids the whole
+    paragraph. Otherwise the paragraph's last BANNER_LINES lines are the
+    candidates."""
     index = len(lines) - 1
     while index >= 0 and _is_banner_chrome(_plain(lines[index])):
         index -= 1
@@ -306,12 +404,16 @@ def _banner_line(lines: "list[str]") -> "tuple[int, str] | None":
         text = _plain(raw)
         if _is_banner_chrome(text):
             break
-        if _OUTPUT_ROW_RE.match(raw):
+        if _OUTPUT_ROW_RE.match(raw) and not (
+            _TOOL_OUTPUT_ROW_RE.match(raw) and _AUTH_REJECTED_RE.search(text)
+        ):
             return None
         paragraph.append((index, text))
         index -= 1
     for index, text in paragraph[:BANNER_LINES]:
-        for pattern in (_LOGIN_EXPIRED_RE, _USAGE_LIMIT_RE, _OUT_OF_CREDITS_RE):
+        for pattern in (
+            _LOGIN_EXPIRED_RE, _AUTH_REJECTED_RE, _USAGE_LIMIT_RE, _OUT_OF_CREDITS_RE,
+        ):
             if pattern.search(text):
                 return index, text
     return None
@@ -339,7 +441,12 @@ class PromptFinding:
     it, scrubbed, for the DEBUG log and nothing else. `pane_hash` fingerprints
     the dialog so the loop can tell "the same pane, one poll later" from "a
     new prompt": the unknown-dialog ladder and the answered/unanswered
-    re-capture both hang off it."""
+    re-capture both hang off it.
+
+    `matched` and `source` are the `auth.rejected` event's vocabulary
+    (issue #146, devloop #140), set on the two AUTH_KINDS only: which documented wording
+    was seen (`AUTH_MATCHED`) and whether it was read off a live pane or
+    the last lines of an exited one (`SOURCE_PANE` / `SOURCE_EXIT`)."""
 
     kind: str
     signature: str
@@ -347,6 +454,8 @@ class PromptFinding:
     options: "tuple[PromptOption, ...]"
     excerpt: "tuple[str, ...]"
     pane_hash: str
+    matched: "str | None" = None
+    source: str = SOURCE_PANE
 
     @property
     def selected(self) -> "PromptOption | None":
@@ -441,6 +550,96 @@ def _excerpt(lines: "list[str]", index: int) -> "tuple[str, ...]":
     return tuple(scrub(strip_ansi(ln).rstrip()) for ln in lines[lo:hi])
 
 
+def _matched_for(kind: str, text: str) -> "str | None":
+    """The `matched` token of a banner finding: the login-expired banner is
+    reported as the same signal (`login_expired`), an auth line as the
+    wording it carries, every other kind as None."""
+    if kind == KIND_LOGIN_EXPIRED:
+        return MATCHED_LOGIN_EXPIRED
+    if kind == KIND_AUTH_REJECTED:
+        return auth_matched(text)
+    return None
+
+
+def classify_exit(pane: str) -> "PromptFinding | None":
+    """The first-turn death check's half of the classifier (issue #146, devloop #140):
+    what a pane whose `claude` has already EXITED back to the shell says
+    about why, or None for the ordinary "died, not auth".
+
+    Only ever called on a pane the loop has established is a shell (the
+    pane's current command is one of `alissa.SHELL_COMMANDS`, inside the
+    first stale window of its round's spawn), so the banner rule --
+    the wording must be the LAST thing on screen -- does not apply: the
+    shell prompt is the last thing on screen, and the error sits a few
+    lines above it. The last EXIT_SCAN_LINES non-blank lines are read
+    bottom-up for a documented 401 wording or the login-expired banner; a
+    `●` turn row is skipped, and so is EVERY line that belongs to a turn
+    (`_under_a_turn`): every line below a `●` row until the next submitted
+    prompt row (`>`), paragraph breaks included -- Claude Code renders one
+    assistant message as blank-separated paragraphs and code blocks, and
+    only the first line carries the `●`. So the reviewer's own prose
+    wrapping onto the wording, a quoted error in a paragraph or code block
+    of its own, a README quoted under a tool call, a `grep` for it, are
+    all the reviewer's -- never Claude Code's error, which is drawn under
+    the `>` prompt row (`⎿  API Error: 401 …`) or, on a start-up refusal,
+    before any turn exists. The finding is an `auth_rejected` with
+    `source: "exit"` and the wording under `matched` -- the same kind the
+    pane detector raises, so the policy (page once, hold spawns) is the
+    same row."""
+    if not pane or not pane.strip():
+        return None
+    lines = pane.splitlines()
+    indices = [i for i, ln in enumerate(lines) if _plain(ln)][-EXIT_SCAN_LINES:]
+    for index in reversed(indices):
+        raw = strip_ansi(lines[index])
+        if _OUTPUT_ROW_RE.match(raw) and not _TOOL_OUTPUT_ROW_RE.match(raw):
+            continue
+        text = _plain(raw)
+        matched = (
+            MATCHED_LOGIN_EXPIRED if _LOGIN_EXPIRED_RE.search(text)
+            else auth_matched(text)
+        )
+        if matched is None:
+            continue
+        if _under_a_turn(lines, index):
+            # Any line under a `●` turn or tool call, up to the next `>`
+            # prompt row, is that turn's: a `⎿` row is its output (a README
+            # quoting the wording, a `grep` for it), a plain row is its own
+            # prose -- wrapped onto the wording, or quoting it in a later
+            # paragraph or code block. Claude Code's error is never drawn
+            # under a `●` without a `>` between them.
+            continue
+        return PromptFinding(
+            kind=KIND_AUTH_REJECTED,
+            signature=scrub(text),
+            target=None,
+            options=(),
+            excerpt=_excerpt(lines, index),
+            pane_hash=pane_hash(pane),
+            matched=matched,
+            source=SOURCE_EXIT,
+        )
+    return None
+
+
+def _under_a_turn(lines: "list[str]", index: int) -> bool:
+    """Whether `lines[index]` belongs to a reviewer's turn: a `●` row sits
+    above it, anywhere in the capture, with no submitted-prompt row
+    (`_USER_PROMPT_ROW_RE`, the `>` Claude Code draws for the prompt that
+    opens the NEXT turn) between them. Blank lines and chrome do NOT end
+    a turn (devloop PR #141 review round 2): one assistant message is several
+    blank-separated paragraphs and code blocks, `●` on its first line
+    only, so the paragraph is no boundary -- only the next prompt row is.
+    A `⎿` row above is the turn's output and bounds nothing either."""
+    for above in range(index - 1, -1, -1):
+        raw = strip_ansi(lines[above])
+        if _USER_PROMPT_ROW_RE.match(raw):
+            return False
+        if _OUTPUT_ROW_RE.match(raw) and not _TOOL_OUTPUT_ROW_RE.match(raw):
+            return True
+    return False
+
+
 def classify(pane: str) -> "PromptFinding | None":
     """What this pane is parked on, or None for a pane that is WORKING, idle
     at the input prompt, empty, or unreadable.
@@ -471,6 +670,7 @@ def classify(pane: str) -> "PromptFinding | None":
         index, text = banner
         for kind, pattern in (
             (KIND_LOGIN_EXPIRED, _LOGIN_EXPIRED_RE),
+            (KIND_AUTH_REJECTED, _AUTH_REJECTED_RE),
             (KIND_USAGE_LIMIT, _USAGE_LIMIT_RE),
             (KIND_OUT_OF_CREDITS, _OUT_OF_CREDITS_RE),
         ):
@@ -482,6 +682,7 @@ def classify(pane: str) -> "PromptFinding | None":
                     options=(),
                     excerpt=_excerpt(lines, index),
                     pane_hash=digest,
+                    matched=_matched_for(kind, text),
                 )
 
     parked = _tail_is_dialog(lines)

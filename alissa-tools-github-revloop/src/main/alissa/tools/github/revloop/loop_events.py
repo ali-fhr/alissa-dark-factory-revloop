@@ -46,13 +46,36 @@ Design rules, all load-bearing:
   between passes) is simply not observed; a row enriched from another table
   (`stability_notices` onto a `stability:` ping) reads whatever that table
   says NOW, which is also what the guard itself decides from.
+
+One event is not a table read but a ROW the watcher writes for it, and it is
+still ledger-derived: ``auth.rejected`` (issue #146; devloop #140's event,
+Studio design `managed-dark-factory-claude-auth.md` §2.6, lane L5) — a
+reviewer session REFUSED by Claude. The prompt responder saw a documented
+401 wording (or the login-expired banner) on a live pane, or the first-turn
+death check found one in the last lines of a pane whose `claude` had already
+exited. The watcher records ONE `auth-rejected:` ping per session
+(`auth_rejected_kind`), and the event is derived from it, keyed on the
+session name, so one session emits at most one whatever the pass count or a
+restart's backfill. ``data: { status: 401, source: "pane" | "exit", matched,
+envName, tokenSuffix }`` — devloop's shape exactly. `envName` is which of
+`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` the container carries, read
+BY NAME ONLY (`null` on a persisted `claude /login`); `tokenSuffix` is the
+last four characters of that variable's value (`null` beside a `null`
+envName), computed in-process by `credential_identity` AT OBSERVATION and
+folded into the row -- never re-read at derivation, so a backfill after the
+operator replaced the token still carries the suffix of the token that was
+refused. The suffix is the design's R1 key: Studio's reducer flips a
+credential only when the suffix matches the stored row, so a container still
+running an OLD token after a same-mode replace cannot flip the new, good
+credential. `reason` is a fixed sentence, never the pane's text.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from .alissa_client import (
     AlissaAuthError,
@@ -88,6 +111,89 @@ _PROMPT_RE = re.compile(
 _PROMPT_PAGE_RE = re.compile(
     r"^prompt-page:(?P<kind>[a-z_]+)@(?P<session>[^#]+)#(?P<bucket>\d+)$"
 )
+
+
+# The `auth.rejected` row (issue #146): one per SESSION,
+# `auth-rejected:<session>#<round>:<source>:<matched>:<envName>:<suffix>`.
+# The session leads so "already recorded for this session" is one prefix read
+# (`auth_rejected_prefix`); the suffix trails because it is the one field
+# whose characters this module does not choose. `round`, `envName` and the
+# suffix are empty when unknown / unset.
+AUTH_REJECTED_PREFIX = "auth-rejected:"
+_AUTH_REJECTED_RE = re.compile(
+    r"^auth-rejected:(?P<session>[^#:@]+)#(?P<round>\d*):(?P<source>pane|exit):"
+    r"(?P<matched>[a-z0-9_]+):(?P<env>[A-Z_]*):(?P<suffix>.{0,4})$"
+)
+
+# The credential variables a container may carry, in Claude Code's own
+# precedence order (design §1.4: `ANTHROPIC_API_KEY` outranks
+# `CLAUDE_CODE_OAUTH_TOKEN`; both outrank the persisted login). Read by NAME
+# only -- the value is touched for its last four characters and for nothing
+# else, and never leaves `credential_identity` whole. devloop's constants.
+AUTH_ENV_NAMES = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+TOKEN_SUFFIX_CHARS = 4
+AUTH_STATUS = 401
+AUTH_SOURCES = ("pane", "exit")
+AUTH_MATCHED_DEFAULT = "api_error_401"
+
+# The fixed `reason` sentences -- never the pane's text (the contract's
+# `reason` is ≤ 2000 characters, and a pane is another agent's screen).
+AUTH_REASONS = {
+    "pane": "claude answered 401 — the reviewer's pane shows an auth banner",
+    "exit": "claude answered 401 on the first turn and exited",
+}
+
+
+def credential_identity(
+    environ: "Mapping[str, str] | None" = None,
+) -> "tuple[str | None, str | None]":
+    """`(envName, tokenSuffix)` for the container this daemon runs in: the
+    first of AUTH_ENV_NAMES that is set and non-blank, and the last
+    TOKEN_SUFFIX_CHARS characters of its value; `(None, None)` when neither
+    is set -- a container running on a persisted `claude /login`. The
+    reviewers are spawned on this same container by `alissa tmux`, so the
+    daemon's environment IS theirs. devloop's function, verbatim in
+    behaviour: a blank value reads as unset, a value shorter than four
+    characters yields what there is."""
+    env = os.environ if environ is None else environ
+    for name in AUTH_ENV_NAMES:
+        value = str(env.get(name) or "").strip()
+        if value:
+            return name, value[-TOKEN_SUFFIX_CHARS:]
+    return None, None
+
+
+def auth_rejected_prefix(session: str) -> str:
+    """The prefix every `auth-rejected:` row of ONE session starts with --
+    the watcher's "already recorded" read (`State.ping_seen_since`)."""
+    return f"{AUTH_REJECTED_PREFIX}{session}#"
+
+
+def auth_rejected_kind(
+    session: str,
+    round_: "int | None",
+    source: str,
+    matched: "str | None",
+    env_name: "str | None",
+    suffix: "str | None",
+) -> str:
+    """The ledger kind of ONE refusal (see AUTH_REJECTED_PREFIX). `source`
+    outside AUTH_SOURCES reads as `pane`, a missing `matched` as the bare
+    401 -- the event's vocabulary is closed, and the row is its source."""
+    return (
+        f"{auth_rejected_prefix(session)}{'' if round_ is None else int(round_)}:"
+        f"{source if source in AUTH_SOURCES else 'pane'}:"
+        f"{matched or AUTH_MATCHED_DEFAULT}:{env_name or ''}:"
+        f"{(suffix or '')[-TOKEN_SUFFIX_CHARS:]}"
+    )
+
+
+def auth_rejected_key(session: str) -> str:
+    """One `auth.rejected` per SESSION (issue #146, devloop's key shape):
+    reviewer names are nonce-unique per spawn and a session is refused once
+    -- the pane detector seeing the same banner on every pass, or the exit
+    check re-asserting a dead shell, is the same refusal."""
+    return f"{SEAT}:auth.rejected:{session}"
 
 
 def _ms(seconds: "int | float") -> int:
@@ -253,7 +359,8 @@ def _capped_events(
 def _ping_events(
     rows: "list[dict]", notices: "dict[tuple[str, int], dict]"
 ) -> "list[tuple[int, dict]]":
-    """`stalled`, `stability.hold` and `checks.held` out of the ping ledger.
+    """`stalled`, `stability.hold`, `checks.held`, the prompt responder's
+    two families and `auth.rejected` out of the ping ledger.
 
     `kind` is free-form text carrying the episode identity, so it is parsed
     by prefix; kinds this module does not report (`activity-deferred:`,
@@ -334,6 +441,36 @@ def _ping_events(
                 data={
                     "kind": match.group("kind"), "action": "page",
                     "session": match.group("session"), "ledgerKind": kind,
+                },
+            ))
+        elif kind.startswith(AUTH_REJECTED_PREFIX):
+            match = _AUTH_REJECTED_RE.match(kind)
+            if match is None:
+                continue
+            session = match.group("session")
+            source = match.group("source")
+            round_str = match.group("round")
+            out.append(_event(
+                "auth.rejected",
+                at,
+                auth_rejected_key(session),
+                repo=repo or None,
+                # An anchor-less refusal (the session resolved to no watched
+                # PR) is recorded under ('', 0): the event still goes, with
+                # no repo and no PR rather than a made-up one.
+                pr=number if number > 0 else None,
+                round_=int(round_str) if round_str else None,
+                session=session,
+                reason=AUTH_REASONS[source],
+                data={
+                    "status": AUTH_STATUS,
+                    "source": source,
+                    "matched": match.group("matched"),
+                    "envName": match.group("env") or None,
+                    "tokenSuffix": (
+                        match.group("suffix") or None
+                        if match.group("env") else None
+                    ),
                 },
             ))
         elif kind.startswith(PROMPT_PREFIX):
