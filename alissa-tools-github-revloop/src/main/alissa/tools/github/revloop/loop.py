@@ -27,6 +27,7 @@ from typing import Callable
 from . import prompts as prompts_mod
 from .alissa import (
     MANAGED_PREFIX,
+    SHELL_COMMANDS,
     READINESS_AUTO,
     READINESS_MISSING,
     READINESS_OPERATOR,
@@ -91,7 +92,13 @@ from .fleet_vitals import (
     FleetVitalsPusher,
     build_pusher,
 )
-from .loop_events import LoopEventsEmitter, build_emitter
+from .loop_events import (
+    LoopEventsEmitter,
+    auth_rejected_kind,
+    auth_rejected_prefix,
+    build_emitter,
+    credential_identity,
+)
 from .proc import CommandError
 from .state import State
 
@@ -1330,7 +1337,11 @@ PROMPT_PAGE_COMMENT = (
     "not answering it, and it is HOLDING new reviewer spawns until the "
     "condition clears (live sessions keep running; the rounds they owe are "
     "not consumed). Operator options: `login_expired` → re-run the claude "
-    "login on the reviewer container; `usage_limit` → wait for the reset or "
+    "login on the reviewer container; `auth_rejected` → Claude refused the "
+    "reviewer's credential (401): replace the container's token "
+    "(`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`) or re-run the claude "
+    "login — the `auth.rejected` loop event names the variable and the "
+    "token's last four characters; `usage_limit` → wait for the reset or "
     "raise the plan; `out_of_credits` → top up. The hold lifts on the first "
     "poll that no longer sees the notice and in any case after {hold_minutes} "
     "min on the same pane: the session is then killed and the stale-round "
@@ -1356,6 +1367,12 @@ ESCALATION_PROMPT_PAGE = "prompt-page"
 # redraws within a second; three is devloop's figure and leaves room for a
 # slow container.
 PROMPT_SETTLE_SECONDS = 3.0
+
+# The first-turn death check's "never looked" marker (issue #146, devloop
+# #140's): the cache maps a session to a finding, to None ("looked: died,
+# not auth"), or -- absent -- to this, so the two negatives cannot be
+# confused.
+_UNCHECKED = object()
 
 
 def prompt_event_kind(kind: str, verb: str, session: str, seq: int) -> str:
@@ -2141,6 +2158,26 @@ class ReviewWatcher:
         self._prompt_hold: "str | None" = None
         # What the responder found and did this pass, for the summary line.
         self._prompt_sweep = PromptSweep()
+        # The first-turn death check's memory (issue #146, devloop #140's
+        # `_exit_findings`): every reviewer session whose pane was found back
+        # in a shell inside its round's first stale window, mapped to what
+        # its last lines said -- an `auth_rejected` finding, or None for the
+        # ordinary "died, not auth". The pane is captured ONCE per session;
+        # later passes re-assert a cached finding (so the hold and its
+        # expiry run the login_expired ladder) and never re-read a None.
+        # In-memory on purpose: a restart re-checks once, and the
+        # `auth-rejected:` row is once per session in the ledger, so a
+        # re-observation writes nothing and emits nothing new.
+        self._exit_findings: "dict[str, prompts_mod.PromptFinding | None]" = {}
+        # Where `auth.rejected` reads the credential's NAME and last four
+        # characters (`loop_events.credential_identity`): the process
+        # environment when None; injectable so a test never depends on --
+        # or leaks -- the seat's own token.
+        self.auth_environ: "dict[str, str] | None" = None
+        # Dry-run's once-per-session memory for the `auth-rejected:` row it
+        # would have written (the durable row is production's; the
+        # `_dry_run_drift` split).
+        self._dry_run_auth: "set[str]" = set()
         # The settle wait between pressing a dialog's keys and re-capturing
         # the pane; injectable so a test never sleeps.
         self._sleep: "Callable[[float], None]" = time.sleep
@@ -5742,6 +5779,18 @@ class ReviewWatcher:
         answered = 0
         for ses in sessions:
             live.add(ses.name)
+            # The first-turn death check (issue #146) runs BEFORE the two
+            # triggers below: a pane whose `claude` exited is a shell at
+            # rest, which neither a marker nor the quiet gate reads as a
+            # prompt, and which the banner classifier would call idle.
+            exited = self._first_turn_death(ses)
+            if exited is not None:
+                outcome = self._answer_prompt(ses, None, exited, mode)
+                waiting.append(outcome["waiting"])
+                answered += outcome["answered"]
+                if outcome["hold"] and hold is None:
+                    hold = outcome["hold"]
+                continue
             marker = self._waiting_marker(ses.tmux_name)
             quiet = ses.quiet_for
             if marker is None and (
@@ -5772,7 +5821,121 @@ class ReviewWatcher:
                 hold = outcome["hold"]
         self._sighting_prune(live)
         self._prune_prompt_pings(live)
+        for gone in [n for n in self._exit_findings if n not in live]:
+            del self._exit_findings[gone]
         return PromptSweep(waiting=tuple(waiting), hold=hold, answered=answered)
+
+    def _first_turn_death(
+        self, ses: ManagedSession
+    ) -> "prompts_mod.PromptFinding | None":
+        """The first-turn death check (issue #146; devloop #140's, on the
+        reviewer seat): an `auth_rejected` finding with `source: "exit"` for
+        a reviewer session whose `claude` died on a 401 before it could do
+        anything, else None.
+
+        The candidate is narrow by design, and every leg is cheap or rare:
+        a session THIS ledger spawned (a spawn row names it -- the skill's
+        hand-driven `review-pr-<n>` rounds have none and no spawn time to
+        measure a window from) inside its round's first stale window
+        (STALE_ROUND_SECONDS), whose pane's current command is back in
+        `SHELL_COMMANDS` (one `display-message` per young session per pass).
+        Its last lines are captured ONCE and read by
+        `prompts.classify_exit`; a match is remembered and re-asserted on
+        later passes while the pane is still a shell, so the page-and-hold
+        path and its one-hour expiry run exactly as they do for a
+        login_expired banner -- and the expiry's kill ages the round's spawn
+        row, so the stale-round edge re-enters THE SAME ROUND (no verdict
+        was submitted, so `completed + 1` has not moved): an auth death
+        never burns a round number. No match is the ordinary "died, not
+        auth": remembered too (never re-read), and nothing new is emitted --
+        the stale-round respawn is the remedy it always was. An unreadable
+        pane (tmux answered nothing) is not remembered: the check runs again
+        next pass rather than filing a blank capture as "not auth"."""
+        name = ses.name
+        cached = self._exit_findings.get(name, _UNCHECKED)
+        if cached is None:
+            return None
+        if cached is not _UNCHECKED:
+            command = self.alissa.pane_command(name)
+            if command in SHELL_COMMANDS or not command:
+                # Still the dead shell -- or tmux could not answer ("" is a
+                # failed read, never a command), in which case the last thing
+                # known stands: forgetting it here would re-arm a second
+                # capture inside the stale window and drop the hold and its
+                # expiry past it, for a shell still dead (devloop PR #141
+                # review round 1).
+                return cached  # type: ignore[return-value]
+            # A named, non-shell command: someone re-ran claude by hand in
+            # the session -- a live pane again, and the ordinary triggers own
+            # it from here.
+            del self._exit_findings[name]
+            return None
+        row = self.state.find_spawn_by_session(name)
+        if row is None:
+            return None
+        age = time.time() - int(row["spawned_at"])
+        if age >= STALE_ROUND_SECONDS:
+            return None
+        if self.alissa.pane_command(name) not in SHELL_COMMANDS:
+            return None
+        pane = self.alissa.capture_pane(name, prompts_mod.PANE_LINES)
+        if not pane.strip():
+            log.debug(
+                "first-turn death check: %s is a shell but its pane could not "
+                "be read — re-checked next pass", name,
+            )
+            return None
+        finding = prompts_mod.classify_exit(pane)
+        self._exit_findings[name] = finding
+        if finding is None:
+            log.info(
+                "first-turn death check: %s exited to a shell %d s after its "
+                "spawn with no auth wording in its last lines — died, not "
+                "auth; the stale-round edge owns it", name, int(age),
+            )
+        return finding
+
+    def _record_auth_rejected(
+        self,
+        name: str,
+        anchor: "PromptAnchor | None",
+        finding: "prompts_mod.PromptFinding",
+    ) -> None:
+        """The `auth.rejected` row (issue #146): ONE `auth-rejected:` ping
+        per session, which the loop-events emitter derives the event from.
+        The row carries the vocabulary tokens, the round, the credential's
+        variable NAME and its last four characters -- read here, at
+        observation, so a later backfill still names the token that was
+        refused -- and never the signature or any other pane text. An
+        anchor-less session (no spawn row, a name that resolves to no single
+        watched repo) is recorded under ('', 0): the event still goes, with
+        no PR. Dry-run writes nothing and logs the row once per session."""
+        if self.state.ping_seen_since(auth_rejected_prefix(name), 0):
+            return
+        env_name, suffix = credential_identity(self.auth_environ)
+        if self.config.dry_run:
+            if name not in self._dry_run_auth:
+                self._dry_run_auth.add(name)
+                log.info(
+                    "[dry-run] would record auth.rejected for %s (source %s, "
+                    "matched %s, envName %s)",
+                    name, finding.source, finding.matched, env_name,
+                )
+            return
+        self.state.record_ping(
+            anchor.repo if anchor is not None else "",
+            anchor.number if anchor is not None else 0,
+            auth_rejected_kind(
+                name, anchor.round if anchor is not None else None,
+                finding.source, finding.matched, env_name, suffix,
+            ),
+        )
+        log.warning(
+            "auth.rejected: claude refused the credential of reviewer session "
+            "%s (source %s, matched %s, envName %s) — the loop event names the "
+            "token's last four characters; spawns are held",
+            name, finding.source, finding.matched, env_name,
+        )
 
     def _answer_prompt(
         self,
@@ -5899,10 +6062,16 @@ class ReviewWatcher:
                 tail = " · killed; the stale-round edge re-enters the same round next poll"
             elif action.sends_keys and not sent and not self.config.dry_run:
                 tail = " · keys not sent (tmux refused)"
+            # The auth kinds name the wording and where it was read (the
+            # `auth.rejected` event's own tokens, never the pane's text).
+            auth_tail = (
+                f" · matched {finding.matched} · source {finding.source}"
+                if finding.kind in prompts_mod.AUTH_KINDS and finding.matched else ""
+            )
             line = self._activity_line(
                 name, anchor.round,
                 f"{prefix}: {finding.kind} → {action.verb} ({action.reason})"
-                f"{f' · target {target_rel}' if target_rel else ''}"
+                f"{f' · target {target_rel}' if target_rel else ''}{auth_tail}"
                 f" · {since} s after it appeared{tail}",
                 anchor.cap,
             )
@@ -5920,6 +6089,12 @@ class ReviewWatcher:
                 "spawn row, and the name resolves to no single watched repo) — "
                 "%s → %s recorded in the log only", name, finding.kind, action.verb,
             )
+        # The `auth.rejected` record (issue #146): the two AUTH_KINDS are the
+        # same signal. Live mode only: `observe` pages nobody and holds
+        # nothing, and Studio acts on this event (it flips the stored
+        # credential), so an observing daemon must not make that claim.
+        if finding.kind in prompts_mod.AUTH_KINDS and live_mode:
+            self._record_auth_rejected(name, anchor, finding)
         return {
             "waiting": {
                 "session": name, "kind": finding.kind,

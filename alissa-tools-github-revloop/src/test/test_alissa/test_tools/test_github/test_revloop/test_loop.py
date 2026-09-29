@@ -369,6 +369,11 @@ class FakeAlissa:
         self.panes: dict = {}
         self.captured: list[tuple[str, int]] = []
         self.paths: dict[str, str] = {}
+        # The pane's current command per managed name (issue #146's
+        # first-turn death check): absent reads `node`, a live `claude`; a
+        # shell name is a `claude` that exited; "" is a tmux read that failed.
+        self.commands: dict[str, str] = {}
+        self.command_reads: list[str] = []
         self.sent: list[tuple[str, tuple]] = []
         self.dry_sent: list[tuple[str, tuple]] = []
         self.send_error = False
@@ -510,6 +515,10 @@ class FakeAlissa:
 
     def pane_path(self, name):
         return self.paths.get(name, "")
+
+    def pane_command(self, name):
+        self.command_reads.append(name)
+        return self.commands.get(name, "node")
 
     def send_keys(self, name, *keys, dry_run=False):
         from alissa.tools.github.revloop.prompts import ALLOWED_KEYS
@@ -11837,3 +11846,314 @@ def test_poll_once_runs_the_responder_on_the_post_reap_roster_and_logs_the_summa
     assert al.sent == [(PROMPT_SESSION, ("Enter",))]
     assert "1 parked on a prompt, 1 answered," in caplog.text
     assert w._prompt_sweep.answered == 1
+
+
+# -- auth.rejected: a reviewer refused by Claude (issue #146) ------------------
+#
+# devloop #140's two detectors on the reviewer seat: a documented 401 wording
+# on a live pane (the banner classifier) and the first-turn death check (a
+# pane back at a shell inside its round's first stale window, last lines
+# captured once). Either one is an `auth_rejected` finding the login_expired
+# row answers -- page once, hold spawns -- and ONE `auth-rejected:` row per
+# session the loop-events emitter derives `auth.rejected` from.
+
+AUTH_SHELL = "alissa@dark-revloop:/workspace/widgets/REVIEW-TASK-500$ \n"
+AUTH_EXIT_PANE = (
+    "> review PR #7\n\n"
+    '  ⎿  API Error: 401 {"type":"error","error":{"type":"authentication_error",'
+    '"message":"invalid x-api-key"}}\n\n' + AUTH_SHELL
+)
+AUTH_EXIT_PLAIN_PANE = "● Done.\n\nSegmentation fault (core dumped)\n" + AUTH_SHELL
+AUTH_BANNERS = {
+    "api_error_401": "\n API Error: 401 Invalid authentication credentials\n\n❯ \n",
+    "invalid_api_key": "\n Invalid API key · Fix external API key\n\n❯ \n",
+    "oauth_expired": "\n OAuth token has expired · run claude setup-token\n\n❯ \n",
+    "oauth_revoked": "\n OAuth token revoked\n\n❯ \n",
+    "login_expired": PROMPT_LOGIN,
+}
+AUTH_TOKEN = "sk-ant-oat01-" + "t" * 40 + "b7Qx"
+
+
+def auth_rows(w):
+    return [r for r in w.state.read_pings() if r["kind"].startswith("auth-rejected:")]
+
+
+def auth_events(w):
+    return [e for e in loop_events.derive_events(w.state) if e["kind"] == "auth.rejected"]
+
+
+def auth_watcher(config, tmp_path, **over):
+    w, gh, al = prompt_watcher(config, tmp_path, **over)
+    w.auth_environ = {"CLAUDE_CODE_OAUTH_TOKEN": AUTH_TOKEN}
+    return w, gh, al
+
+
+@pytest.mark.parametrize("matched", sorted(AUTH_BANNERS))
+def test_each_documented_401_wording_on_a_reviewer_pane_emits_one_auth_rejected(
+    config, tmp_path, matched
+):
+    """c1 (pane detector): each wording, parked on a marked reviewer pane
+    for three passes, pages once, holds spawns every pass, and leaves ONE
+    `auth-rejected:` row -- one `auth.rejected` event with the wording's
+    token, `source: "pane"`, the round the spawn row names, and the
+    credential's name and suffix."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    write_marker(w.config, PROMPT_SESSION)
+    al.sessions = [roster_entry(PROMPT_SESSION)]
+    al.panes[PROMPT_SESSION] = AUTH_BANNERS[matched]
+    kind = "login_expired" if matched == "login_expired" else "auth_rejected"
+    for _ in range(3):
+        sweep = w._respond_to_prompts(al.sessions)
+        assert sweep.hold and sweep.hold.startswith(f"{kind} on {PROMPT_SESSION}")
+    assert al.sent == [] and al.killed == []
+    assert len(operator_comments(gh)) == 1, "paged once"
+    assert len(auth_rows(w)) == 1
+    (event,) = auth_events(w)
+    assert event["prNumber"] == NUMBER and event["round"] == 1 and event["repo"] == SLUG
+    assert event["session"] == PROMPT_SESSION
+    assert event["data"] == {
+        "status": 401, "source": "pane", "matched": matched,
+        "envName": "CLAUDE_CODE_OAUTH_TOKEN", "tokenSuffix": "b7Qx",
+    }
+    line = activity_lines(gh)[0]
+    assert f"prompt-paged: {kind} → page" in line
+    assert f"matched {matched} · source pane" in line
+
+
+def test_a_first_turn_death_on_a_401_emits_source_exit_pages_once_and_holds(config, tmp_path):
+    """c1 (exit detector) + c3: the reviewer's `claude` printed the 401 and
+    exited; the pane is a shell, so neither the marker nor the quiet gate
+    would read it. The death check captures it ONCE, then re-asserts the
+    cached finding every pass: the page goes out once, the hold stands, and
+    one `auth.rejected` with `source: "exit"` is derived."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PANE
+    for _ in range(3):
+        sweep = w._respond_to_prompts(al.sessions)
+        assert sweep.hold and sweep.hold.startswith(f"auth_rejected on {PROMPT_SESSION}")
+        assert sweep.waiting[0]["kind"] == "auth_rejected"
+    assert al.captured == [(PROMPT_SESSION, prompts_mod.PANE_LINES)], "captured once"
+    pages = operator_comments(gh)
+    assert len(pages) == 1 and "`auth_rejected`" in pages[0]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in pages[0] and "last four characters" in pages[0]
+    (event,) = auth_events(w)
+    assert event["data"] == {
+        "status": 401, "source": "exit", "matched": "api_error_401",
+        "envName": "CLAUDE_CODE_OAUTH_TOKEN", "tokenSuffix": "b7Qx",
+    }
+    assert event["reason"] == "claude answered 401 on the first turn and exited"
+    assert "matched api_error_401 · source exit" in activity_lines(gh)[0]
+
+
+def test_a_first_turn_death_without_a_401_emits_nothing_new(config, tmp_path, caplog):
+    """c1's negative: a shell that died of something else is the ordinary
+    "died, not auth" -- read once, remembered, no page, no hold, no row;
+    the stale-round edge's respawn stays the remedy."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "zsh"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PLAIN_PANE
+    with caplog.at_level(logging.INFO):
+        first = w._respond_to_prompts(al.sessions)
+        second = w._respond_to_prompts(al.sessions)
+    assert first == PromptSweep() and second == PromptSweep()
+    assert al.captured == [(PROMPT_SESSION, prompts_mod.PANE_LINES)], "never re-read"
+    assert gh.comments == [] and gh.issue_store == []
+    assert auth_rows(w) == [] and auth_events(w) == []
+    assert caplog.text.count("died, not auth") == 1
+
+
+def test_the_death_check_reads_only_young_spawned_shells(config, tmp_path):
+    """The candidate is narrow: a live `claude` (`node`) is never captured
+    by the check; a session with no spawn row (the skill's `review-pr-<n>`)
+    has no spawn time to measure from and is never probed; a spawn older
+    than the first stale window is not a first-turn death."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    skill = "review-pr-904"
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0), roster_entry(skill, quiet=0)]
+    al.commands[skill] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PANE
+    al.panes[skill] = AUTH_EXIT_PANE
+    w._respond_to_prompts(al.sessions)
+    assert al.captured == [] and al.command_reads == [PROMPT_SESSION]
+
+    al.commands[PROMPT_SESSION] = "bash"
+    w.state._db.execute(
+        "UPDATE spawns SET spawned_at=spawned_at-? WHERE session=?",
+        (loop_module.STALE_ROUND_SECONDS + 1, PROMPT_SESSION),
+    )
+    w.state._db.commit()
+    assert w._respond_to_prompts(al.sessions) == PromptSweep()
+    assert al.captured == [] and auth_rows(w) == []
+
+
+def test_an_unreadable_dead_pane_is_rechecked_next_pass(config, tmp_path):
+    """A blank capture is tmux failing, not a pane saying "not auth": it is
+    not filed as a negative, so the next pass reads the pane again."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = ["", AUTH_EXIT_PANE]
+    assert w._respond_to_prompts(al.sessions).hold is None
+    assert w._respond_to_prompts(al.sessions).hold is not None
+    assert len(al.captured) == 2 and len(auth_rows(w)) == 1
+
+
+def test_a_cached_refusal_survives_a_failed_tmux_read_and_a_live_claude_releases_it(
+    config, tmp_path
+):
+    """devloop PR #141 round 1's `[minor]` on this seat: "" from
+    `pane_command` is a failed read and keeps the cached finding (the hold
+    stands, no re-capture); a named non-shell command means claude was
+    re-run in the session, and the ordinary triggers own it again."""
+    w, gh, al = auth_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PANE
+    assert w._respond_to_prompts(al.sessions).hold is not None
+    al.commands[PROMPT_SESSION] = ""
+    assert w._respond_to_prompts(al.sessions).hold is not None
+    assert len(al.captured) == 1
+    al.commands[PROMPT_SESSION] = "node"
+    assert w._respond_to_prompts(al.sessions).hold is None
+    assert PROMPT_SESSION not in w._exit_findings
+    assert len(auth_rows(w)) == 1, "the row is once per session, whatever happens after"
+
+
+def test_the_death_checks_memory_follows_the_session_out_of_the_roster(config, tmp_path):
+    w, gh, al = auth_watcher(config, tmp_path)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PLAIN_PANE
+    w._respond_to_prompts(al.sessions)
+    assert PROMPT_SESSION in w._exit_findings
+    w._respond_to_prompts([])
+    assert w._exit_findings == {}
+
+
+def test_an_auth_death_never_burns_a_round_number(config, tmp_path):
+    """c3, THE PIN: round 1's reviewer dies on a 401. The round is held
+    (in flight, never a round 2), the hold's expiry kills the dead shell
+    and ages its spawn row, and the stale-round edge re-enqueues ROUND 1
+    -- `reenqueued`, the same number. The respawned reviewer refused again
+    is a second session and a second event, still on round 1; and once the
+    credential is fixed the loop still has its full cap of rounds."""
+    cfg = prompt_config(config, tmp_path)
+    w, gh, al = watcher(cfg, make_pr(), [], state=State(cfg.state_db))
+    w._sleep = lambda s: None
+    w.auth_environ = {"ANTHROPIC_API_KEY": "sk-ant-api03-" + "k" * 40 + "wxyz"}
+    first = w.evaluate(OWNER, REPO, NUMBER)
+    assert first.action is Action.SPAWNED and first.round == 1
+    dead = al.enqueued[0]["session"]
+
+    al.sessions = [roster_entry(dead, quiet=0)]
+    al.commands[dead] = "bash"
+    al.panes[dead] = AUTH_EXIT_PANE
+    sweep = w._respond_to_prompts(al.sessions)
+    w._prompt_hold = sweep.hold
+    assert sweep.hold is not None
+    held = w.evaluate(OWNER, REPO, NUMBER)
+    assert held.round == 1 and held.action is not Action.SPAWNED
+    assert len(al.enqueued) == 1
+
+    # The hold's expiry: the same dead pane past ACCOUNT_HOLD_SECONDS.
+    w.state._db.execute(
+        "UPDATE prompt_sightings SET first_seen=first_seen-? WHERE session=?",
+        (prompts_mod.ACCOUNT_HOLD_SECONDS + 5, dead),
+    )
+    w.state._db.commit()
+    expired = w._respond_to_prompts(al.sessions)
+    w._prompt_hold = expired.hold
+    assert al.killed == [dead] and expired.hold is None
+
+    again = w.evaluate(OWNER, REPO, NUMBER)
+    assert again.action is Action.SPAWNED and again.reenqueued is True
+    assert again.round == 1, "the same round, not round 2"
+    respawned = al.enqueued[1]["session"]
+    assert respawned != dead
+
+    # Still refused: the fresh pane re-arms the hold, one more event.
+    al.sessions = [roster_entry(respawned, quiet=0)]
+    al.commands[respawned] = "bash"
+    al.panes[respawned] = AUTH_EXIT_PANE
+    assert w._respond_to_prompts(al.sessions).hold is not None
+    events = {e["session"]: e for e in auth_events(w)}
+    assert set(events) == {dead, respawned}
+    assert {e["round"] for e in events.values()} == {1}
+    assert len(operator_comments(gh)) == 1, "one page per kind per window"
+    assert not any(r["kind"].startswith("capout") for r in w.state.read_pings())
+
+    # The credential is fixed: two verdicts later round 3 (the cap) spawns.
+    gh._reviews[:] = [review(at="2026-07-18T10:00:00Z"), review(at="2026-07-18T11:00:00Z")]
+    al.verdict_count = 2
+    al.sessions = []
+    w._respond_to_prompts(al.sessions)
+    w._prompt_hold = None
+    w.state._db.execute("DELETE FROM spawns")
+    w.state._db.commit()
+    third = w.evaluate(OWNER, REPO, NUMBER)
+    assert third.action is Action.SPAWNED and third.round == 3
+
+
+def test_observe_and_dry_run_record_no_auth_rejected(config, tmp_path, caplog):
+    """Studio flips the stored credential on this event, so a daemon that
+    pages nobody (`observe`) makes no such claim, and dry-run writes no row
+    -- it logs the row it would have written, once per session."""
+    w, gh, al = auth_watcher(config, tmp_path, prompt_responder="observe")
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PANE
+    sweep = w._respond_to_prompts(al.sessions)
+    assert sweep.hold is None and sweep.waiting[0]["kind"] == "auth_rejected"
+    assert auth_rows(w) == []
+
+    w, gh, al = auth_watcher(config, tmp_path / "dry", dry_run=True)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = AUTH_EXIT_PANE
+    with caplog.at_level(logging.INFO):
+        w._respond_to_prompts(al.sessions)
+        w._respond_to_prompts(al.sessions)
+    assert auth_rows(w) == [] and gh.comments == []
+    assert caplog.text.count("[dry-run] would record auth.rejected") == 1
+
+
+def test_poll_once_emits_auth_rejected_and_no_token_value_leaves_the_process(
+    config, tmp_path, caplog
+):
+    """c2, THE SCAN, through a whole pass: the token is in the environment
+    the watcher reads AND printed on the dead pane. After `poll_once`, the
+    batch on the wire, every log line at DEBUG, every comment body and the
+    ledger carry neither the value nor the value minus its suffix; the
+    event carries the four-character suffix and nothing else of it."""
+    class Client:
+        def __init__(self):
+            self.batches = []
+
+        def post_loop_events(self, events):
+            self.batches.append(list(events))
+            return {"accepted": len(events), "duplicates": 0}
+
+    w, gh, al = auth_watcher(config, tmp_path)
+    client = Client()
+    w._loop_events = loop_events.LoopEventsEmitter(w.state, client)
+    al.sessions = [roster_entry(PROMPT_SESSION, quiet=0)]
+    al.commands[PROMPT_SESSION] = "bash"
+    al.panes[PROMPT_SESSION] = (
+        f"$ echo $CLAUDE_CODE_OAUTH_TOKEN\n{AUTH_TOKEN}\n"
+        f"$ claude\n Invalid API key · key {AUTH_TOKEN} was refused\n\n" + AUTH_SHELL
+    )
+    with caplog.at_level(logging.DEBUG):
+        w.poll_once()
+    wire = json.dumps(client.batches)
+    (event,) = [e for b in client.batches for e in b if e["kind"] == "auth.rejected"]
+    assert event["data"]["tokenSuffix"] == "b7Qx"
+    assert event["data"]["matched"] == "invalid_api_key"
+    ledger = json.dumps([dict(r) for r in w.state.read_pings()])
+    comments = "\n".join(list(gh.comments) + [c.body for c in gh.issue_store])
+    for surface, text in (("wire", wire), ("log", caplog.text), ("comments", comments),
+                          ("ledger", ledger)):
+        assert AUTH_TOKEN not in text, surface
+        assert AUTH_TOKEN[:-4] not in text, surface

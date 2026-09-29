@@ -13,8 +13,10 @@ import pytest
 
 from alissa.tools.github.revloop import prompts
 from alissa.tools.github.revloop.alissa import (
+    SHELL_COMMANDS,
     capture_pane_argv,
     check_session_name,
+    pane_command_argv,
     send_keys_argv,
     tmux_target,
 )
@@ -24,6 +26,7 @@ from alissa.tools.github.revloop.prompts import (
     ALLOWED_KEYS,
     KEY_ENTER,
     KEY_ESCAPE,
+    KIND_AUTH_REJECTED,
     KIND_DANGEROUS_RM,
     KIND_LOGIN_EXPIRED,
     KIND_OUT_OF_CREDITS,
@@ -42,7 +45,9 @@ from alissa.tools.github.revloop.prompts import (
     VERB_PAGE,
     VERB_WAIT,
     accept_keys,
+    auth_matched,
     classify,
+    classify_exit,
     decide,
     decline_keys,
     inside,
@@ -191,6 +196,98 @@ TRUST_NO_PATH_LINE_PANE = TRUST_PANE.replace(
     "│ Claude Code may read files in /workspace/studio          │",
 )
 
+# -- the 401 wordings (issue #146; devloop #140) ----------------------------
+#
+# The five documented wordings (design §1.4), each as the LAST thing on a
+# parked pane. The first is the shape Claude Code actually draws: its own
+# API error on a `⎿` row under the turn that failed, JSON body and all.
+AUTH_ROW_PANE = (
+    "> review PR #7\n\n"
+    '  ⎿  API Error: 401 {"type":"error","error":{"type":"authentication_error",'
+    '"message":"Invalid authentication credentials"},"request_id":"req_011"}\n'
+    + IDLE_BOX
+)
+AUTH_401_PANE = "\n API Error: 401 Invalid authentication credentials\n\n❯ \n"
+AUTH_CREDENTIALS_PANE = "\n Invalid authentication credentials\n\n❯ \n"
+AUTH_KEY_PANE = "\n Invalid API key · Fix external API key\n\n❯ \n"
+AUTH_OAUTH_EXPIRED_PANE = "\n OAuth token has expired · run claude setup-token\n\n❯ \n"
+AUTH_OAUTH_REVOKED_PANE = "\n OAuth token revoked\n\n❯ \n"
+AUTH_PANES = {
+    "api_error_401": AUTH_401_PANE,
+    "invalid_api_key": AUTH_KEY_PANE,
+    "oauth_expired": AUTH_OAUTH_EXPIRED_PANE,
+    "oauth_revoked": AUTH_OAUTH_REVOKED_PANE,
+}
+# The same words QUOTED: this README, a grep, a reviewer's own turn text, or
+# the banner left in scrollback behind later work. None is a refusal.
+QUOTED_AUTH_PANE = (
+    "● Bash(cat README.md)\n"
+    "  ⎿  `API Error: 401`, `Invalid API key`, `OAuth token revoked` → auth.rejected\n"
+    "     `OAuth token has expired`, `Invalid authentication credentials` too\n"
+    + IDLE_BOX
+)
+GREPPED_AUTH_PANE = (
+    '● Bash(grep -n "Invalid API key" prompts.py)\n'
+    '  ⎿  212: r"Invalid API key\\b|OAuth token (?:has )?expired\\b|"\n'
+    + IDLE_BOX
+)
+TURN_AUTH_PANE = "● Invalid API key is the wording the test pins.\n" + IDLE_BOX
+SCROLLBACK_AUTH_PANE = AUTH_KEY_PANE + "\n● Bash(ls)\n  ⎿  a b c\n" + IDLE_BOX
+# The exited shapes: `claude` printed the error and EXITED, and the shell
+# drew its prompt under it -- the wording is never the last thing on screen.
+SHELL_PROMPT = "alissa@dark-revloop:/workspace/widgets/REVIEW-TASK-500$ \n"
+EXIT_PANE = (
+    "> review PR #7\n\n"
+    '  ⎿  API Error: 401 {"type":"error","error":{"type":"authentication_error",'
+    '"message":"invalid x-api-key"}}\n\n'
+    + SHELL_PROMPT
+)
+EXIT_KEY_PANE = "\n Invalid API key · Fix external API key\n\n" + SHELL_PROMPT
+EXIT_LOGIN_PANE = LOGIN_PANE.replace("❯ \n", SHELL_PROMPT)
+EXIT_PLAIN_PANE = "● Done.\n\nSegmentation fault (core dumped)\n" + SHELL_PROMPT
+EXIT_QUOTED_PANE = (
+    "● Bash(cat README.md)\n"
+    "  ⎿  `API Error: 401`, `Invalid API key` → the auth.rejected event\n"
+    + SHELL_PROMPT
+)
+EXIT_TURN_PANE = "● OAuth token revoked is the wording the test pins.\n" + SHELL_PROMPT
+# The reviewer's own `●` turn wrapping onto a wording on a line of its own
+# (devloop PR #141 review round 1): no glyph on the wrapped row, the indent
+# stripped -- only the paragraph tells it from Claude Code's error.
+EXIT_WRAPPED_TURN_PANE = (
+    "● I traced the failure. When the key is wrong the server answers:\n"
+    "  Invalid API key · Please run /login\n"
+    "  so the fix is to reload the env.\n\n" + SHELL_PROMPT
+)
+EXIT_WRAPPED_401_PANE = EXIT_WRAPPED_TURN_PANE.replace(
+    "  Invalid API key · Please run /login",
+    '  API Error: 401 {"type":"error","error":{"type":"authentication_error"}}',
+)
+# The reviewer's own turn quoting the wording in a LATER paragraph or a code
+# block (devloop PR #141 review round 2): Claude Code renders one assistant message
+# as blank-separated paragraphs, `●` on the first line only, so the
+# paragraph is no boundary -- only the next `>` prompt row is.
+EXIT_PARAGRAPH_TURN_PANE = (
+    "● I traced the failure. When the key is wrong the server answers:\n\n"
+    "  Invalid API key · Please run /login\n\n"
+    "  so the fix is to reload the env.\n\n" + SHELL_PROMPT
+)
+EXIT_PARAGRAPH_401_PANE = (
+    "● The loop should match this line:\n\n"
+    '  API Error: 401 {"type":"error","error":{"type":"authentication_error"}}\n\n'
+    "  Done.\n\n" + SHELL_PROMPT
+)
+EXIT_CODE_BLOCK_PANE = (
+    "● Here is what the server printed:\n\n"
+    "  ```\n"
+    '  API Error: 401 {"type":"error","error":{"type":"authentication_error"}}\n'
+    "  ```\n\n" + SHELL_PROMPT
+)
+# A `>` prompt row ABOVE the error releases it from the `●` further up:
+# the genuine 401 under a later turn's prompt, with the reviewer's previous
+# answer still on screen.
+EXIT_SECOND_TURN_PANE = "● Reading loop.py\n\n" + EXIT_PANE
+
 
 # -- the classifier -----------------------------------------------------
 
@@ -209,6 +306,12 @@ TRUST_NO_PATH_LINE_PANE = TRUST_PANE.replace(
     (BOXED_LOGIN_PANE, KIND_LOGIN_EXPIRED),
     (BOXED_CREDITS_PANE, KIND_OUT_OF_CREDITS),
     (TRUST_SCROLLBACK_PANE, KIND_TRUST),
+    (AUTH_ROW_PANE, KIND_AUTH_REJECTED),
+    (AUTH_401_PANE, KIND_AUTH_REJECTED),
+    (AUTH_CREDENTIALS_PANE, KIND_AUTH_REJECTED),
+    (AUTH_KEY_PANE, KIND_AUTH_REJECTED),
+    (AUTH_OAUTH_EXPIRED_PANE, KIND_AUTH_REJECTED),
+    (AUTH_OAUTH_REVOKED_PANE, KIND_AUTH_REJECTED),
 ])
 def test_each_signature_classifies(pane, kind):
     finding = classify(pane)
@@ -219,6 +322,8 @@ def test_each_signature_classifies(pane, kind):
     WORKING_PANE, SPINNER_PANE, IDLE_PANE, "", "   \n\n", SCROLLBACK_PANE, QUOTED_PANE,
     QUOTED_LOGIN_PANE, QUOTED_CREDITS_PANE, QUOTED_LIMIT_PANE, PROSE_LOGIN_PANE,
     TURN_LIMIT_PANE, SCROLLBACK_LOGIN_PANE, SCROLLBACK_LIMIT_PANE, SCROLLBACK_CREDITS_PANE,
+    QUOTED_AUTH_PANE, GREPPED_AUTH_PANE, TURN_AUTH_PANE, SCROLLBACK_AUTH_PANE,
+    EXIT_PANE, EXIT_KEY_PANE, EXIT_LOGIN_PANE,
 ])
 def test_working_idle_empty_and_quoting_panes_are_not_prompts(pane):
     """A spinner or "esc to interrupt" in the tail is WORKING; the bare
@@ -289,7 +394,7 @@ def test_trust_path_is_read_from_the_dialog_body_never_from_scrollback():
 
 
 def test_account_kinds_are_banners_with_no_options_and_not_answerable():
-    for pane in (LOGIN_PANE, LIMIT_PANE, CREDITS_PANE):
+    for pane in (LOGIN_PANE, LIMIT_PANE, CREDITS_PANE, AUTH_ROW_PANE):
         finding = classify(pane)
         assert finding.options == ()
         assert finding.answerable is False
@@ -447,7 +552,7 @@ def test_resume_picker_is_escaped():
     assert action.verb == VERB_ESCAPE and action.keys == (KEY_ESCAPE,)
 
 
-@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE])
+@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE, AUTH_KEY_PANE])
 def test_account_kinds_page_hold_and_send_no_keys(pane):
     action = decide(classify(pane), ctx())
     assert action.verb == VERB_PAGE
@@ -455,7 +560,7 @@ def test_account_kinds_page_hold_and_send_no_keys(pane):
     assert action.page is True and action.hold_spawns is True
 
 
-@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE])
+@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE, AUTH_KEY_PANE])
 def test_account_kinds_are_not_subject_to_the_answer_cap(pane):
     """The cap counts answers; an account notice gets none, so it pages
     even on a session that already burned its answers."""
@@ -463,7 +568,7 @@ def test_account_kinds_are_not_subject_to_the_answer_cap(pane):
     assert action.verb == VERB_PAGE
 
 
-@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE])
+@pytest.mark.parametrize("pane", [LOGIN_PANE, LIMIT_PANE, CREDITS_PANE, AUTH_KEY_PANE])
 def test_the_account_hold_expires_into_a_kill_on_the_same_pane(pane):
     """The hold can never outlive one pane by more than
     ACCOUNT_HOLD_SECONDS: the same banner, seen again past it, is killed
@@ -569,7 +674,163 @@ def test_kinds_and_verbs_vocabulary_is_pinned():
     """The vocabulary Studio, the console and the activity lines share."""
     assert prompts.KINDS == (
         "dangerous_rm", "permission", "trust", "resume_picker", "login_expired",
-        "usage_limit", "out_of_credits", "unknown_dialog",
+        "auth_rejected", "usage_limit", "out_of_credits", "unknown_dialog",
     )
+    assert prompts.AUTH_KINDS == frozenset(("login_expired", "auth_rejected"))
+    assert prompts.AUTH_KINDS <= ACCOUNT_KINDS
+    # The `auth.rejected` event's own vocabulary (design §2.6), pinned as
+    # literals: Studio and the operator read these tokens.
+    assert prompts.AUTH_MATCHED == (
+        "api_error_401", "invalid_api_key", "oauth_expired", "oauth_revoked", "login_expired",
+    )
+    assert (prompts.SOURCE_PANE, prompts.SOURCE_EXIT) == ("pane", "exit")
     assert prompts.CONSOLE_VERBS == ("accept", "decline", "escape")
     assert ALLOWED_KEYS == frozenset(("Enter", "Escape", "1", "2", "3", "Down", "Up"))
+
+
+# -- the auth.rejected detectors (issue #146; devloop #140) ------------------
+
+
+@pytest.mark.parametrize("matched,pane", sorted(AUTH_PANES.items()))
+def test_each_documented_401_wording_classifies_with_its_matched_token(matched, pane):
+    """c1 (design §2.6): the four `auth_rejected` wordings, each as a
+    banner, carry the token Studio and the operator read. The wording is
+    the signature -- and the signature is the only pane text kept."""
+    finding = classify(pane)
+    assert finding.kind == KIND_AUTH_REJECTED
+    assert finding.matched == matched and finding.source == "pane"
+    assert finding.options == () and finding.answerable is False
+
+
+def test_the_credentials_sentence_and_the_api_error_row_are_the_bare_401():
+    """`Invalid authentication credentials` is the 401's own message, so
+    alone or under `API Error: 401` it reads as `api_error_401` -- and the
+    shape Claude Code really draws (its own `⎿` row, JSON body and all,
+    under the turn that failed) is admitted as a banner for this family."""
+    assert classify(AUTH_CREDENTIALS_PANE).matched == "api_error_401"
+    row = classify(AUTH_ROW_PANE)
+    assert row.kind == KIND_AUTH_REJECTED and row.matched == "api_error_401"
+    assert row.signature.startswith("API Error: 401")
+    assert "req_011" in row.signature, "the scrubbed line is kept whole -- there is no token in it"
+
+
+def test_login_expired_is_reported_as_the_same_signal():
+    finding = classify(LOGIN_PANE)
+    assert finding.kind == KIND_LOGIN_EXPIRED
+    assert finding.matched == "login_expired" and finding.source == "pane"
+    assert classify(RM_PANE).matched is None, "only the auth kinds carry a matched token"
+
+
+def test_the_api_error_row_under_a_tool_call_is_that_tools_output():
+    """The one `⎿` row the banner rule admits is Claude Code's OWN error
+    row; the same row under a `●` tool call in the same paragraph is what
+    the tool printed (a curl, a cat), never a refusal of this reviewer."""
+    under_tool = "● Bash(curl -s api.anthropic.com/v1/models)\n  ⎿  API Error: 401 …\n" + IDLE_BOX
+    assert classify(under_tool) is None
+    assert classify(AUTH_ROW_PANE) is not None
+
+
+@pytest.mark.parametrize("text,matched", [
+    ("API Error: 401 {\"type\":\"error\"}", "api_error_401"),
+    ("✗ API Error: 401 Invalid authentication credentials", "api_error_401"),
+    ("Invalid authentication credentials", "api_error_401"),
+    ("Invalid API key · Fix external API key", "invalid_api_key"),
+    ("API Error: 401 Invalid API key", "invalid_api_key"),
+    ("OAuth token has expired", "oauth_expired"),
+    ("OAuth token expired", "oauth_expired"),
+    ("OAuth token revoked", "oauth_revoked"),
+    ("OAuth token has been revoked", "oauth_revoked"),
+    ("the OAuth token revoked earlier", None),
+    ("Login expired · Please run /login", None),
+    ("API Error: 500 overloaded", None),
+    ("API Error: 4010", None),
+    ("", None),
+])
+def test_auth_matched_reads_the_documented_wordings_at_line_start(text, matched):
+    assert auth_matched(text) == matched
+
+
+def test_auth_rejected_pages_holds_and_expires_exactly_as_login_expired():
+    """c3: the policy row is login_expired's own -- page, hold, no keys,
+    no answer cap, and the one-hour expiry into a kill on the same pane."""
+    for pane in (AUTH_ROW_PANE, AUTH_KEY_PANE, AUTH_OAUTH_REVOKED_PANE):
+        finding = classify(pane)
+        action = decide(finding, ctx(answers=99))
+        assert action.verb == VERB_PAGE and action.keys == ()
+        assert action.page is True and action.hold_spawns is True
+        assert "auth rejected" in action.reason
+        expired = decide(finding, ctx(sightings=2, waiting_for=ACCOUNT_HOLD_SECONDS))
+        assert expired.verb == VERB_KILL and expired.hold_spawns is False
+
+
+@pytest.mark.parametrize("pane,matched", [
+    (EXIT_PANE, "api_error_401"),
+    (EXIT_KEY_PANE, "invalid_api_key"),
+    (EXIT_LOGIN_PANE, "login_expired"),
+    (EXIT_PANE.replace("\n\n" + SHELL_PROMPT, "\n\n\n" + SHELL_PROMPT + "\n"), "api_error_401"),
+    # a `●` turn ABOVE the `>` prompt row does not void the error under it
+    (EXIT_SECOND_TURN_PANE, "api_error_401"),
+])
+def test_classify_exit_reads_a_401_above_the_shell_prompt(pane, matched):
+    """c1: the exited shapes -- `claude` printed the error and the shell
+    drew its prompt under it. The banner rule cannot see these (the prompt
+    is the last thing on screen, so `classify` says idle); `classify_exit`
+    reads the last lines and answers an `auth_rejected` with `source:
+    "exit"`, the login-expired banner as the same signal."""
+    assert classify(pane) is None
+    finding = classify_exit(pane)
+    assert finding is not None
+    assert finding.kind == KIND_AUTH_REJECTED and finding.source == "exit"
+    assert finding.matched == matched and finding.options == ()
+    assert finding.pane_hash == pane_hash(pane)
+
+
+@pytest.mark.parametrize("pane", [
+    EXIT_PLAIN_PANE, EXIT_QUOTED_PANE, EXIT_TURN_PANE, SHELL_PROMPT, "", "  \n",
+    # the reviewer's own turn WRAPPED onto the wording, either family
+    EXIT_WRAPPED_TURN_PANE, EXIT_WRAPPED_401_PANE,
+    # ... or quoting it in a LATER paragraph or a code block of the same turn
+    EXIT_PARAGRAPH_TURN_PANE, EXIT_PARAGRAPH_401_PANE, EXIT_CODE_BLOCK_PANE,
+    # the wording is there but older than the scan window
+    AUTH_KEY_PANE + "".join(f"line {i}\n" for i in range(prompts.EXIT_SCAN_LINES)) + SHELL_PROMPT,
+])
+def test_classify_exit_answers_nothing_for_a_death_that_was_not_auth(pane):
+    """c1: a segfault, a README quoted under a tool call, the reviewer's own
+    turn text (on the `●` row, wrapped onto a plain row below it, or in a
+    later paragraph or code block of the same message), a bare shell, an
+    empty capture, or a wording that scrolled out of the last
+    EXIT_SCAN_LINES lines -- the ordinary "died, not auth". Every shape is
+    the live pane's answer too: `classify` answers None for all of them."""
+    assert classify_exit(pane) is None
+    assert classify(pane) is None
+
+
+def test_classify_exit_output_is_scrubbed():
+    """c2: a pane holds what the shell printed -- an `env` dump, a token
+    echoed by hand -- and neither the signature nor the excerpt may carry
+    it. The wording line itself is scrubbed like every other signature."""
+    token = "sk-ant-api03-" + "q" * 40
+    pane = (
+        f"$ echo $ANTHROPIC_API_KEY\n{token}\n"
+        f"$ claude\n Invalid API key · key {token} was refused\n\n" + SHELL_PROMPT
+    )
+    finding = classify_exit(pane)
+    assert finding is not None and finding.matched == "invalid_api_key"
+    assert token not in finding.signature and "<redacted>" in finding.signature
+    assert all(token not in line for line in finding.excerpt)
+
+
+def test_the_shell_commands_and_the_pane_command_argv(monkeypatch):
+    """The first-turn death check's probe: `#{pane_current_command}` over
+    the same socket and exact-match target as the other raw-tmux verbs,
+    and the shell names it compares against -- never Claude Code's own
+    runtime, which is what a LIVE reviewer reads."""
+    monkeypatch.setenv("TMUX_TMPDIR", "/home/alissa/.tmux")
+    argv = pane_command_argv("review-widgets-pr7-r1-abcdef")
+    assert argv[:2] == ["tmux", "-S"] and argv[2].endswith("/default")
+    assert argv[3:] == ["display-message", "-p", "-t", tmux_target("review-widgets-pr7-r1-abcdef"),
+                        "#{pane_current_command}"]
+    with pytest.raises(ValueError):
+        pane_command_argv("-t bad")
+    assert {"bash", "sh", "zsh", "fish", "dash"} <= SHELL_COMMANDS
+    assert not {"node", "claude", "python3", "git"} & SHELL_COMMANDS

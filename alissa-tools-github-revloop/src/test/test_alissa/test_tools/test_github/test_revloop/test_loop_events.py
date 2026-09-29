@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import urllib.error
 
 import pytest
@@ -847,3 +848,161 @@ def test_prompt_prefixes_match_the_loops_own_constants():
     assert loop_events.PROMPT_PAGE_PREFIX == loop_module.ESCALATION_PROMPT_PAGE + ":"
     assert loop_module.prompt_event_kind("trust", "accept", "review-pr-7", 5) == "prompt:trust:accept@review-pr-7#5"
     assert loop_module.prompt_page_kind("usage_limit", "review-pr-7", 3) == "prompt-page:usage_limit@review-pr-7#3"
+
+
+# -- auth.rejected (issue #146; devloop #140's event on the reviewer seat) -----
+
+API_KEY = "sk-ant-api03-" + "k" * 40 + "wxyz"
+OAUTH = "sk-ant-oat01-" + "o" * 40 + "1234"
+AUTH_SESSION = "review-widgets-pr7-r2-abcdef"
+
+
+def _auth_events(ledger):
+    return [e for e in derive_events(ledger) if e["kind"] == "auth.rejected"]
+
+
+@pytest.mark.parametrize("environ,expected", [
+    ({"ANTHROPIC_API_KEY": API_KEY, "CLAUDE_CODE_OAUTH_TOKEN": OAUTH}, ("ANTHROPIC_API_KEY", "wxyz")),
+    ({"ANTHROPIC_API_KEY": API_KEY}, ("ANTHROPIC_API_KEY", "wxyz")),
+    ({"CLAUDE_CODE_OAUTH_TOKEN": OAUTH}, ("CLAUDE_CODE_OAUTH_TOKEN", "1234")),
+    ({"ANTHROPIC_API_KEY": "  ", "CLAUDE_CODE_OAUTH_TOKEN": OAUTH}, ("CLAUDE_CODE_OAUTH_TOKEN", "1234")),
+    ({"ANTHROPIC_API_KEY": "ab"}, ("ANTHROPIC_API_KEY", "ab")),
+    ({"ANTHROPIC_AUTH_TOKEN": OAUTH}, (None, None)),
+    ({}, (None, None)),
+])
+def test_credential_identity_reads_the_name_and_the_last_four_only(environ, expected):
+    """c2: which variable the container carries, in Claude Code's own
+    precedence (the API key outranks the OAuth token), a blank value
+    reading as unset, and the value reduced to its last four characters
+    in the same read. Neither variable: a persisted `claude /login`.
+    devloop's table, verbatim."""
+    assert loop_events.credential_identity(environ) == expected
+
+
+def test_credential_identity_defaults_to_the_process_environment(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", API_KEY)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert loop_events.credential_identity() == ("ANTHROPIC_API_KEY", "wxyz")
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert loop_events.credential_identity() == (None, None)
+
+
+def test_an_auth_rejected_row_derives_devloops_data_shape_keyed_per_session(ledger, clock):
+    """c2, pinned as literals: kind, seat, the session-keyed dedupe key
+    (devloop's `<seat>:auth.rejected:<session>`), the PR and round, the
+    fixed reason, and `data` with the status, the source, the matched
+    token, the variable's NAME and the token's SUFFIX."""
+    ledger.record_ping(REPO, 7, loop_events.auth_rejected_kind(
+        AUTH_SESSION, 2, "exit", "api_error_401", "ANTHROPIC_API_KEY", "wxyz",
+    ))
+    (event,) = _auth_events(ledger)
+    assert event == {
+        "seat": "revloop",
+        "kind": "auth.rejected",
+        "at": clock.now() * 1000,
+        "dedupeKey": f"revloop:auth.rejected:{AUTH_SESSION}",
+        "repo": REPO,
+        "prNumber": 7,
+        "round": 2,
+        "session": AUTH_SESSION,
+        "reason": "claude answered 401 on the first turn and exited",
+        "data": {
+            "status": 401, "source": "exit", "matched": "api_error_401",
+            "envName": "ANTHROPIC_API_KEY", "tokenSuffix": "wxyz",
+        },
+    }
+    assert re.match(r"^[a-z]+(\.[a-z_]+)*$", event["kind"])
+
+
+def test_a_persisted_login_and_an_anchorless_session_still_derive_an_event(ledger, clock):
+    """A container on `claude /login` carries no variable: `envName` and
+    `tokenSuffix` are explicit nulls (devloop's shape). A session that
+    resolved to no watched PR is recorded under ('', 0): no repo and no PR
+    on the event rather than a made-up one; a round the row does not know
+    is omitted."""
+    ledger.record_ping(REPO, 7, loop_events.auth_rejected_kind(
+        AUTH_SESSION, 2, "pane", "login_expired", None, None,
+    ))
+    ledger.record_ping("", 0, loop_events.auth_rejected_kind(
+        "review-pr-904", None, "exit", "oauth_revoked", "CLAUDE_CODE_OAUTH_TOKEN", "1234",
+    ))
+    events = {e["session"]: e for e in _auth_events(ledger)}
+    pane = events[AUTH_SESSION]
+    assert pane["reason"] == "claude answered 401 — the reviewer's pane shows an auth banner"
+    assert pane["data"] == {
+        "status": 401, "source": "pane", "matched": "login_expired",
+        "envName": None, "tokenSuffix": None,
+    }
+    bare = events["review-pr-904"]
+    assert "repo" not in bare and "prNumber" not in bare and "round" not in bare
+    assert bare["data"]["matched"] == "oauth_revoked" and bare["data"]["tokenSuffix"] == "1234"
+
+
+def test_the_auth_rejected_kind_round_trips_any_suffix_and_closes_its_vocabulary():
+    """The suffix is the one field whose characters this module does not
+    choose (a token may end in `:` or `#`), so it trails the kind; a
+    source or matched token outside the vocabulary cannot be written."""
+    kind = loop_events.auth_rejected_kind(AUTH_SESSION, 3, "exit", "invalid_api_key",
+                                          "ANTHROPIC_API_KEY", "x" * 30 + "a:#9")
+    assert kind == f"auth-rejected:{AUTH_SESSION}#3:exit:invalid_api_key:ANTHROPIC_API_KEY:a:#9"
+    match = loop_events._AUTH_REJECTED_RE.match(kind)
+    assert match and match.group("suffix") == "a:#9"
+    assert kind.startswith(loop_events.auth_rejected_prefix(AUTH_SESSION))
+    odd = loop_events.auth_rejected_kind(AUTH_SESSION, None, "bogus", None, None, None)
+    assert odd == f"auth-rejected:{AUTH_SESSION}#:pane:api_error_401::"
+
+
+def test_a_malformed_auth_rejected_row_derives_nothing(ledger):
+    ledger.record_ping(REPO, 7, "auth-rejected:garbage")
+    ledger.record_ping(REPO, 7, f"auth-rejected:{AUTH_SESSION}#1:shell:api_error_401::")
+    assert _auth_events(ledger) == []
+
+
+def test_one_auth_rejected_per_session_however_often_it_is_derived(ledger, clock):
+    """One row per session is the watcher's half; the key is the emitter's:
+    two rows for one session (a second repo anchor, a restart that lost the
+    in-memory cache) still share ONE dedupe key, and two sessions have two."""
+    ledger.record_ping(REPO, 7, loop_events.auth_rejected_kind(AUTH_SESSION, 2, "exit", None, None, None))
+    clock()
+    ledger.record_ping("", 0, loop_events.auth_rejected_kind(AUTH_SESSION, None, "pane", None, None, None))
+    clock()
+    ledger.record_ping(REPO, 9, loop_events.auth_rejected_kind(
+        "review-widgets-pr9-r1-00ff00", 1, "pane", "oauth_expired", None, None,
+    ))
+    keys = [e["dedupeKey"] for e in _auth_events(ledger)]
+    assert sorted(set(keys)) == [
+        f"revloop:auth.rejected:{AUTH_SESSION}", "revloop:auth.rejected:review-widgets-pr9-r1-00ff00",
+    ]
+    assert derive_events(ledger) == derive_events(ledger), "deterministic"
+
+
+def test_no_token_value_reaches_the_wire_only_its_suffix(ledger, clock):
+    """c2, the scan at the emitter: the row is built from the injected
+    environment exactly as the watcher builds it, and the batch that
+    leaves the process carries four characters of the token -- never the
+    value, never the value minus its suffix."""
+    env_name, suffix = loop_events.credential_identity({"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    ledger.record_ping(REPO, 7, loop_events.auth_rejected_kind(
+        AUTH_SESSION, 1, "exit", "api_error_401", env_name, suffix,
+    ))
+    client = FakeClient()
+    assert LoopEventsEmitter(ledger, client).emit_once() is True
+    wire = json.dumps(client.batches)
+    assert OAUTH not in wire and OAUTH[:-4] not in wire
+    assert "oooo" not in wire, "no run of the token body at all"
+    (event,) = by_kind(client.events, "auth.rejected")
+    assert event["data"]["envName"] == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert event["data"]["tokenSuffix"] == "1234"
+
+
+def test_auth_rejected_prefix_is_distinct_from_every_other_ping_family():
+    """`_ping_events` dispatches on prefixes; the new family must not be a
+    prefix of, or prefixed by, any other the module parses."""
+    others = (
+        loop_events.STALLED_PREFIX, loop_events.STABILITY_PREFIX,
+        loop_events.CHECKS_UNSETTLED_PREFIX, loop_events.PROMPT_PREFIX,
+        loop_events.PROMPT_PAGE_PREFIX,
+    )
+    for other in others:
+        assert not other.startswith(loop_events.AUTH_REJECTED_PREFIX)
+        assert not loop_events.AUTH_REJECTED_PREFIX.startswith(other)
