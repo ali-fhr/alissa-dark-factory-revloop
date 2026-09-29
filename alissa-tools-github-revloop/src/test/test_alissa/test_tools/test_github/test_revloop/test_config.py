@@ -5,13 +5,19 @@ narrowed to static, and the actor-id shape check on `bow_owners`."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
+from alissa.tools.github.revloop import config as config_module
 from alissa.tools.github.revloop.config import (
     BOW_OWNERS_ENV,
     BOWS_REFRESH_POLLS_ENV,
     CONFIG_FILENAME,
+    CONFIG_KEYS,
+    DEFAULT_PLAN_REPOS,
+    PLAN_AUTHORS_ENV,
+    PLAN_REPOS_ENV,
     HUB_ADD,
     REPOS_BOWS,
     REPOS_SOURCE_ENV,
@@ -263,3 +269,102 @@ def test_the_prompt_keys_are_known_config_keys_and_in_the_example_file(tmp_path)
     for key in keys:
         assert key in example, key
     assert Config.build(tmp_path, {k: v for k, v in example.items() if not k.startswith("_")}, environ={})
+
+
+# -- the plan allowlists (issue #148) -----------------------------------------
+#
+# The plans repository is fleet CONFIGURATION: the default names it by name
+# under the `<owner>` placeholder, a deployment names its own with
+# ALISSA_REVIEW_PLAN_REPOS, and no literal plans repository survives in the
+# code outside config.py. `plan_authors` is fail-closed: empty means no PR is
+# a plan PR.
+
+
+def test_the_plan_defaults_select_nothing(tmp_path):
+    cfg = Config.build(tmp_path, {}, environ={})
+    assert cfg.plan_repos == ("<owner>/alissa-dark-factory-plans",)
+    assert cfg.plan_repos == DEFAULT_PLAN_REPOS
+    assert cfg.plan_authors == ()
+    assert cfg.is_plan_repo("ali-fhr/alissa-dark-factory-plans")
+    assert cfg.is_plan_repo("someone-else/alissa-dark-factory-plans")
+    assert not cfg.is_plan_repo("ali-fhr/alissa-dark-factory-revloop")
+    # Fail-closed: nobody is a plan author until one is named.
+    assert not cfg.is_plan_author("genlissa-app")
+    assert not cfg.is_plan_author("")
+
+
+def test_the_env_rails_name_the_fleets_plans_repository_and_author(tmp_path):
+    cfg = Config.build(
+        tmp_path,
+        {"plan_repos": ["file/plans"], "plan_authors": ["file-bot"]},
+        environ={
+            PLAN_REPOS_ENV: "ali-fhr/alissa-dark-factory-plans",
+            PLAN_AUTHORS_ENV: " genlissa-app | planner[bot] ,",
+        },
+    )
+    # env > file, split on | and , with whitespace and empties dropped.
+    assert cfg.plan_repos == ("ali-fhr/alissa-dark-factory-plans",)
+    assert cfg.plan_authors == ("genlissa-app", "planner[bot]")
+    assert cfg.is_plan_repo("ALI-FHR/Alissa-Dark-Factory-Plans")
+    assert not cfg.is_plan_repo("other/alissa-dark-factory-plans")
+    assert cfg.is_plan_author("GenLissa-App")
+    assert not cfg.is_plan_author("vlissa-app")
+
+
+def test_a_blank_env_rail_falls_through_to_the_file(tmp_path):
+    cfg = Config.build(
+        tmp_path,
+        {"plan_repos": ["acme/plans"], "plan_authors": ["genlissa-app"]},
+        environ={PLAN_REPOS_ENV: "  ", PLAN_AUTHORS_ENV: ""},
+    )
+    assert cfg.plan_repos == ("acme/plans",)
+    assert cfg.plan_authors == ("genlissa-app",)
+
+
+def test_a_separator_only_env_rail_is_an_empty_list(tmp_path):
+    """Said, and what was said is "nothing": fail closed, not the default."""
+    cfg = Config.build(tmp_path, {}, environ={PLAN_REPOS_ENV: "|,"})
+    assert cfg.plan_repos == ()
+    assert not cfg.is_plan_repo("ali-fhr/alissa-dark-factory-plans")
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("plan_repos", ["alissa-dark-factory-plans"]),   # no owner
+        ("plan_repos", ["a/b/c"]),
+        ("plan_repos", ["*/plans"]),
+        ("plan_repos", ["<org>/plans"]),                 # the placeholder is <owner>
+        ("plan_authors", ["not a login"]),
+        ("plan_authors", ["-leading-dash"]),
+        ("plan_repos", "acme/plans"),                    # a string, not a list
+    ],
+)
+def test_a_malformed_plan_entry_is_refused_at_load(tmp_path, key, value):
+    with pytest.raises(ValueError, match=key):
+        Config.build(tmp_path, {key: value}, environ={})
+
+
+def test_the_plan_keys_are_config_file_keys():
+    assert "plan_repos" in CONFIG_KEYS and "plan_authors" in CONFIG_KEYS
+
+
+def test_no_plans_repository_literal_survives_outside_config():
+    """The operator's decision on issue #148: the plans repository is
+    configuration. Neither the design's superseded name nor this fleet's
+    appears anywhere in the daemon's code but config.py -- which itself names
+    it only under the placeholder."""
+    package = Path(config_module.__file__).parent
+    literals = ("alissa-dark-factory-plans", "alissa-plans", "ali-fhr/")
+    offenders = []
+    for path in sorted(package.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for literal in literals:
+            if literal in text and not (
+                path.name == "config.py" and literal == "alissa-dark-factory-plans"
+            ):
+                offenders.append(f"{path.relative_to(package)}: {literal}")
+    assert offenders == []
+    config_text = Path(config_module.__file__).read_text(encoding="utf-8")
+    assert "ali-fhr/alissa-dark-factory-plans" not in config_text
+    assert "ali-fhr/alissa-plans" not in config_text

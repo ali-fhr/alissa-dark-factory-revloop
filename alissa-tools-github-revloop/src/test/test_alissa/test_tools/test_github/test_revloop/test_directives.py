@@ -8,10 +8,16 @@ guards them against being edited away.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
+from alissa.tools.github.revloop.alissa import COMMIT_READINESS_CLASSES
 from alissa.tools.github.revloop.loop import (
     CHECKS_AT_SPAWN_RED,
+    PLAN_ROUND_1_DIRECTIVE,
+    PLAN_ROUND_K_DIRECTIVE,
+    PLAN_RUBRIC,
     DATA_CLOSE,
     DATA_OPEN,
     DIRECTIVE_DATA_TRUNCATED,
@@ -239,3 +245,185 @@ def test_the_shell_rule_is_devloops_word_for_word():
     one vocabulary; a drift here is a drift in what every seat is told."""
     assert _SHELL_RULE.startswith("You are unattended: nothing can answer an interactive prompt.")
     assert _SHELL_RULE.endswith("change the command; do not retry it. ")
+
+
+# -- the plan directives (issue #148; genloop design D8, D18, §6.2, §6.3) -----
+
+PLAN_TEMPLATES = [PLAN_ROUND_1_DIRECTIVE, PLAN_ROUND_K_DIRECTIVE]
+
+# The rubric, byte for byte (c3). A change to the refuter's questions is a
+# change to what makes a merged plan trustworthy, so it is a test edit here
+# too -- never a silent drift in the directive.
+EXPECTED_PLAN_RUBRIC = (
+    "THE RUBRIC — answer all six questions, in this order, each with one line "
+    "in your verdict envelope and a finding wherever the answer is no: "
+    "(1) Worth doing? Does the plan serve its anchor in a way the operator "
+    "would recognise, and does *Why now* hold against the program's "
+    "milestones and the direction? "
+    "(2) Correctly split into tasks? Is each task one PR's worth for one "
+    "worker with one definition of done; is nothing a milestone in disguise; "
+    "is nothing split so fine that the pieces cannot be reviewed alone? "
+    "(3) Scopes honest and narrow? Does each `scope` name the files the task "
+    "will actually touch — the shared hotspots included (`convex/schema.ts`, "
+    "`packages/client/src/**`, `API.md`) — and nothing it will not? The lint "
+    "refuses the broad glob; you refuse the narrow lie. "
+    "(4) Dependencies right? Are the edges the real order; is anything "
+    "missing that would make two tasks collide on a scope; is anything hard "
+    "that should be soft? The lint proves the graph resolves and is acyclic; "
+    "you judge whether it is true. "
+    "(5) Duplicates an open task? The same intent under another title — `gh "
+    "issue list --repo <repo> --label alissa:develop --state all`, the "
+    "merged-PR titles of the window and `GET /v1/tasks?status=…` for the fleet "
+    "actor, read for every task's `repo`. "
+    "(6) Consistent with the accepted design docs and the operator's "
+    "direction? Does any task contradict a decision in the target repo's "
+    "`docs/design/` (the `D<n>` rows, read with `gh api`) or a priority in the "
+    "steering record; does it touch an `offLimits` topic or an unexpired "
+    "`notNow[]` entry by another name (`GET /v1/factory/steering`, `GET "
+    "/v1/factory/proposal-rules`)? "
+)
+
+# The whole templates, pinned by digest: every clause of both plan
+# directives is load-bearing, and a pin that only checked phrases would let
+# a clause be dropped silently. Re-pin deliberately, with the reason in the
+# commit, when a directive changes.
+PLAN_TEMPLATE_SHA256 = {
+    "round-1": "648cd997d8e408178f7fe096610bed987ecdda49faafbcbdda1c68aa4fd97d4a",
+    "round-k": "8d92834e0e9ecaca919e35ba1b8a1876c85e4a9276875747f6357f5e9fdded2c",
+}
+
+
+def render_plan(template, **kw):
+    fields = dict(
+        assignment="You've been assigned Alissa review task TASK-9.", round=2,
+        cap=10, session="review-plans-pr7-r2-abc123", credential="", poll=60,
+        wait=15, checks="", stability="",
+    )
+    fields.update(kw)
+    return template.format(**fields)
+
+
+def test_the_plan_rubric_is_pinned_byte_for_byte():
+    assert PLAN_RUBRIC == EXPECTED_PLAN_RUBRIC
+
+
+@pytest.mark.parametrize(
+    "name, template",
+    [("round-1", PLAN_ROUND_1_DIRECTIVE), ("round-k", PLAN_ROUND_K_DIRECTIVE)],
+)
+def test_the_plan_templates_are_pinned_by_digest(name, template):
+    digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+    assert digest == PLAN_TEMPLATE_SHA256[name], (
+        f"the {name} plan directive changed; if on purpose, re-pin it to {digest}"
+    )
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_six_questions_render_in_order_in_every_round(template):
+    text = render_plan(template)
+    assert EXPECTED_PLAN_RUBRIC in text
+    heads = [
+        "(1) Worth doing?", "(2) Correctly split into tasks?",
+        "(3) Scopes honest and narrow?", "(4) Dependencies right?",
+        "(5) Duplicates an open task?",
+        "(6) Consistent with the accepted design docs and the operator's direction?",
+    ]
+    at = [text.index(h) for h in heads]
+    assert at == sorted(at)
+    assert text.count("(1) Worth doing?") == 1
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_carries_no_automatic_rule(template):
+    """c3: nothing mechanical is the reviewer's (design D18). No clause turns
+    a deterministic predicate into a reviewer rule -- they are the lint's,
+    and the directive says so instead of re-stating any of them."""
+    text = render_plan(template)
+    lowered = text.lower()
+    assert "automatic" not in lowered
+    assert "NOTHING MECHANICAL IS YOURS" in text
+    assert "never request changes on one" in text
+    assert "`plan-lint` check run on this head concluded success" in text
+    # v0.1's rules as rules: none survives.
+    for rule in (
+        "request_changes when", "must request changes if", "fails the validator",
+        "reject the plan if", "automatically",
+    ):
+        assert rule not in lowered
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_reads_target_code_with_gh_and_never_clones(template):
+    text = render_plan(template)
+    assert "gh api repos/<repo>/contents/<path>" in text
+    assert "gh search code" in text
+    assert "gh issue list --repo <repo>" in text
+    assert "gh pr list --repo <repo>" in text
+    assert "NEVER clone a target repository" in text
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_quotes_the_skill_by_path(template):
+    text = render_plan(template)
+    assert "Load the alissa-code-review skill" in text
+    assert "`alissa-code-review:references/plan-directive.md`" in text
+    assert "Review plan <org>/<repo>#<n> (<plan id>)" in text
+    assert "downstream of nothing" in text
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_states_the_commit_readiness_rules(template):
+    text = render_plan(template)
+    assert "- **Commit-Readiness:** operator — <class>: <one-line reason>" in text
+    assert "first line under `## Summary`" in text
+    assert "`Commit-Readiness: auto`" in text
+    assert "last non-empty line" in text and "byte-equal" in text
+    assert "Write NO Merge-Readiness line" in text
+    assert "`Merge-Readiness: auto`" not in text
+    for klass in COMMIT_READINESS_CLASSES:
+        assert f"`{klass}` (" in text, klass
+    assert "`auto` never carries a class" in text
+    assert "When no row fits, write no class" in text
+    assert "envelope carries no Commit-Readiness line" in text
+    # A wrong scope or dependency is a [major]: the prose cap does not apply.
+    assert "a wrong scope or a wrong dependency is a `[major]`" in text
+
+
+def test_the_class_table_lists_the_enum_in_severity_order():
+    text = render_plan(PLAN_ROUND_1_DIRECTIVE)
+    at = [text.index(f"`{klass}` (") for klass in COMMIT_READINESS_CLASSES]
+    assert at == sorted(at)
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_keeps_every_shared_clause(template):
+    """The plan rounds run the same shell, the same CI gate, the same close
+    and the same self-kill as the code rounds."""
+    text = render_plan(template)
+    assert _SHELL_RULE in text and _REVIEWER_RULE in text
+    assert "CI GATE — before you submit ANY verdict" in text
+    assert "CLOSE THE ROUND" in text
+    assert "NEVER push commits, merge, or change PR state." in text
+    assert "Do NOT create further ali-* sessions." in text
+    assert text.rstrip().endswith(
+        "run `alissa tmux kill review-plans-pr7-r2-abc123`. Do nothing after it."
+    )
+
+
+@pytest.mark.parametrize("template", PLAN_TEMPLATES)
+def test_the_plan_directive_formats_every_slot(template):
+    out = render_plan(
+        template,
+        credential=_POST_AS_REVIEWER.format(env_var="REV_TOKEN", reviewer="alissa-app"),
+        checks=CHECKS_AT_SPAWN_RED.format(sha="abc123", failing="plan-lint (failure)"),
+        stability="STABILITY. ",
+    )
+    assert "{" not in out and "}" not in out.replace("${REV_TOKEN}", "")
+
+
+def test_the_code_directives_are_untouched_by_the_plan_lane():
+    """Out of scope for issue #148: the code directives say nothing about
+    plans or Commit-Readiness."""
+    for template in (ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE):
+        assert "Commit-Readiness" not in template
+        assert "PLAN" not in template

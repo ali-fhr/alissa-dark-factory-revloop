@@ -1006,3 +1006,91 @@ def test_auth_rejected_prefix_is_distinct_from_every_other_ping_family():
     for other in others:
         assert not other.startswith(loop_events.AUTH_REJECTED_PREFIX)
         assert not loop_events.AUTH_REJECTED_PREFIX.startswith(other)
+
+
+# -- plan rounds carry data.kind: "plan" (issue #148 c6) --------------------
+
+
+def test_the_plan_round_prefix_matches_the_loops_own():
+    assert loop_module.plan_round_kind(3).startswith(loop_events.PLAN_ROUND_PREFIX)
+    assert loop_events.PLAN_ROUND_PREFIX == loop_module.PLAN_ROUND_PREFIX
+    assert loop_events.ROUND_KIND_PLAN == loop_module.ROUND_KIND_PLAN == "plan"
+
+
+def test_every_round_event_of_a_plan_round_carries_kind_plan(ledger, clock):
+    clock()
+    ledger.record_ping(REPO, 7, loop_module.plan_round_kind(1))
+    ledger.record_ping(REPO, 7, loop_module.plan_round_kind(2))
+    # Round 1: held on plan-lint (spawn gate), then spawned and posted.
+    ledger.note_spawn_checks_hold(REPO, 7, 1, HEAD)
+    ledger.record_spawn(
+        repo=REPO, number=7, round_=1, head_sha=HEAD, session="s1", task_ref=None,
+    )
+    ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
+    ledger.record_ping(REPO, 7, loop_module.checks_unsettled_kind(1, HEAD))
+    clock()
+    ledger.record_verdict_post(REPO, 7, 1, "url", verdict="request_changes")
+    # Round 2: spawned, abandoned, then capped.
+    ledger.record_spawn(
+        repo=REPO, number=7, round_=2, head_sha=HEAD, session="s2", task_ref=None,
+    )
+    ledger.note_verdict_post_owed(REPO, 7, 2, HEAD)
+    clock()
+    ledger.record_verdict_post_abandoned(REPO, 7, 2, "head force-pushed away")
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)
+
+    events = derive_events(ledger)
+    kinds = sorted(e["kind"] for e in events)
+    assert kinds == sorted([
+        "checks.held", "checks.held", "round.spawned", "round.spawned",
+        "round.verdict", "round.abandoned", "round.capped",
+    ])
+    assert all(e["data"]["kind"] == "plan" for e in events), events
+    # The marker adds a field and changes nothing else: the dedupe keys are
+    # the code path's, so a backfill across the upgrade lands as duplicates.
+    spawned = [e for e in events if e["kind"] == "round.spawned" and e["round"] == 1]
+    assert spawned[0]["dedupeKey"] == f"revloop:round.spawned:{REPO}:7:1:{HEAD}"
+    assert spawned[0]["data"] == {"headSha": HEAD, "kind": "plan"}
+
+
+def test_a_code_round_carries_no_kind(ledger, clock):
+    """Every pre-existing payload is unchanged: no `kind` on a code round,
+    not even `kind: "code"`."""
+    clock()
+    ledger.record_spawn(
+        repo=REPO, number=7, round_=1, head_sha=HEAD, session="s1", task_ref="TASK-1",
+    )
+    ledger.note_spawn_checks_hold(REPO, 7, 1, HEAD)
+    for event in derive_events(ledger):
+        assert "kind" not in event.get("data", {}), event
+
+
+def test_only_the_marked_round_and_pr_are_plan(ledger, clock):
+    clock()
+    ledger.record_ping(REPO, 7, loop_module.plan_round_kind(2))
+    for number, round_ in ((7, 1), (7, 2), (8, 2)):
+        ledger.record_spawn(
+            repo=REPO, number=number, round_=round_, head_sha=HEAD,
+            session=f"s{number}-{round_}", task_ref=None,
+        )
+    marked = {
+        (e["prNumber"], e["round"]): e["data"].get("kind")
+        for e in derive_events(ledger)
+    }
+    assert marked == {(7, 1): None, (7, 2): "plan", (8, 2): None}
+
+
+def test_the_plan_round_ping_derives_no_event_of_its_own(ledger, clock):
+    clock()
+    ledger.record_ping(REPO, 7, loop_module.plan_round_kind(1))
+    assert derive_events(ledger) == []
+
+
+def test_non_round_events_are_never_marked(ledger, clock):
+    clock()
+    ledger.record_ping(REPO, 7, loop_module.plan_round_kind(1))
+    ledger.record_ping(REPO, 7, loop_module.stalled_kind("review-widgets-pr7-r1-abcd"))
+    (event,) = derive_events(ledger)
+    assert event["kind"] == "stalled"
+    assert "data" not in event

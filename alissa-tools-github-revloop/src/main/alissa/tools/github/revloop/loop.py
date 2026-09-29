@@ -26,6 +26,7 @@ from typing import Callable
 
 from . import prompts as prompts_mod
 from .alissa import (
+    COMMIT_READINESS_TRAILER_LABEL,
     MANAGED_PREFIX,
     SHELL_COMMANDS,
     READINESS_AUTO,
@@ -41,6 +42,7 @@ from .alissa import (
     Task,
     TaskDetail,
     is_review_task_for,
+    parse_commit_trailer,
     parse_trailer,
     session_repo_slug,
 )
@@ -493,6 +495,30 @@ def readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
             )
         return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR}"
     return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR} — {READINESS_MISSING_REASON}"
+
+
+# The Commit-Readiness trailer (issue #148; genloop design D8, §6.3): what a
+# PLAN PR's native APPROVE carries instead of Merge-Readiness. Same emitter
+# rules as readiness_trailer -- APPROVE events only, the envelope's reason
+# copied whole (class prefix included), and an envelope with no parseable
+# line fails CLOSED to an UNCLASSED `operator` whose reason says why: the
+# design's fallback, verbatim. A plan PR never carries Merge-Readiness: it is
+# not a code merge candidate, and a stray `auto` there is a line orcloop's
+# merge edge must never read on a plan.
+COMMIT_READINESS_MISSING_REASON = "envelope carries no Commit-Readiness line"
+
+
+def commit_readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
+    """The line a plan PR's native APPROVE carries for `envelope`'s
+    Commit-Readiness judgment -- readiness_trailer over the other key."""
+    label = COMMIT_READINESS_TRAILER_LABEL
+    if envelope is not None and envelope.commit_readiness == READINESS_AUTO:
+        return f"{label} {READINESS_AUTO}"
+    if envelope is not None and envelope.commit_readiness == READINESS_OPERATOR:
+        if envelope.commit_readiness_reason:
+            return f"{label} {READINESS_OPERATOR} — {envelope.commit_readiness_reason}"
+        return f"{label} {READINESS_OPERATOR}"
+    return f"{label} {READINESS_OPERATOR} — {COMMIT_READINESS_MISSING_REASON}"
 
 
 # Appended to the body when the round's review task is known.
@@ -1115,6 +1141,302 @@ ROUND_K_DIRECTIVE = (
     "NEVER push commits, merge, or change PR state. "
     "Do NOT create further ali-* sessions. "
     + _RELEASE_SLOT
+)
+
+# -- the plan directive (issue #148; genloop design D8, D18, §6, §7.1) --------
+#
+# A PLAN PR is a generated plan -- one new directory under `plans/` holding
+# `plan.md` and one task file per task -- opened by the generator seat in the
+# plans repository. Merging it COMMITS its tasks, so its reviewer is the
+# refuter that makes a merged plan trustworthy, and the code rubric would
+# review that prose as if it were code. So a plan PR gets its own two round
+# directives, beside the code ones, and its own trailer.
+#
+# All FOUR signals, or it is not a plan PR (design §6.1): the repository is
+# in `plan_repos`, the author in `plan_authors` (both fleet configuration,
+# config.py -- `plan_authors` empty means nobody), the head ref matches the
+# generator's branch grammar, and the body carries the plan marker on a line
+# of its own. Any other PR in the plans repository -- a `TASK-` lane on its
+# linter or README -- and any PR by the generator's login elsewhere is
+# reviewed under the code directive: a plan author never pushes code, and if
+# it did, the code rubric is the safer reading.
+PLAN_HEAD_REF_RE = re.compile(r"^PLAN-\d{8}T\d{6}Z-[a-z0-9-]+\Z")
+PLAN_MARKER = "<!-- alissa-genloop:plan v1 -->"
+
+# The plan's id (the directory name, `<yyyy-mm-dd>-<slug>`, design §5.1), as
+# the generator writes it into the PR body (`Alissa-Plan: <id>`, §2.14). It is
+# PR-author text, so it reaches the directive only through this grammar --
+# an id that does not match is not quoted at all, and the session is told to
+# read the id from `plan.md` instead.
+PLAN_ID_RE = re.compile(
+    r"^Alissa-Plan:[ \t]*(\d{4}-\d{2}-\d{2}-[a-z0-9-]{3,48})[ \t]*$", re.MULTILINE
+)
+
+# The check run the round waits for (design D18). Its name is a string, and
+# that is the whole of the dependency on the lint lane: without the workflow
+# the run never appears and the round holds, which is fail-closed.
+PLAN_LINT_CHECK = "plan-lint"
+
+# The ledger ping that marks round `<n>` of a PR as a PLAN round, so the loop
+# events derived from the ledger can carry `data.kind: "plan"` (issue #148
+# c6). Recorded when the plan gate first sees the round -- before any hold --
+# so the held round's `checks.held` is marked too. loop_events keeps a pinned
+# copy of the prefix (it cannot import this module).
+PLAN_ROUND_PREFIX = "plan-round:"
+ROUND_KIND_PLAN = "plan"
+
+
+def plan_round_kind(round_: int) -> str:
+    """The ping kind that marks round `round_` of a PR as a plan round."""
+    return f"{PLAN_ROUND_PREFIX}{int(round_)}"
+
+
+def plan_signals(config: Config, pr: PullRequest) -> "dict[str, bool]":
+    """The four signals of design §6.1, by name, for the one predicate below
+    and for the log line that says which one a near-miss lacked."""
+    body = pr.body.replace("\r\n", "\n")
+    return {
+        "repo": config.is_plan_repo(pr.full_name),
+        "author": config.is_plan_author(pr.author),
+        "head_ref": bool(PLAN_HEAD_REF_RE.match(pr.head_ref)),
+        "marker": any(line.strip() == PLAN_MARKER for line in body.split("\n")),
+    }
+
+
+def is_plan_pr(config: Config, pr: PullRequest) -> bool:
+    """All four signals hold -- the ONLY way a PR gets the plan directive."""
+    return all(plan_signals(config, pr).values())
+
+
+def plan_id_of(pr: PullRequest) -> "str | None":
+    """The plan id the PR body declares, or None when it declares none in the
+    grammar (see PLAN_ID_RE)."""
+    match = PLAN_ID_RE.search(pr.body.replace("\r\n", "\n"))
+    return match.group(1) if match else None
+
+
+def plan_review_task_title(pr: PullRequest) -> str:
+    """The CR2 title of a plan PR's review task (design §6.1)."""
+    return f"Review plan {pr.slug} ({plan_id_of(pr) or '<plan id>'})"
+
+
+# Who the reviewer is and which protocol it runs. The skill is QUOTED BY PATH,
+# never inlined: `alissa-code-review:references/plan-directive.md` is the
+# skill's own statement of the plan rubric (a sibling change in the skills
+# repository), and this directive states the parts the daemon must be able
+# to rely on whatever version of the skill the container carries.
+_PLAN_PROTOCOL = (
+    "Load the alissa-code-review skill and run its protocol unchanged — fresh "
+    "instance, CR1–CR9, one review task, severity-tagged comments via gh pr "
+    "review, one verdict envelope, the task moved to pending_validation — but "
+    "walk the PLAN rubric of "
+    "`alissa-code-review:references/plan-directive.md` instead of the code "
+    "rubric: this PR is a plan (one new directory under `plans/` holding "
+    "`plan.md` and one `tasks/<id>.md` per task), not code. The review task is "
+    "titled `Review plan <org>/<repo>#<n> (<plan id>)` and is created "
+    "downstream of nothing — a plan has no origin task; the rest of CR2 is "
+    "unchanged. "
+)
+
+# Nothing mechanical is the reviewer's (design D18): every deterministic
+# predicate is the plan-lint job's, and the daemon has already held the round
+# until that job's run on this head concluded success. v0.1's automatic
+# request_changes rules are gone from the directive -- each became a lint
+# rule, a close-edge rule or a rubric question -- and this clause is where
+# the directive says so rather than re-stating any of them as a rule.
+_PLAN_LINT_OWNS_THE_MECHANICS = (
+    "NOTHING MECHANICAL IS YOURS. The daemon held this round until the "
+    "`" + PLAN_LINT_CHECK + "` check run on this head concluded success, so "
+    "every deterministic predicate — the frontmatter schema, an acyclic graph, "
+    "edges that resolve, a scope on every task with no broad glob, one to "
+    "eight tasks, an open anchor, a commitClass on every task, the generated "
+    "graph and summary, a diff confined to one new plan directory — is the "
+    "lint's and has passed. Do not re-check them and never request changes "
+    "on one; read the `" + PLAN_LINT_CHECK + "` run like any other check under "
+    "the CI GATE below. Your findings are judgment, and only the six "
+    "questions below. "
+)
+
+# The refuter's checkout is the plans repository; the target code a plan
+# names lives elsewhere and is read remotely (design D19).
+_PLAN_READ_TARGETS = (
+    "READ THE TARGET CODE REMOTELY. Your checkout is the plans repository — "
+    "this PR's own. Every task names where it lands (`repo`, `scope`): read "
+    "that code, its issues and its pull requests under the reviewer login, "
+    "which can read every fed repository, with `gh api "
+    "repos/<repo>/contents/<path>`, `gh search code`, `gh issue list --repo "
+    "<repo>` and `gh pr list --repo <repo>`. NEVER clone a target repository. "
+)
+
+# The rubric: six questions, in this order, byte-pinned (design §6.2).
+PLAN_RUBRIC = (
+    "THE RUBRIC — answer all six questions, in this order, each with one line "
+    "in your verdict envelope and a finding wherever the answer is no: "
+    "(1) Worth doing? Does the plan serve its anchor in a way the operator "
+    "would recognise, and does *Why now* hold against the program's "
+    "milestones and the direction? "
+    "(2) Correctly split into tasks? Is each task one PR's worth for one "
+    "worker with one definition of done; is nothing a milestone in disguise; "
+    "is nothing split so fine that the pieces cannot be reviewed alone? "
+    "(3) Scopes honest and narrow? Does each `scope` name the files the task "
+    "will actually touch — the shared hotspots included (`convex/schema.ts`, "
+    "`packages/client/src/**`, `API.md`) — and nothing it will not? The lint "
+    "refuses the broad glob; you refuse the narrow lie. "
+    "(4) Dependencies right? Are the edges the real order; is anything "
+    "missing that would make two tasks collide on a scope; is anything hard "
+    "that should be soft? The lint proves the graph resolves and is acyclic; "
+    "you judge whether it is true. "
+    "(5) Duplicates an open task? The same intent under another title — `gh "
+    "issue list --repo <repo> --label alissa:develop --state all`, the "
+    "merged-PR titles of the window and `GET /v1/tasks?status=…` for the fleet "
+    "actor, read for every task's `repo`. "
+    "(6) Consistent with the accepted design docs and the operator's "
+    "direction? Does any task contradict a decision in the target repo's "
+    "`docs/design/` (the `D<n>` rows, read with `gh api`) or a priority in the "
+    "steering record; does it touch an `offLimits` topic or an unexpired "
+    "`notNow[]` entry by another name (`GET /v1/factory/steering`, `GET "
+    "/v1/factory/proposal-rules`)? "
+)
+
+# Severity (design §6.2): the skill's tags and triage, minus the design-lane
+# cap -- a plan is this seat's shipped product.
+_PLAN_SEVERITY = (
+    "Severity tags and the triage loop are the skill's (CR5, CR8, CR9), with "
+    "one exception: the design-lane rule that caps findings on prose at "
+    "`[minor]` does NOT apply — a plan is the shipped product of this review, "
+    "and a wrong scope or a wrong dependency is a `[major]`. "
+)
+
+# The Commit-Readiness line (design §6.3, §7.1): the plan's merge decision,
+# in the Merge-Readiness grammar with the other key. The checklist and the
+# eleven-class table are the design's, condensed; alissa.py holds the enum
+# (COMMIT_READINESS_CLASSES) and test_readiness pins the two together.
+_COMMIT_READINESS_LINE = (
+    "Your verdict envelope MUST carry `- **Commit-Readiness:** auto` or `- "
+    "**Commit-Readiness:** operator — <class>: <one-line reason>` as the "
+    "first line under `## Summary`, AND your OWN native review (every `gh pr "
+    "review` form and the reviews-API POST alike) MUST END with the bare line "
+    "`Commit-Readiness: auto` or `Commit-Readiness: operator — <class>: "
+    "<one-line reason>` as its last non-empty line — plain text at the start "
+    "of the line, not in backticks, not bold — byte-equal in value, class and "
+    "reason to the envelope's line; the value is case-sensitive. Write NO "
+    "Merge-Readiness line: a plan PR is never a code merge candidate. Decide "
+    "the line by walking this checklist in order after the verdict; the first "
+    "item that fires is the reason: "
+    "(1) the verdict is request_changes → `operator — verdict is "
+    "request_changes`; "
+    "(2) the anchor is a milestone, criterion or objective and any leaf's "
+    "shape is outside the five auto classes → the operator-only class that "
+    "fits, `product-surface` when none is more specific; "
+    "(3) any leaf's scope names `**/schema.ts`, `**/migrations/**`, a backfill "
+    "or a migration → `schema-migration`; "
+    "(4) auth, permission gates, secrets, credentials, tokens → "
+    "`auth-secrets`; "
+    "(5) pricing, credits, tiers, quotas, invoices → `pricing-billing`; "
+    "(6) copy or behaviour a customer is told about (landing pages, offer "
+    "prompts, WhatsApp wording, public pages) → `customer-promise`; "
+    "(7) a waived `[major]`, an open `[blocker]` / `[major]`, or a cap-out → "
+    "`operator — review outcome: …` with no class; "
+    "(8) the plan's class (the most severe commitClass of its tasks) is "
+    "higher than yours → the plan's class; "
+    "(9) a judgment residual, stated → no class. "
+    "Otherwise `auto`, which asserts the plan is one of the five auto classes "
+    "and nothing above fired. `<class>` is exactly ONE token from this closed "
+    "enum, lowercase and hyphenated, followed by a colon and the reason; the "
+    "rows are in severity order, most severe first, and the first six never "
+    "auto-commit: "
+    "`unanchored` (the anchor does not resolve, is closed, or the sources do "
+    "not belong to the class named); "
+    "`schema-migration` (a leaf's scope names `**/schema.ts`, "
+    "`**/migrations/**`, or its description says backfill, migration, "
+    "rename, removal); "
+    "`auth-secrets` (auth, permission gates, tokens, credentials, secrets, env "
+    "vars a deploy must carry); "
+    "`pricing-billing` (pricing, credits, tiers, quotas, invoices, refunds); "
+    "`customer-promise` (copy or behaviour a customer is told about: landing "
+    "pages, offer prompts, WhatsApp wording, public pages, emails); "
+    "`product-surface` (a new screen, route, tool, command or exported type — "
+    "new product, however small — and the default for a milestone- or "
+    "objective-anchored plan whose leaves fit no row above); "
+    "then the five that may: "
+    "`gate-verification` (leaves that verify an unverified operator's-gate "
+    "item with a test, a replay or a recorded smoke); "
+    "`drift-fix` (leaves that make a lagging repo follow a fleet-wide "
+    "contract change); "
+    "`flaky-test` (leaves that fix, quarantine with a named owner, or pin a "
+    "test the loop capped out on); "
+    "`exhaust-followup` (leaves that carry `[triage:later]` replies and "
+    "unpursued `[minor]` / `[nit]` findings on merged code); "
+    "`doc-correction` (leaves confined to `docs/**`, READMEs, `API.md` prose "
+    "and design-doc pins where the code did not move). "
+    "Exactly one class, the most severe applicable row; your class is never "
+    "lower than the plan's class. `auto` never carries a class — an `auto` "
+    "line with a class is refused whole and read as no line at all — and is "
+    "written only when the plan's class is one of the last five rows and "
+    "nothing above fired: before writing it, check that every leaf's scope "
+    "stays out of the hold paths, that no leaf adds a route, a tool, a table "
+    "or a public type, and that every leaf's definition of done is a PR bar "
+    "the loop already knows. When no row fits, write no class: an unclassed "
+    "operator line is the correct hard hold, never a failure. No backticks in "
+    "the reason. The daemon copies the envelope's line onto a native review "
+    "only when it posts the verdict itself, and an envelope without the line "
+    "posts as `operator — " + COMMIT_READINESS_MISSING_REASON + "`, with no "
+    "class. "
+)
+
+PLAN_ROUND_1_DIRECTIVE = (
+    "You are a PLAN REVIEWER — the refuter of a generated plan — not an "
+    "implementer and not its generator. {assignment} "
+    + _PLAN_PROTOCOL
+    + _PLAN_LINT_OWNS_THE_MECHANICS
+    + _PLAN_READ_TARGETS
+    + PLAN_RUBRIC
+    + _PLAN_SEVERITY
+    + _SHELL_RULE
+    + _REVIEWER_RULE
+    + _RECORD_THE_CAP
+    + _COMMIT_READINESS_LINE
+    + "{credential}"
+    + _CHECKS_BEFORE_VERDICT
+    + "{checks}"
+    + "{stability}"
+    + _CLOSE_THE_ROUND +
+    "NEVER push commits, merge, or change PR state. "
+    "Do NOT create further ali-* sessions. "
+    + _RELEASE_SLOT
+)
+
+PLAN_ROUND_K_DIRECTIVE = (
+    "You are a PLAN REVIEWER — the refuter of a generated plan — not an "
+    "implementer and not its generator — round {round} of a review loop (cap "
+    "{cap}). {assignment} "
+    + _PLAN_PROTOCOL
+    + "Follow the skill's round-k section: verify the generator's triage "
+    "reply to every prior finding on its thread, verify the amended plan "
+    "directory against each, walk the full rubric again on the new head, "
+    "record a round-{round} verdict envelope. "
+    + _PLAN_LINT_OWNS_THE_MECHANICS
+    + _PLAN_READ_TARGETS
+    + PLAN_RUBRIC
+    + _PLAN_SEVERITY
+    + _SHELL_RULE
+    + _REVIEWER_RULE
+    + _RECORD_THE_CAP
+    + _COMMIT_READINESS_LINE
+    + "{credential}"
+    + _CHECKS_BEFORE_VERDICT
+    + "{checks}"
+    + "{stability}"
+    + _CLOSE_THE_ROUND +
+    "NEVER push commits, merge, or change PR state. "
+    "Do NOT create further ali-* sessions. "
+    + _RELEASE_SLOT
+)
+
+# What the plan-lint gate tells the log and the console while it holds.
+PLAN_LINT_HELD = (
+    "round {round} waits for {check} — the `{check}` run at {sha} is {state}; "
+    "a plan round never starts before the lint is green"
 )
 
 # The operator re-entry ack (issue #42). A capped PR is unreviewable until an
@@ -2119,6 +2441,10 @@ class ReviewWatcher:
         # that resets each pass never reaches its bound and the diagnostic would
         # report an eternal hold production never takes).
         self._dry_run_check_waits: dict[tuple[str, int, int, str], float] = {}
+        # (repo slug, number, head) the plan-lint gate has already announced
+        # at INFO (issue #148). Process-lifetime and log-only: the hold itself
+        # is re-decided from the rollup every poll.
+        self._plan_lint_logged: set[tuple[str, int, str]] = set()
         # The task corpus THIS poll pass already fetched, or None until some
         # PR in it misses the review-task cache. `alissa task list` returns
         # every non-terminal task this actor owns (hundreds of rows, ~250 KB)
@@ -3394,6 +3720,11 @@ class ReviewWatcher:
         rollup = self.github.check_rollup(pr.owner, pr.repo, pr.head_sha)
         sha, short = pr.head_sha, pr.head_sha[:8]
 
+        if is_plan_pr(self.config, pr):
+            held = self._gate_spawn_on_plan_lint(pr, round_, rollup)
+            if held is not None:
+                return SpawnChecks(hold=held)
+
         if rollup.state == CHECKS_RED:
             failing = directive_data([
                 CHECKS_AT_SPAWN_FAILING.format(
@@ -3475,6 +3806,61 @@ class ReviewWatcher:
                 detail=CHECKS_STILL_RUNNING.format(names=running),
             )
         )
+
+    def _gate_spawn_on_plan_lint(
+        self, pr: PullRequest, round_: int, rollup: CheckRollup
+    ) -> "Decision | None":
+        """Hold a PLAN round until the `plan-lint` run on its head concluded
+        success (issue #148; design D18, §6.1). None lets the round through
+        to the ordinary CI gate.
+
+        UNBOUNDED, unlike the CI wait above it: that wait bounds a CI system
+        that never reports, because a review must never be cancelled by one;
+        a plan round owes nothing to a plan the lint has not passed. A
+        `failure` is not the reviewer's to explain -- the generator reads it
+        on its next pass and pushes a new head, which re-arms this gate. A
+        MISSING run holds too (the lint lane is a soft dependency: without
+        the workflow nothing ever passes, which is fail-closed), and so do an
+        unreadable rollup and a `skipped` / `neutral` conclusion: only
+        `success` proves the lint ran and passed.
+
+        The hold is the ordinary pre-spawn hold -- a QUEUED with
+        `checks_held`, the `spawn_checks_holds` row that derives the
+        `checks.held` loop event once per (PR, round, head) -- and the round
+        is marked as a plan round in the ledger first, so that event carries
+        `data.kind: "plan"`. One INFO line per (PR, head); repeats are DEBUG,
+        because a lint failure can hold for as long as the generator takes.
+        """
+        self._note_plan_round(pr, round_)
+        runs = [c for c in rollup.contexts if c.name == PLAN_LINT_CHECK]
+        if rollup.state == CHECKS_UNKNOWN:
+            state = f"unreadable ({rollup.unreadable or 'no reason recorded'})"
+        elif not runs:
+            state = "missing"
+        elif any(c.running for c in runs):
+            state = "still running"
+        elif all(c.conclusion == "success" for c in runs):
+            return None
+        else:
+            state = ", ".join(sorted({c.conclusion for c in runs if c.conclusion}))
+
+        self._checks_wait_since(pr, round_)
+        reason = PLAN_LINT_HELD.format(
+            round=round_, check=PLAN_LINT_CHECK, sha=pr.head_sha[:8], state=state
+        )
+        seen = (pr.full_name, pr.number, pr.head_sha)
+        level = logging.DEBUG if seen in self._plan_lint_logged else logging.INFO
+        self._plan_lint_logged.add(seen)
+        log.log(level, "%s: %s", pr.slug, reason)
+        return Decision(Action.QUEUED, reason, round_, checks_held=True)
+
+    def _note_plan_round(self, pr: PullRequest, round_: int) -> None:
+        """Mark round `round_` of this PR as a PLAN round in the ledger, once
+        (the ping is idempotent per kind). Never under --dry-run, which
+        writes no durable state."""
+        if self.config.dry_run:
+            return
+        self.state.record_ping(pr.full_name, pr.number, plan_round_kind(round_))
 
     def _checks_wait_since(self, pr: PullRequest, round_: int) -> float:
         """When this round's pre-spawn CI wait began -- the stamp its bound is
@@ -3796,7 +4182,17 @@ class ReviewWatcher:
         # checks gate turned into a REQUEST_CHANGES or COMMENT carries none,
         # because `auto` on anything but an APPROVE is exactly what the
         # consumer must never see (issue #130).
-        trailer = readiness_trailer(envelope) if event == EVENT_APPROVE else ""
+        # A PLAN PR's approve carries Commit-Readiness and nothing else
+        # (issue #148): the plan close edge commits on it, and a plan is
+        # never a code merge candidate.
+        plan = is_plan_pr(self.config, pr)
+        label = COMMIT_READINESS_TRAILER_LABEL if plan else READINESS_TRAILER_LABEL
+        if event != EVENT_APPROVE:
+            trailer = ""
+        elif plan:
+            trailer = commit_readiness_trailer(envelope)
+        else:
+            trailer = readiness_trailer(envelope)
         body = gate.lead + NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
@@ -3849,10 +4245,15 @@ class ReviewWatcher:
         # read BACK off the emitted line with the shared grammar (issue
         # #142), so what the narration names is what the consumer will parse
         # -- an unclassed operator says `class=unclassed`, the hard hold.
-        readiness_value = trailer[len(READINESS_TRAILER_LABEL):].strip()
-        posted_value, _, posted_class = parse_trailer(trailer)
+        readiness_value = trailer[len(label):].strip()
+        posted_value, _, posted_class = (
+            parse_commit_trailer(trailer) if plan else parse_trailer(trailer)
+        )
         class_term = readiness_class_term(posted_value, posted_class)
-        readiness_note = f" readiness={readiness_value}{class_term}" if trailer else ""
+        readiness_name = "commit-readiness" if plan else "readiness"
+        readiness_note = (
+            f" {readiness_name}={readiness_value}{class_term}" if trailer else ""
+        )
         log.info(
             "%s round %d closed: native %s review submitted as %s (%s)%s%s",
             pr.slug, round_, event, self.github.login, url or "no url",
@@ -3862,7 +4263,11 @@ class ReviewWatcher:
             pr,
             f"- {_now()} — round {round_} — native `{event}` review submitted "
             f"as `{self.github.login}` (verdict of record){gate_note}"
-            + (f" — merge-readiness: `{readiness_value}`{class_term}" if trailer else ""),
+            + (
+                f" — {'commit' if plan else 'merge'}-readiness: "
+                f"`{readiness_value}`{class_term}"
+                if trailer else ""
+            ),
         )
         if event == EVENT_COMMENT:
             # A degraded verdict takes the PR out of the loop (the review
@@ -4576,20 +4981,29 @@ class ReviewWatcher:
         if self.state.readiness_observed(pr.full_name, pr.number, pr.head_sha) is not None:
             return
 
-        value, reason, klass = parse_trailer(newest.body)
+        # A plan PR's approve is read for its Commit-Readiness trailer, the
+        # one the plan close edge commits on (issue #148); the flag, the row
+        # and the narration are otherwise the same.
+        plan = is_plan_pr(self.config, pr)
+        if plan:
+            value, reason, klass = parse_commit_trailer(newest.body)
+            label, name, edge = COMMIT_READINESS_TRAILER_LABEL, "commit-readiness", "plan close"
+        else:
+            value, reason, klass = parse_trailer(newest.body)
+            label, name, edge = READINESS_TRAILER_LABEL, "readiness", "merge"
         head7 = pr.head_sha[:7]
         if value is None:
             readiness = READINESS_MISSING
             log.warning(
-                "%s approve at %s by %s carries no Merge-Readiness trailer — the "
-                "merge edge will hold it; the session must end its review body "
+                "%s approve at %s by %s carries no %s trailer — the "
+                "%s edge will hold it; the session must end its review body "
                 "with the line (see directive)",
-                pr.slug, head7, self.github.login,
+                pr.slug, head7, self.github.login, label.rstrip(":"), edge,
             )
             line = (
                 f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
-                f"`{self.github.login}` at `{head7}` — readiness=missing (no "
-                f"`{READINESS_TRAILER_LABEL}` trailer on the review body; the merge "
+                f"`{self.github.login}` at `{head7}` — {name}=missing (no "
+                f"`{label}` trailer on the review body; the {edge} "
                 f"edge will hold it)"
             )
         else:
@@ -4599,12 +5013,12 @@ class ReviewWatcher:
             # not, nothing for `auto`.
             term = (f"{value} — {reason}" if reason else value) + readiness_class_term(value, klass)
             log.info(
-                "%s approve at %s by %s carries readiness=%s",
-                pr.slug, head7, self.github.login, term,
+                "%s approve at %s by %s carries %s=%s",
+                pr.slug, head7, self.github.login, name, term,
             )
             line = (
                 f"- {_now()} — round {round_} — session-posted `APPROVE` review by "
-                f"`{self.github.login}` at `{head7}` — readiness={term}"
+                f"`{self.github.login}` at `{head7}` — {name}={term}"
             )
 
         posted_at = _epoch(newest.submitted_at)
@@ -5375,7 +5789,29 @@ class ReviewWatcher:
         # `task is None` here means spawn_anyway/warn_and_spawn: the skip mode
         # was decided in _refused_before_start, above the CI gate, so a round
         # that will never start buys no rollup.
-        if task is None:
+        plan = is_plan_pr(self.config, pr)
+        if plan and task is None:
+            # The ordinary round 1 of a plan PR, not a CR2 gap: a plan has no
+            # origin task and no implementer to have made one, so its first
+            # reviewer creates the review task (design §6.1).
+            log.info(
+                "%s is a plan PR with no review task yet — its reviewer "
+                "creates %r downstream of nothing",
+                pr.slug, plan_review_task_title(pr),
+            )
+            assignment = (
+                f"Review the plan PR {pr.url} . There is no Alissa review task "
+                f"for it yet — create it per CR2, titled "
+                f"`{plan_review_task_title(pr)}`, downstream of nothing (a plan "
+                f"has no origin task), before recording your verdict."
+                + (
+                    ""
+                    if plan_id_of(pr)
+                    else " The PR body declares no plan id: take it from the "
+                    "`id` field of the plan's `plan.md` frontmatter."
+                )
+            )
+        elif task is None:
             log.warning(
                 "%s has no open Alissa review task (CR2) — spawning against the PR "
                 "URL; the reviewer must create or locate one before recording a verdict",
@@ -5390,7 +5826,10 @@ class ReviewWatcher:
             assignment = f"You've been assigned Alissa review task {task.ref}."
 
         name = session_name(pr, round_)
-        template = ROUND_1_DIRECTIVE if round_ == 1 else ROUND_K_DIRECTIVE
+        if plan:
+            template = PLAN_ROUND_1_DIRECTIVE if round_ == 1 else PLAN_ROUND_K_DIRECTIVE
+        else:
+            template = ROUND_1_DIRECTIVE if round_ == 1 else ROUND_K_DIRECTIVE
         directive = template.format(
             assignment=assignment,
             round=round_,

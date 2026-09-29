@@ -181,6 +181,8 @@ CONFIG_KEYS = (
     "bows_refresh_polls",
     "bow_owners",
     "authors",
+    "plan_repos",
+    "plan_authors",
     "operators",
     "agent_profile",
     "reviewer_login",
@@ -230,6 +232,42 @@ FLEET_VITALS_ENV = "ALISSA_REV_FLEET_VITALS_ENABLED"
 REPOS_SOURCE_ENV = "ALISSA_REVIEW_REPOS_SOURCE"
 BOWS_REFRESH_POLLS_ENV = "ALISSA_REVIEW_BOWS_REFRESH_POLLS"
 BOW_OWNERS_ENV = "ALISSA_REVIEW_BOW_OWNERS"
+
+# The plan directive's two allowlists (issue #148; genloop design §6.1, D12).
+# A PR gets the PLAN directive only when all four signals hold, and two of
+# them are fleet configuration: the repository is one of `plan_repos` and the
+# author one of `plan_authors`. Same `|`/`,` rail as the bows keys, same
+# env > file > default precedence, same blank-falls-through rule.
+#
+# The plans repository is CONFIGURATION, never a literal in the code (the
+# operator's decision on issue #148 -- the design's own name for it is
+# superseded): the default names the repository by NAME under the
+# `<owner>` placeholder, which matches that name under any owner, and a
+# deployment names its own with the variable. A test proves no plans-repo
+# literal survives outside this module.
+#
+# FAIL-CLOSED, and deliberately unlike `authors`: an EMPTY `plan_authors`
+# means NO PR is a plan PR -- every PR, the plans repository's included, is
+# reviewed under the code directive. The plan directive is a different
+# contract (no code rubric, a Commit-Readiness trailer the plan close edge
+# commits on), so it must be switched on by naming the generator's login,
+# never by default. An empty `plan_repos` (the variable set to a lone
+# separator, say) means the same.
+PLAN_REPOS_ENV = "ALISSA_REVIEW_PLAN_REPOS"
+PLAN_AUTHORS_ENV = "ALISSA_REVIEW_PLAN_AUTHORS"
+PLAN_REPO_OWNER_PLACEHOLDER = "<owner>"
+DEFAULT_PLAN_REPO_NAME = "alissa-dark-factory-plans"
+DEFAULT_PLAN_REPOS: "tuple[str, ...]" = (
+    f"{PLAN_REPO_OWNER_PLACEHOLDER}/{DEFAULT_PLAN_REPO_NAME}",
+)
+# `owner/repo`, or `<owner>/repo`; GitHub's own character sets.
+_PLAN_REPO_RE = re.compile(
+    r"^(?:" + re.escape(PLAN_REPO_OWNER_PLACEHOLDER)
+    + r"|[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/[A-Za-z0-9._-]{1,100}\Z"
+)
+# A GitHub login, or a GitHub App's `<slug>[bot]` login.
+_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?\Z")
+_LIST_SEPARATORS = re.compile(r"[|,]")
 
 # The default Studio API base the loop-events client posts to. Mirrors
 # alissa_client.DEFAULT_ENDPOINT (a test pins the two together); defined here
@@ -375,6 +413,30 @@ def env_bow_owners(environ: "Mapping[str, str] | None" = None) -> "str | None":
     `|`/`,` splitting and the actor-id check happen in `normalize_bow_owners`,
     so the env, the file and the flag are validated by exactly one rule."""
     return _env_text(BOW_OWNERS_ENV, environ)
+
+
+def env_plan_list(name: str, environ: "Mapping[str, str] | None" = None) -> "list[str] | None":
+    """One plan allowlist rail (`PLAN_REPOS_ENV` / `PLAN_AUTHORS_ENV`) split on
+    `|` and `,`, or None when unset/blank. A value of separators only is an
+    EMPTY list, not None: the operator said something, and what they said is
+    "nothing" -- which for these keys is the fail-closed answer."""
+    raw = _env_text(name, environ)
+    if raw is None:
+        return None
+    return [part.strip() for part in _LIST_SEPARATORS.split(raw) if part.strip()]
+
+
+def _plan_list(value: Any, key: str, what: str, shape: "re.Pattern[str]") -> "tuple[str, ...]":
+    """A plan allowlist as a tuple of validated entries. A malformed entry is
+    refused at load, naming it -- a typo in a trust gate must not read as an
+    entry that silently matches nothing."""
+    entries = _string_list(value, key, what)
+    bad = [entry for entry in entries if not shape.match(entry)]
+    if bad:
+        raise ValueError(
+            f"{key} must be a list of {what}, got {', '.join(repr(b) for b in bad)}"
+        )
+    return entries
 
 
 def normalize_bow_owners(values: "Any") -> "tuple[str, ...]":
@@ -768,6 +830,13 @@ class Config:
     # want agent reviews.
     authors: tuple[str, ...] = ()
 
+    # The plan directive's repository and author allowlists (issue #148); see
+    # PLAN_REPOS_ENV above. `plan_repos` entries are `owner/repo` or
+    # `<owner>/repo` (any owner); `plan_authors` EMPTY means no PR is a plan
+    # PR -- fail closed, the opposite of `authors`.
+    plan_repos: tuple[str, ...] = DEFAULT_PLAN_REPOS
+    plan_authors: tuple[str, ...] = ()
+
     # GitHub logins whose re-entry ack may raise a capped PR's effective cap
     # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
     # honoured: the lever fails closed, because anyone who can comment on a PR
@@ -1007,6 +1076,29 @@ class Config:
             return True
         return login.lower() in {a.lower() for a in self.authors}
 
+    def is_plan_repo(self, full_name: str) -> bool:
+        """Whether `owner/repo` is a plans repository -- signal one of four.
+
+        Case-insensitive, like `watches` under bows: GitHub names are. An
+        entry whose owner is the `<owner>` placeholder matches its repository
+        name under any owner, which is how the default names the plans
+        repository without naming a fleet."""
+        owner, _, name = full_name.partition("/")
+        for entry in self.plan_repos:
+            want_owner, _, want_name = entry.partition("/")
+            if want_name.casefold() != name.casefold():
+                continue
+            if want_owner == PLAN_REPO_OWNER_PLACEHOLDER:
+                return True
+            if want_owner.casefold() == owner.casefold():
+                return True
+        return False
+
+    def is_plan_author(self, login: str) -> bool:
+        """Whether a PR by this login may be a plan PR -- signal two of four.
+        EMPTY means NOBODY (fail closed; see the field)."""
+        return bool(login) and login.lower() in {a.lower() for a in self.plan_authors}
+
     @classmethod
     def build(
         cls,
@@ -1095,6 +1187,13 @@ class Config:
         env_owners = env_bow_owners(environ)
         if env_owners is not None:
             raw["bow_owners"] = env_owners
+        # The plan allowlists (issue #148), same rail, same reason.
+        env_plan_repos = env_plan_list(PLAN_REPOS_ENV, environ)
+        if env_plan_repos is not None:
+            raw["plan_repos"] = env_plan_repos
+        env_plan_authors = env_plan_list(PLAN_AUTHORS_ENV, environ)
+        if env_plan_authors is not None:
+            raw["plan_authors"] = env_plan_authors
 
         source = raw.get("repos_source", cls.repos_source)
         if source not in _REPOS_SOURCES:
@@ -1144,6 +1243,15 @@ class Config:
         )
         operators = _string_list(
             raw.get("operators", ()), "operators", "GitHub logins"
+        )
+        plan_repos = _plan_list(
+            raw.get("plan_repos", cls.plan_repos), "plan_repos",
+            f"owner/repo (or {PLAN_REPO_OWNER_PLACEHOLDER}/repo) entries",
+            _PLAN_REPO_RE,
+        )
+        plan_authors = _plan_list(
+            raw.get("plan_authors", cls.plan_authors), "plan_authors",
+            "GitHub logins", _GITHUB_LOGIN_RE,
         )
         if hub_mode == HUB_ADD and not repos and source == REPOS_STATIC:
             # Anyone who can request a review could otherwise cause an arbitrary
@@ -1344,6 +1452,8 @@ class Config:
             bows_refresh_polls=refresh_polls,
             bow_owners=bow_owners,
             authors=authors,
+            plan_repos=plan_repos,
+            plan_authors=plan_authors,
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),

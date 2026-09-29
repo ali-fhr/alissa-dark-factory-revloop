@@ -50,6 +50,23 @@ def test_review_task_ref_matches_cr2_title():
     assert prreview._review_task_ref(A(), OWNER, REPO, NUMBER) == "TASK-99"
 
 
+def test_review_task_ref_matches_a_plan_review_task_title():
+    """A plan PR's review task is titled `Review plan …` (issue #148); the
+    implementer-side driver resolves it with the daemon's own pattern."""
+    class A:
+        def list_tasks(self, *, narrow_status=True):
+            return [
+                Task(ref="TASK-1", title="Do the thing", status="in_progress"),
+                Task(
+                    ref="TASK-77",
+                    title=f"Review plan {OWNER}/{REPO}#{NUMBER} (2026-09-29-loop-labels)",
+                    status="committed",
+                ),
+            ]
+
+    assert prreview._review_task_ref(A(), OWNER, REPO, NUMBER) == "TASK-77"
+
+
 def test_review_task_ref_none_when_absent():
     class A:
         def list_tasks(self, *, narrow_status=True):

@@ -248,12 +248,23 @@ _VERDICT_RE = re.compile(
 # own grammar; the reason runs to the end of the line and no further.
 READINESS_AUTO = "auto"
 READINESS_OPERATOR = "operator"
-_READINESS_RE = re.compile(
-    r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*Merge-Readiness[ \t]*:?[ \t]*(?:\*\*)?"
-    r"[ \t]*:?[ \t]*(?:\*\*)?(auto|operator)\b(?:\*\*)?"
-    r"(?:[ \t]*[—–-][ \t]*(.*?))?[ \t]*$",
-    re.MULTILINE,
-)
+
+
+def _envelope_line_re(key: str) -> "re.Pattern[str]":
+    """The tolerant envelope-line grammar for one readiness KEY. Two keys
+    share it (issue #148): `Merge-Readiness` on a code PR, `Commit-Readiness`
+    on a plan PR -- the same markdown tolerance, the same case-sensitive
+    value, the same first-match-wins."""
+    return re.compile(
+        r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*" + re.escape(key)
+        + r"[ \t]*:?[ \t]*(?:\*\*)?"
+        r"[ \t]*:?[ \t]*(?:\*\*)?(auto|operator)\b(?:\*\*)?"
+        r"(?:[ \t]*[—–-][ \t]*(.*?))?[ \t]*$",
+        re.MULTILINE,
+    )
+
+
+_READINESS_RE = _envelope_line_re("Merge-Readiness")
 
 # The operator reason's CLASS (issue #142). An `operator` judgment names WHY
 # the merge is a human's, and until now it did so in prose the merge edge
@@ -343,11 +354,19 @@ def _classed(value: "str | None", raw_reason: object) -> "tuple[str | None, str,
 # construction, a line this regex reads.
 READINESS_TRAILER_LABEL = "Merge-Readiness:"
 READINESS_MISSING = "missing"
-_TRAILER_RE = re.compile(
-    r"^" + re.escape(READINESS_TRAILER_LABEL)
-    + r"[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$",
-    re.MULTILINE,
-)
+
+
+def _trailer_line_re(label: str) -> "re.Pattern[str]":
+    """The strict bare-line grammar for one trailer LABEL (see _TRAILER_RE);
+    shared by the Merge- and the Commit-Readiness trailers (issue #148)."""
+    return re.compile(
+        r"^" + re.escape(label)
+        + r"[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$",
+        re.MULTILINE,
+    )
+
+
+_TRAILER_RE = _trailer_line_re(READINESS_TRAILER_LABEL)
 
 
 def parse_trailer(body: object) -> "tuple[str | None, str, str | None]":
@@ -386,6 +405,102 @@ def parse_readiness(blob: object) -> "tuple[str | None, str, str | None]":
     if match is None:
         return (None, "", None)
     return _classed(match.group(1), match.group(2))
+
+
+# The Commit-Readiness judgment on a PLAN PR (issue #148; genloop design D8,
+# §6.3, §7.1). A plan PR is never a code merge candidate: what its approve
+# decides is whether merging the plan COMMITS its tasks, and orcloop's plan
+# close edge reads that off this trailer the way its merge edge reads
+# Merge-Readiness -- the same grammar with the other key:
+#
+#   Commit-Readiness: auto
+#   Commit-Readiness: operator — <class>: <one-line reason>
+#
+# Eleven classes in SEVERITY order, the enum orcloop copies verbatim: the
+# first six never auto-commit under any policy, the last five may. A task
+# file's `commitClass` draws on the last ten -- `unanchored` is the
+# refuter's alone. Same rules as the merge enum: exactly one class, the most
+# severe applicable; `auto` never carries one; an operator reason that leads
+# with no recognised token parses and reads as UNCLASSED (the hard hold).
+#
+# One rule is STRICTER than the merge grammar, because the acceptance names
+# it (c4): a class on an `auto` line is REFUSED WHOLE -- the line reads as
+# missing and the fallback holds -- rather than read as a bare `auto` with a
+# stray reason. An `auto` whose trailing text is class-shaped is a reviewer
+# that could not decide between the two forms, and the commit policy must
+# never resolve that doubt toward committing.
+COMMIT_READINESS_KEY = "Commit-Readiness"
+COMMIT_READINESS_CLASSES: "tuple[str, ...]" = (
+    "unanchored",         # the anchor does not resolve, is closed, or the sources are not its class
+    "schema-migration",   # a leaf's scope names **/schema.ts, **/migrations/**, a backfill or a migration
+    "auth-secrets",       # auth, permission gates, tokens, credentials, secrets, deploy env vars
+    "pricing-billing",    # pricing, credits, tiers, quotas, invoices, refunds
+    "customer-promise",   # copy or behaviour a customer is told about
+    "product-surface",    # a new screen, route, tool, command or exported type
+    "gate-verification",  # leaves that verify an unverified operator's-gate item
+    "drift-fix",          # leaves that make a lagging repo follow a fleet-wide contract change
+    "flaky-test",         # leaves that fix, quarantine or pin a test the loop capped out on
+    "exhaust-followup",   # leaves that carry [triage:later] replies and unpursued [minor]/[nit]
+    "doc-correction",     # leaves confined to docs, READMEs, API.md prose, design-doc pins
+)
+# The six that stay operator's under every commit policy (design §7.1).
+COMMIT_READINESS_OPERATOR_ONLY: "tuple[str, ...]" = COMMIT_READINESS_CLASSES[:6]
+COMMIT_READINESS_TRAILER_LABEL = COMMIT_READINESS_KEY + ":"
+_COMMIT_READINESS_RE = _envelope_line_re(COMMIT_READINESS_KEY)
+_COMMIT_TRAILER_RE = _trailer_line_re(COMMIT_READINESS_TRAILER_LABEL)
+_COMMIT_READINESS_CLASS_RE = re.compile(
+    r"^(" + "|".join(re.escape(klass) for klass in COMMIT_READINESS_CLASSES)
+    + r")[ \t]*:"
+)
+# What "a class on an auto line" looks like: the reason leads with a
+# `<token>:` -- a recognised class, a misspelt one or a merge-enum token
+# alike. Deliberately wider than the enum, for the reason above.
+_CLASS_SHAPED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*[ \t]*:")
+
+
+def classify_commit_readiness_reason(value: object, reason: object) -> "str | None":
+    """The COMMIT_READINESS_CLASSES token an `operator` reason leads with, or
+    None (auto, unclassed, misspelt, wrong case) -- classify_readiness_reason
+    over the commit enum."""
+    if value != READINESS_OPERATOR or not isinstance(reason, str):
+        return None
+    match = _COMMIT_READINESS_CLASS_RE.match(reason)
+    return match.group(1) if match else None
+
+
+def _commit_classed(
+    value: "str | None", raw_reason: object
+) -> "tuple[str | None, str, str | None]":
+    """The `(value, reason, klass)` triple both commit parsers hand back, with
+    the class-on-auto refusal applied."""
+    reason = clean_readiness_reason(raw_reason)
+    if value == READINESS_AUTO and _CLASS_SHAPED_RE.match(reason):
+        return (None, "", None)
+    return (value, reason, classify_commit_readiness_reason(value, reason))
+
+
+def parse_commit_trailer(body: object) -> "tuple[str | None, str, str | None]":
+    """`(value, reason, klass)` from the first bare `Commit-Readiness:` line of
+    a review body, or `(None, "", None)` -- parse_trailer with the other key,
+    plus the class-on-auto refusal."""
+    if not isinstance(body, str):
+        return (None, "", None)
+    match = _COMMIT_TRAILER_RE.search(body.replace("\r\n", "\n"))
+    if match is None:
+        return (None, "", None)
+    return _commit_classed(match.group(1), match.group(2))
+
+
+def parse_commit_readiness(blob: object) -> "tuple[str | None, str, str | None]":
+    """`(value, reason, klass)` from the first Commit-Readiness line of a
+    verdict envelope -- parse_readiness with the other key, plus the
+    class-on-auto refusal."""
+    if not isinstance(blob, str):
+        return (None, "", None)
+    match = _COMMIT_READINESS_RE.search(blob)
+    if match is None:
+        return (None, "", None)
+    return _commit_classed(match.group(1), match.group(2))
 
 
 @dataclass(frozen=True)
@@ -615,10 +730,19 @@ class ManagedSession:
         return parse_session_name(self.name)
 
 
-def _title_pattern(owner: str, repo: str, number: int) -> re.Pattern[str]:
-    """CR2 title convention: `Review PR <org>/<repo>#<n> (TASK-<origin>)`."""
+# The CR2 title's lead-in. A code PR's review task reads `Review PR …`; a PLAN
+# PR's reads `Review plan <org>/<repo>#<n> (<plan id>)` (issue #148, genloop
+# design §6.1) -- created downstream of nothing, since a plan has no origin
+# task. Both leads resolve to the same PR, so one pattern serves the daemon's
+# search, its cache check and `alissa-pr-review` alike.
+REVIEW_TASK_TITLE_LEAD = r"^Review\s+(?:PR|plan)\s+"
+
+
+def review_task_title_pattern(owner: str, repo: str, number: int) -> re.Pattern[str]:
+    """CR2 title convention: `Review PR <org>/<repo>#<n> (TASK-<origin>)`, or
+    `Review plan <org>/<repo>#<n> (<plan id>)` for a plan PR."""
     return re.compile(
-        rf"^Review PR\s+{re.escape(owner)}/{re.escape(repo)}#{number}\b",
+        rf"{REVIEW_TASK_TITLE_LEAD}{re.escape(owner)}/{re.escape(repo)}#{number}\b",
         re.IGNORECASE,
     )
 
@@ -633,7 +757,7 @@ def is_review_task_for(owner: str, repo: str, number: int, task: "Task") -> bool
     would either pin a wrong task forever or re-fetch the corpus every pass
     while disagreeing with itself.
     """
-    return bool(_title_pattern(owner, repo, number).match(task.title)) and task.is_open
+    return bool(review_task_title_pattern(owner, repo, number).match(task.title)) and task.is_open
 
 
 def _task_from_row(row: object) -> "Task | None":
@@ -676,11 +800,18 @@ class VerdictEnvelope:
     the narration reads the class back off the emitted line -- so the fact
     has one source, and a second copy here would be a reader-less field
     that could only ever drift from it (PR #143 round 1).
+
+    `commit_readiness` / `commit_readiness_reason` are the same pair for the
+    envelope's `Commit-Readiness` line (issue #148), read off the same
+    evidence item; only a PLAN PR's native post reads them, and a code PR's
+    envelope simply has none.
     """
 
     verdict: str
     readiness: "str | None" = None
     readiness_reason: str = ""
+    commit_readiness: "str | None" = None
+    commit_readiness_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1187,6 +1318,9 @@ class Alissa:
                     readiness, reason, _ = parse_readiness(content)
                     if readiness is None:
                         readiness, reason, _ = parse_readiness(title)
+                    commit, commit_reason, _ = parse_commit_readiness(content)
+                    if commit is None:
+                        commit, commit_reason, _ = parse_commit_readiness(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
@@ -1194,6 +1328,8 @@ class Alissa:
                              verdict=match.group(1).lower(),
                              readiness=readiness,
                              readiness_reason=reason,
+                             commit_readiness=commit,
+                             commit_readiness_reason=commit_reason,
                          ))
                     )
                     break
