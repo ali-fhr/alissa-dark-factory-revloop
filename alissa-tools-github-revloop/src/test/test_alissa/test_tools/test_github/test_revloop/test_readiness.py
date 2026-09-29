@@ -22,12 +22,18 @@ import logging
 import pytest
 
 from alissa.tools.github.revloop.alissa import (
+    COMMIT_READINESS_CLASSES,
+    COMMIT_READINESS_OPERATOR_ONLY,
+    COMMIT_READINESS_TRAILER_LABEL,
     READINESS_AUTO,
     READINESS_CLASSES,
     READINESS_OPERATOR,
     READINESS_TRAILER_LABEL,
     VerdictEnvelope,
+    classify_commit_readiness_reason,
     classify_readiness_reason,
+    parse_commit_readiness,
+    parse_commit_trailer,
     parse_readiness,
     parse_trailer,
 )
@@ -37,6 +43,7 @@ from alissa.tools.github.revloop.loop import (
     ROUND_1_DIRECTIVE,
     ROUND_K_DIRECTIVE,
     Action,
+    commit_readiness_trailer,
     readiness_class_term,
     readiness_trailer,
 )
@@ -181,9 +188,11 @@ def test_the_envelope_has_no_class_field_of_its_own():
     """One source for the fact (PR #143 round 1): the class is a function of
     the reason, the emitter copies the reason whole, and the narration reads
     the class back off the emitted line -- a field here would be a second
-    copy nothing reads, free to drift."""
+    copy nothing reads, free to drift. The Commit-Readiness pair (issue
+    #148) follows the same rule: a value and a reason, no class."""
     assert [f.name for f in dataclasses.fields(VerdictEnvelope)] == [
         "verdict", "readiness", "readiness_reason",
+        "commit_readiness", "commit_readiness_reason",
     ]
 
 
@@ -401,3 +410,145 @@ def test_a_session_auto_approve_names_no_class(config, caplog):
     assert record.getMessage().endswith("carries readiness=auto")
     (row,) = readiness_rows(gh)
     assert "class=" not in row
+
+
+# -- the Commit-Readiness grammar (issue #148; genloop design §6.3, §7.1) ----
+#
+#   Commit-Readiness: auto
+#   Commit-Readiness: operator — <class>: <one-line reason>
+#
+# The Merge-Readiness grammar with the other key and the eleven-class enum,
+# plus one rule the merge grammar does not have: a class on an `auto` line is
+# refused whole (c4).
+
+
+def test_the_commit_enum_is_the_designs_eleven_in_severity_order():
+    assert COMMIT_READINESS_CLASSES == (
+        "unanchored", "schema-migration", "auth-secrets", "pricing-billing",
+        "customer-promise", "product-surface",
+        "gate-verification", "drift-fix", "flaky-test", "exhaust-followup",
+        "doc-correction",
+    )
+    assert COMMIT_READINESS_OPERATOR_ONLY == COMMIT_READINESS_CLASSES[:6]
+    assert COMMIT_READINESS_TRAILER_LABEL == "Commit-Readiness:"
+
+
+@pytest.mark.parametrize("klass", COMMIT_READINESS_CLASSES)
+@pytest.mark.parametrize("dash", ["—", "-"])
+def test_every_commit_class_parses_off_the_bare_trailer(klass, dash):
+    body = f"Plan review.\n\nCommit-Readiness: operator {dash} {klass}: the reason"
+    assert parse_commit_trailer(body) == (
+        READINESS_OPERATOR, f"{klass}: the reason", klass
+    )
+
+
+@pytest.mark.parametrize("klass", COMMIT_READINESS_CLASSES)
+def test_every_commit_class_parses_off_the_envelope_line(klass):
+    blob = f"## Summary\n- **Commit-Readiness:** operator — {klass}: why\n"
+    assert parse_commit_readiness(blob) == (READINESS_OPERATOR, f"{klass}: why", klass)
+
+
+@pytest.mark.parametrize("parse", [parse_commit_trailer, parse_commit_readiness])
+def test_commit_auto_parses_bare(parse):
+    assert parse("Commit-Readiness: auto") == (READINESS_AUTO, "", None)
+
+
+@pytest.mark.parametrize("line", ["Commit-Readiness: Auto", "Commit-Readiness: AUTO",
+                                  "Commit-Readiness: Operator — drift-fix: x"])
+@pytest.mark.parametrize("parse", [parse_commit_trailer, parse_commit_readiness])
+def test_the_commit_value_is_case_sensitive(parse, line):
+    assert parse(line) == (None, "", None)
+
+
+@pytest.mark.parametrize(
+    "misspelt", ["drift-fixes", "doc-corection", "Drift-Fix", "unanchored-plan", "schema_migration"]
+)
+@pytest.mark.parametrize("parse", [parse_commit_trailer, parse_commit_readiness])
+def test_a_misspelt_commit_class_is_not_a_class(parse, misspelt):
+    """It parses as operator -- the reason is kept whole -- but UNCLASSED:
+    the consumer's hard hold, never the class it was reaching for."""
+    value, reason, klass = parse(f"Commit-Readiness: operator — {misspelt}: why")
+    assert (value, klass) == (READINESS_OPERATOR, None)
+    assert reason == f"{misspelt}: why"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ["drift-fix: a class", "doc-correction: docs only", "drift-fixes: misspelt",
+     "infra-deploy: a merge-enum token", "Note: anything class-shaped"],
+)
+@pytest.mark.parametrize("parse", [parse_commit_trailer, parse_commit_readiness])
+def test_a_class_on_an_auto_line_is_refused_whole(parse, tail):
+    """c4: `auto` never carries a class, and a line that tries is read as NO
+    line -- which fails closed to the unclassed operator fallback."""
+    assert parse(f"Commit-Readiness: auto — {tail}") == (None, "", None)
+
+
+def test_an_auto_with_a_plain_reason_is_still_auto():
+    """Only the class SHAPE is refused: the design's grammar lets trailing
+    text follow a value, and an `auto` with prose is still an auto."""
+    assert parse_commit_trailer("Commit-Readiness: auto — the five auto classes only") == (
+        READINESS_AUTO, "the five auto classes only", None
+    )
+
+
+def test_the_merge_enum_is_not_the_commit_enum():
+    """The two enums are separate contracts: a merge class on a commit line is
+    unclassed, and a commit class on a merge line is unclassed."""
+    assert parse_commit_trailer("Commit-Readiness: operator — infra-deploy: x")[2] is None
+    assert parse_trailer("Merge-Readiness: operator — drift-fix: x")[2] is None
+    assert classify_commit_readiness_reason(READINESS_OPERATOR, "billing: x") is None
+    assert classify_commit_readiness_reason(READINESS_AUTO, "drift-fix: x") is None
+
+
+def test_the_keys_do_not_read_each_other():
+    body = "Merge-Readiness: auto\nCommit-Readiness: operator — unanchored: gone"
+    assert parse_trailer(body)[0] == READINESS_AUTO
+    assert parse_commit_trailer(body)[0] == READINESS_OPERATOR
+    assert parse_commit_trailer("Merge-Readiness: auto") == (None, "", None)
+
+
+def test_the_commit_trailer_is_strict_where_the_envelope_is_tolerant():
+    assert parse_commit_trailer("- **Commit-Readiness:** auto") == (None, "", None)
+    assert parse_commit_trailer("see `Commit-Readiness: auto` above") == (None, "", None)
+    assert parse_commit_readiness("- **Commit-Readiness:** auto") == (READINESS_AUTO, "", None)
+
+
+def test_the_envelope_reads_both_keys_off_one_item(monkeypatch):
+    content = (
+        f"# Review verdict: {SLUG}#{NUMBER} — approve\n\n## Summary\n"
+        "- **Commit-Readiness:** operator — flaky-test: pins a capped test\n"
+    )
+    env = envelope_from(monkeypatch, {"evidence": [{"title": "t", "markdownContent": content}]})
+    assert env.verdict == VERDICT_APPROVE
+    assert env.readiness is None
+    assert (env.commit_readiness, env.commit_readiness_reason) == (
+        READINESS_OPERATOR, "flaky-test: pins a capped test"
+    )
+
+
+@pytest.mark.parametrize("klass", COMMIT_READINESS_CLASSES)
+def test_the_native_commit_trailer_equals_the_envelope_line(klass):
+    reason = f"{klass}: the plan's own reason"
+    env = VerdictEnvelope(
+        verdict=VERDICT_APPROVE, commit_readiness=READINESS_OPERATOR,
+        commit_readiness_reason=reason,
+    )
+    line = commit_readiness_trailer(env)
+    assert line == f"Commit-Readiness: operator — {reason}"
+    assert parse_commit_trailer(line) == (READINESS_OPERATOR, reason, klass)
+
+
+@pytest.mark.parametrize(
+    "envelope_",
+    [None, VerdictEnvelope(verdict=VERDICT_APPROVE),
+     VerdictEnvelope(verdict=VERDICT_APPROVE, readiness=READINESS_AUTO)],
+    ids=["no-envelope", "no-line", "merge-line-only"],
+)
+def test_the_commit_fallback_is_unclassed_operator(envelope_):
+    """c5: no Commit-Readiness line -> the design's fallback, no class."""
+    line = commit_readiness_trailer(envelope_)
+    assert line == "Commit-Readiness: operator — envelope carries no Commit-Readiness line"
+    assert parse_commit_trailer(line) == (
+        READINESS_OPERATOR, "envelope carries no Commit-Readiness line", None
+    )

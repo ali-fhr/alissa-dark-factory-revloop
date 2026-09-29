@@ -118,7 +118,7 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
-Six keys have a third layer above both, the environment: `task_list_bow_id`
+Eight keys have a third layer above both, the environment: `task_list_bow_id`
 (`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why),
 `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*),
 `fleet_vitals_enabled` (`ALISSA_REV_FLEET_VITALS_ENABLED`; see *Fleet vitals*),
@@ -126,7 +126,10 @@ and the three `repos_source: bows` keys — `repos_source`
 (`ALISSA_REVIEW_REPOS_SOURCE`), `bows_refresh_polls`
 (`ALISSA_REVIEW_BOWS_REFRESH_POLLS`) and `bow_owners`
 (`ALISSA_REVIEW_BOW_OWNERS`; see *Deriving the allowlist from feed Bodies of
-Work*). The environment wins over the file **and** the flags for all six, but a
+Work*), and the two plan-directive allowlists — `plan_repos`
+(`ALISSA_REVIEW_PLAN_REPOS`) and `plan_authors` (`ALISSA_REVIEW_PLAN_AUTHORS`;
+see *Plan PRs*). The environment wins over the file **and** the flags for all
+eight, but a
 **blank** value falls through — an unset platform variable reference renders as
 `""`, and that must not fail boot on a mode of `''`. The two boolean rails
 share one reader: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, anything
@@ -145,6 +148,8 @@ else refused by name.
 | `bows_refresh_polls` | `5` | `bows` only: re-derive every N poll passes; must be ≥1 (`1` = every pass). The **enrollment-latency** knob: at the default pair (60 s poll, 5) a new feed enrolls its repo within ~5 minutes, for one API call per five passes; `--bows-refresh-polls` / `ALISSA_REVIEW_BOWS_REFRESH_POLLS` |
 | `bow_owners` | `[]` | `bows` only, and an **optional override**: the actor id(s) whose Bodies of Work may enroll a repo. Empty resolves at boot to the token's **own** actor (`GET /v1/ping` → `actorId`), and a failed whoami is **fatal** — never a fallback to trusting everything, nor to trusting nothing. Ids only — a username or display name is refused at load naming the entry; entries may be `\|`- or `,`-separated, and are compared and de-duplicated **exactly** (no casefolding, which could only widen a trust gate); `--bow-owner` (repeatable; replaces the list) / `ALISSA_REVIEW_BOW_OWNERS` |
 | `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
+| `plan_repos` | `["<owner>/alissa-dark-factory-plans"]` | the **plans repositories** — signal one of the four that make a PR a *plan PR* (see *Plan PRs*). `owner/repo`, or `<owner>/repo` for that repository name under **any** owner (the default names the repository by name only; a deployment names its own). Matched case-insensitively; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_REPOS` (`\|`/`,`-separated) wins over the file, blank falls through |
+| `plan_authors` | `[]` | the **plan generator's login(s)** — signal two of four. **Fail-closed, unlike `authors`: empty means NO PR is a plan PR**, so every PR is reviewed under the code directive until the generator's login is named. GitHub logins (`<app>[bot]` accepted), case-insensitive; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_AUTHORS` (`\|`/`,`-separated) wins over the file, blank falls through |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
@@ -199,6 +204,9 @@ identity's, say, or everything except Dependabot and renovate.
   own login narrows the loop to a PR GitHub then forbids it to review.
 - `--author` is repeatable and *replaces* the config list, exactly like
   `--repo`.
+- A non-empty `authors` list must also name the plan generator's login for
+  its plan PRs to be reviewed at all: `plan_authors` decides which directive
+  a PR gets, `authors` still decides whether it gets one.
 
 ### Deriving the allowlist from feed Bodies of Work (`repos_source: bows`)
 
@@ -329,6 +337,13 @@ Your two identities are independent and nothing keeps them in sync:
 Because of that, a `reviewer_login` that disagrees with the token is **fatal at
 startup**, not a warning: the search would follow the token while round counting
 followed the config, so every round would look like round 1 and respawn forever.
+
+A **third GitHub login** matters to this seat without being one of its own: the
+plan generator's (genloop design D12), which opens plan PRs in the plans
+repository. The reviewer never shares its context — the refuter is this
+daemon's ordinary container and session, hydrated from the PR alone — and the
+generator's login is named in `plan_authors`, the allowlist that selects the
+plan directive. Empty, it selects nothing; see *Plan PRs*.
 
 ### The verdict of record, and whose credential writes it
 
@@ -522,6 +537,93 @@ On the daemon-posted path:
   produced, not a lever. The round-close log line carries `readiness=…` and
   the activity comment's round row names it, exactly as the session-posted
   observation does.
+
+### Plan PRs: the plan directive and the `Commit-Readiness` trailer (issue #148)
+
+A **plan PR** is a generated plan — one new directory under `plans/` holding
+`plan.md` and one `tasks/<id>.md` per task — that the plan generator opens in
+the plans repository (genloop design, lane L4). Merging it **commits** its
+tasks, so its reviewer is the refuter that makes a merged plan trustworthy,
+and the code rubric would review that prose as if it were code. A PR gets the
+plan directive when **all four** signals hold, and only then:
+
+1. its repository is in `plan_repos`;
+2. its author is in `plan_authors` (empty = nobody — fail-closed);
+3. its head ref matches `^PLAN-\d{8}T\d{6}Z-[a-z0-9-]+$`;
+4. its body carries `<!-- alissa-genloop:plan v1 -->` on a line of its own.
+
+Any other PR — a `TASK-` lane on the plans repository's linter or README, a
+PR by the generator's login anywhere else — is reviewed under the **code**
+directive, unchanged: a plan author never pushes code, and if it did, the code
+rubric is the safer reading.
+
+**The round waits for `plan-lint`.** A plan round is not queued until the
+check run named `plan-lint` on the head has concluded `success`. Missing (the
+workflow is not installed yet), still running, `failure`, `skipped`,
+`neutral`, or an unreadable rollup all **hold** the round as `checks.held` —
+the ordinary pre-spawn hold, one `spawn_checks_holds` row per (PR, round,
+head), one INFO line per (PR, head) — and **unbounded**, unlike the CI wait:
+a failure is not the reviewer's to explain, the generator reads it on its
+next pass and pushes a new head. Once the lint is green the ordinary CI gate
+still runs, so another red check still reaches the directive as the
+no-approve clause.
+
+**The plan directives** (`PLAN_ROUND_1_DIRECTIVE`, `PLAN_ROUND_K_DIRECTIVE`
+in `loop.py`, beside the code ones, byte-pinned by `test_directives.py`)
+load the same `alissa-code-review` protocol — fresh instance, CR1–CR9, one
+review task, severity-tagged comments, one envelope — and walk the plan rubric
+of `alissa-code-review:references/plan-directive.md` (quoted by path, never
+inlined): six questions, in order — worth doing? correctly split into tasks?
+scopes honest and narrow? dependencies right? duplicates an open task?
+consistent with the accepted design docs and the operator's direction? They
+carry **no automatic rule**: every deterministic predicate is `plan-lint`'s,
+and the directive says so instead of restating any. The session's checkout is
+the plans repository; the target code a plan names is read with `gh api
+repos/<repo>/contents/<path>`, `gh search code`, `gh issue list --repo` and
+`gh pr list --repo` — never cloned. A wrong scope or dependency is a
+`[major]` (the design-lane cap on prose findings does not apply). The review
+task is titled `Review plan <owner>/<repo>#<n> (<plan id>)` and created by
+the round-1 reviewer downstream of nothing — a plan has no origin task — so a
+plan PR under `on_missing_review_task: skip` is never reviewed; the id comes
+from the body's `Alissa-Plan: <id>` line when it matches
+`<yyyy-mm-dd>-<slug>`, and is otherwise read from `plan.md`. The daemon's
+task search matches both `Review PR …` and `Review plan …` titles.
+
+**The `Commit-Readiness` trailer.** A plan PR's approve carries
+
+```
+Commit-Readiness: auto
+Commit-Readiness: operator — <class>: <one-line reason>
+```
+
+— the Merge-Readiness grammar with the other key
+(`^Commit-Readiness:[ \t]*(auto|operator)(?:[ \t]*[—-][ \t]*(.+))?[ \t]*$`,
+first match wins, value case-sensitive) — as the first line under the
+envelope's `## Summary` and as the last non-empty line of the native review,
+and **never** a Merge-Readiness line: a plan PR is not a code merge candidate.
+The class is one of eleven (`alissa.COMMIT_READINESS_CLASSES`, severity order,
+the enum orcloop's plan close edge copies verbatim):
+
+| class | may auto-commit |
+| --- | --- |
+| `unanchored`, `schema-migration`, `auth-secrets`, `pricing-billing`, `customer-promise`, `product-surface` | never |
+| `gate-verification`, `drift-fix`, `flaky-test`, `exhaust-followup`, `doc-correction` | yes |
+
+The rules are the merge enum's — exactly one class, the most severe; an
+unclassed `operator` parses and is the hardest hold; a misspelt or
+capitalised token is not a class — plus one stricter rule: **a class on an
+`auto` line is refused whole** (the line reads as missing), where the merge
+grammar only ignores it. On the daemon-posted path the envelope's line is
+copied byte for byte, and an envelope with no parseable line posts the
+unclassed fallback `Commit-Readiness: operator — envelope carries no
+Commit-Readiness line`. The round-close log line says `commit-readiness=…`,
+and a session-posted approve on a plan PR is observed for the
+`Commit-Readiness:` trailer (a Merge-Readiness line alone reads as missing).
+
+**Telemetry.** Every round event of a plan round carries `data.kind: "plan"`
+(see *Loop telemetry*). The plan directive is out of the code directives'
+way entirely: a code PR's directive, trailer and events are unchanged byte
+for byte.
 
 ### Never approve a red head: the CI checks gate
 
@@ -1378,6 +1480,13 @@ built from the ledger's own keys:
 | `escalation.prompt_page` | `prompt-page:<kind>@<session>#<bucket>` pings | `session`, `data.kind`, `data.action` = `page` — one per account-level kind per 6 h |
 | `grant` | `grants` (operator re-entry acks) | `data.author`, `data.rounds` |
 | `reap` | `reaps` | `session` |
+
+**Plan rounds** (issue #148) are marked, not a kind of their own: when the
+plan-lint gate first sees round `<n>` of a plan PR it records one
+`plan-round:<n>` ping, and every `round.spawned`, `round.verdict`,
+`round.abandoned`, `round.capped` and `checks.held` event of that (repo, PR,
+round) carries `data.kind: "plan"`. A code round carries no `kind`, so its
+payloads and dedupe keys are unchanged.
 
 **Best-effort, never fatal, no retry queue.** A failed push is one WARN and the
 pass completes. The emitter keeps an in-memory watermark of the newest ledger

@@ -34,7 +34,12 @@ import re
 import sys
 import time
 
-from .alissa import Alissa, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES
+from .alissa import (
+    Alissa,
+    VERDICT_APPROVE,
+    VERDICT_REQUEST_CHANGES,
+    review_task_title_pattern,
+)
 from .config import env_task_list_bow_id
 from .ghclient import GitHub
 from .proc import CommandError, run, run_json
@@ -80,9 +85,9 @@ def _review_task_ref(alissa: Alissa, owner: str, repo: str, number: int) -> str 
     `is_open` set or absent altogether, and in the first case narrowing by it
     here would re-impose the filter this function exists to avoid.
     """
-    pattern = re.compile(
-        rf"^Review PR\s+{re.escape(owner)}/{re.escape(repo)}#{number}\b", re.IGNORECASE
-    )
+    # The daemon's own title grammar, so a plan PR's `Review plan …` task
+    # (issue #148) resolves here exactly as it does in the poll loop.
+    pattern = review_task_title_pattern(owner, repo, number)
     matches = [
         t for t in alissa.list_tasks(narrow_status=False) if pattern.match(t.title)
     ]

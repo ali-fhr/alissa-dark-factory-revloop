@@ -68,6 +68,14 @@ refused. The suffix is the design's R1 key: Studio's reducer flips a
 credential only when the suffix matches the stored row, so a container still
 running an OLD token after a same-mode replace cannot flip the new, good
 credential. `reason` is a fixed sentence, never the pane's text.
+
+A PLAN round (issue #148; genloop design §6, lane L4) is marked the same
+ledger-derived way: when the plan gate first sees round `<n>` of a plan PR it
+records one `plan-round:<n>` ping, and every ROUND event of that (repo, PR,
+round) -- `round.spawned`, `round.verdict`, `round.abandoned`,
+`round.capped` and both gates' `checks.held` -- carries `data.kind: "plan"`.
+A code round carries no `kind` at all, so every pre-existing payload is
+unchanged byte for byte.
 """
 
 from __future__ import annotations
@@ -112,6 +120,18 @@ _PROMPT_PAGE_RE = re.compile(
     r"^prompt-page:(?P<kind>[a-z_]+)@(?P<session>[^#]+)#(?P<bucket>\d+)$"
 )
 
+
+# The plan-round marker (issue #148): `plan-round:<round>`, recorded by
+# loop._note_plan_round (a test pins the two prefixes together).
+PLAN_ROUND_PREFIX = "plan-round:"
+_PLAN_ROUND_RE = re.compile(r"^plan-round:(?P<round>\d+)$")
+ROUND_KIND_PLAN = "plan"
+# The events a round kind is stamped on: the per-round kinds, and nothing
+# that is about a session or the whole PR.
+ROUND_EVENT_KINDS = frozenset({
+    "round.spawned", "round.verdict", "round.abandoned", "round.capped",
+    "checks.held",
+})
 
 # The `auth.rejected` row (issue #146): one per SESSION,
 # `auth-rejected:<session>#<round>:<source>:<matched>:<envName>:<suffix>`.
@@ -547,6 +567,32 @@ def _reap_events(rows: "list[dict]") -> "list[tuple[int, dict]]":
     ]
 
 
+def _plan_rounds(pings: "list[dict]") -> "set[tuple[str, int, int]]":
+    """Every (repo, PR, round) the ledger marks as a plan round."""
+    out = set()
+    for row in pings:
+        match = _PLAN_ROUND_RE.match(str(row["kind"]))
+        if match is not None:
+            out.add((row["repo"], int(row["number"]), int(match.group("round"))))
+    return out
+
+
+def _mark_plan_rounds(
+    stamped: "list[tuple[int, dict]]", plan_rounds: "set[tuple[str, int, int]]"
+) -> None:
+    """Stamp `data.kind: "plan"` on the round events of plan rounds, in
+    place. An event with no round (a `round.capped` no spawn row explains)
+    cannot be attributed and is left unmarked."""
+    if not plan_rounds:
+        return
+    for _, event in stamped:
+        if event["kind"] not in ROUND_EVENT_KINDS or "round" not in event:
+            continue
+        key = (event.get("repo"), event.get("prNumber"), event["round"])
+        if key in plan_rounds:
+            event["data"] = {**event.get("data", {}), "kind": ROUND_KIND_PLAN}
+
+
 def derive_events(state: State, *, since: int = 0) -> "list[dict]":
     """Every loop event the ledger implies whose stamp is >= `since`,
     oldest first.
@@ -565,10 +611,12 @@ def derive_events(state: State, *, since: int = 0) -> "list[dict]":
     stamped += _spawn_events(spawns)
     stamped += _verdict_events(state.read_verdict_posts())
     stamped += _capped_events(state.read_escalations(), spawns)
-    stamped += _ping_events(state.read_pings(), notices)
+    pings = state.read_pings()
+    stamped += _ping_events(pings, notices)
     stamped += _spawn_hold_events(state.read_spawn_checks_holds())
     stamped += _grant_events(state.read_grants())
     stamped += _reap_events(state.read_reaps())
+    _mark_plan_rounds(stamped, _plan_rounds(pings))
 
     stamped = [(at, event) for at, event in stamped if at >= since]
     stamped.sort(key=lambda pair: pair[0])

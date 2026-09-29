@@ -202,6 +202,13 @@ class PullRequest:
     # `requested_teams` is a separate field and is deliberately not carried,
     # because nothing in the loop may ever withdraw a team's request.
     requested_reviewers: tuple[str, ...] = ()
+    # The head BRANCH name and the PR body, read off the same payload. Two of
+    # the four signals that make a PR a PLAN PR (issue #148, genloop design
+    # §6.1): a `PLAN-<stamp>-<slug>` head ref and the plan marker on a line of
+    # its own in the body. Both are PR-author text -- they select a directive
+    # and are never interpolated into one.
+    head_ref: str = ""
+    body: str = ""
 
     @property
     def full_name(self) -> str:
@@ -311,6 +318,11 @@ class CheckRollup:
     # than the one it stands in for (see ACTIONS_FALLBACK_NOTE), so the answer
     # carries which path produced it everywhere the rollup is reported.
     via_actions_fallback: bool = False
+    # Every context read, passing ones included -- what a gate keyed on ONE
+    # named check reads (the plan-lint gate, issue #148). `failing` and
+    # `running` answer "may an approve claim this head?"; only this answers
+    # "did the check called X conclude success?".
+    contexts: tuple[CheckContext, ...] = ()
 
     @property
     def summary(self) -> str:
@@ -393,6 +405,7 @@ def rollup_of(
         running=running,
         total=len(contexts),
         via_actions_fallback=via_actions_fallback,
+        contexts=tuple(contexts),
     )
 
 
@@ -697,6 +710,8 @@ class GitHub:
                 for u in (data.get("requested_reviewers") or [])
                 if (u or {}).get("login")
             ),
+            head_ref=str((data.get("head") or {}).get("ref") or ""),
+            body=str(data.get("body") or ""),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:

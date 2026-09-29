@@ -4,6 +4,60 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.7
+
+- **Plan PRs get a plan directive, a plan-lint gate and a `Commit-Readiness`
+  trailer** (issue #148; genloop design `docs/design/genloop.md` v0.2 in
+  `ali-fhr/studio.alissa.app`, D8, D18, §6, §7.1, lane L4; origin
+  TASK-2001160633, implementation TASK-1824369549).
+  - **Four signals, or it is code.** A PR is a plan PR only when its
+    repository is in `plan_repos`, its author in `plan_authors`, its head ref
+    matches `^PLAN-\d{8}T\d{6}Z-[a-z0-9-]+$` and its body carries
+    `<!-- alissa-genloop:plan v1 -->` on a line of its own
+    (`loop.plan_signals` / `loop.is_plan_pr`). Any other PR keeps the code
+    directive, trailer and events byte for byte.
+  - **The plans repository is configuration.** `plan_repos`
+    (`ALISSA_REVIEW_PLAN_REPOS`, default `<owner>/alissa-dark-factory-plans`
+    — the repository name under any owner) and `plan_authors`
+    (`ALISSA_REVIEW_PLAN_AUTHORS`, default empty = **no plan PRs**,
+    fail-closed); `|`/`,`-separated env rails that win over the file, blank
+    falls through, malformed entries refused at load. A test proves no
+    plans-repository literal survives in the package outside `config.py`.
+  - **The round waits for `plan-lint`.** A plan round is held as the
+    ordinary pre-spawn `checks.held` until the `plan-lint` check run on the
+    head concluded `success` — missing, running, failed, skipped, neutral or
+    unreadable all hold, unbounded — and no session spawns
+    (`ReviewWatcher._gate_spawn_on_plan_lint`). `CheckRollup` now carries
+    every context it read (`contexts`).
+  - **The plan directives.** `PLAN_ROUND_1_DIRECTIVE` /
+    `PLAN_ROUND_K_DIRECTIVE` beside the code ones in `loop.py`: the
+    `alissa-code-review` protocol with the plan rubric of
+    `alissa-code-review:references/plan-directive.md` (quoted by path), the
+    six questions in order (`PLAN_RUBRIC`, byte-pinned; both templates pinned
+    by digest), no automatic rule (the mechanics are the lint's), target code
+    read with `gh api` / `gh search code` / `gh issue list` / `gh pr list` and
+    never cloned, wrong scopes and dependencies as `[major]`, and the review
+    task titled `Review plan <owner>/<repo>#<n> (<plan id>)` downstream of
+    nothing (the id from a body `Alissa-Plan:` line in the id grammar, never
+    quoted otherwise). The task search and `alissa-pr-review` match
+    `Review plan …` titles (`alissa.review_task_title_pattern`).
+  - **`Commit-Readiness`.** `alissa.COMMIT_READINESS_CLASSES` (eleven, in
+    severity order, the first six never auto-commit), `parse_commit_trailer`
+    / `parse_commit_readiness` (the Merge-Readiness grammar with the other
+    key; a class on an `auto` line is refused whole), the envelope's
+    `commit_readiness` pair, and `loop.commit_readiness_trailer`: a plan PR's
+    native approve carries `Commit-Readiness:` and never `Merge-Readiness:`,
+    and an envelope with no line posts the unclassed
+    `operator — envelope carries no Commit-Readiness line`. A session-posted
+    plan approve is observed for the same trailer.
+  - **`data.kind: "plan"`.** The gate records a `plan-round:<n>` ping, and
+    every round event of that round (`round.spawned`, `round.verdict`,
+    `round.abandoned`, `round.capped`, `checks.held`) carries
+    `data.kind: "plan"`; code rounds carry no `kind`.
+  - **Operator, after merge:** re-pin `REVLOOP_VERSION`; set
+    `ALISSA_REVIEW_PLAN_REPOS=ali-fhr/alissa-dark-factory-plans` and
+    `ALISSA_REVIEW_PLAN_AUTHORS=<genloop login>` once that login exists.
+
 ## 0.31.6
 
 - **A reviewer refused by Claude is a named `auth.rejected` loop event, not
