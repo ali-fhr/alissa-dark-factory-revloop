@@ -4,6 +4,50 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.8
+
+- **The seat image is published to GHCR on every release** (issue #151;
+  origin TASK-1046190284, implementation TASK-234076312) — the pilot for the
+  fleet's published images, written to be copied by orcloop, devloop and
+  genloop (seat-specific values at the top of the workflow).
+  - **`image-publish.yaml`.** On a pull request merged into `main` that
+    touches `alissa-tools-github-revloop/**`, `docker/**` or the workflow:
+    read the version file at the merge commit; wait (bounded, 15 min, loud
+    on timeout) until PyPI serves `alissa-tools-github-revloop==<version>`;
+    exit green without pushing if `ghcr.io/ali-fhr/alissa-dark-factory-revloop:<version>`
+    already exists (an unclassifiable registry answer fails the run rather
+    than risk an overwrite); build `docker/claude/Dockerfile` for
+    `linux/amd64` with `--build-arg REVLOOP_VERSION=<version>` and the OCI
+    `source` / `version` / `revision` / `title` / `description` / `licenses`
+    labels; run `tests-image-contract.sh` against that image; push
+    `:X.Y.Z`, `:X.Y`, `:X`; read the digest back and write it with the
+    ready-to-paste `<tag>@sha256:<digest>` pin to the job summary.
+    `packages: write` on the publishing job only; `GITHUB_TOKEN` the only
+    credential; nothing runs on unmerged code.
+  - **One version axis.** `check-version-bump.yaml` now requires a version
+    bump for `docker/**` changes (the image is published under that number
+    and an existing tag is never overwritten), and its new
+    `dockerfile-pin-sync` job fails any pull request on which the
+    Dockerfile's `ARG REVLOOP_VERSION` default differs from the version
+    file. The ARG moves from `0.29.0` to the version file's value.
+  - **`check-image.yaml`** builds the pull request's Dockerfile at the
+    newest *published* release when the pinned one is not on PyPI yet (a
+    release pull request), and says so; the release build is
+    image-publish's. `tests-image-contract.sh` gains two env overrides for
+    that: `REVLOOP_VERSION` (build-arg + expected installed version) and
+    `IMAGE_PREBUILT=1` (assert an existing image instead of building one).
+    `tests-entrypoint-config.sh` now asserts the ARG equals the version
+    file, where it used to assert a feature PR left the pin alone.
+  - **Docs.** `docker/claude/README.md` gains *Published image* — image
+    name, tag scheme, labels, the publish order of events, `docker run`
+    with the runtime env contract, and the operator lever: pin Railway to
+    `ghcr.io/ali-fhr/alissa-dark-factory-revloop:<version>@sha256:<digest>`
+    instead of bumping `REVLOOP_VERSION`.
+  - **Operator, after merge:** confirm the first *Container Image Publish*
+    run; set the GHCR package `alissa-dark-factory-revloop` to public;
+    verify an anonymous manifest pull; switch `dark-revloop-shared` to the
+    image source pinned by digest. Out of scope here by design.
+
 ## 0.31.7
 
 - **Plan PRs get a plan directive, a plan-lint gate and a `Commit-Readiness`

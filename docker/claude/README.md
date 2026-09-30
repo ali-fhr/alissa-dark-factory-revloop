@@ -45,12 +45,21 @@ The image installs the daemon from PyPI, so the build context is just this
 directory — no repo source is copied in.
 
 `REVLOOP_VERSION` is deliberately absent from the example: its `ARG` default in
-the Dockerfile is the release this repo publishes on merge, and it is the value
-CI reads back out of the Dockerfile, so a second copy here could only ever go
-stale — and a stale one is load-bearing once a config key has a version floor
-(pinning below `ALISSA_REVIEW_OPERATORS`' floor makes the daemon reject the key
-and the container exit at boot). Pass `--build-arg REVLOOP_VERSION=…` only when
-you deliberately want a version other than the pinned one.
+the Dockerfile **equals the package's plain-text `version` file** (the version
+of record), and CI keeps it so — the `dockerfile-pin-sync` job of
+`check-version-bump.yaml` fails any PR on which the two differ, and any PR that
+touches `docker/**` must bump that file (issue #151). So a second copy here
+could only ever go stale — and a stale one is load-bearing once a config key
+has a version floor (pinning below `ALISSA_REVIEW_OPERATORS`' floor makes the
+daemon reject the key and the container exit at boot). Pass
+`--build-arg REVLOOP_VERSION=…` only when you deliberately want a version other
+than the pinned one — CI does exactly that on a release PR, whose pinned
+version is not on PyPI until the merge: `check-image.yaml` builds at the newest
+published release and says so in the log; the release build itself is
+[`image-publish.yaml`'s](#published-image), after PyPI serves the version.
+
+You usually do not need to build at all: every release is published to GHCR,
+contract-tested before push — see [Published image](#published-image).
 
 ### Base image
 
@@ -177,10 +186,26 @@ needs to change for it.
 
 ### On Railway
 
+Two ways to source the service, and the second is the one to move to:
+
+- **Dockerfile source** (how `dark-revloop-shared` was set up): Railway builds
+  `docker/claude/Dockerfile` on every deploy, with the ARG-matched service
+  variables baked in. What runs is a build nothing tested.
+- **Image source, pinned by digest** (issue #151): point the service at the
+  [published image](#published-image) —
+  `ghcr.io/ali-fhr/alissa-dark-factory-revloop:<version>@sha256:<digest>` —
+  and every deploy runs exactly the image CI contract-tested. Upgrading is
+  changing that pin, not bumping `REVLOOP_VERSION`; the ARG→ENV knobs below stay
+  overridable as ordinary runtime service variables (the baked value is only
+  the default). Switching the existing service is an operator step after the
+  first publish; revloop is restart-safe (boot re-enqueues open review requests).
+
 Set the config values (`ALISSA_REVIEW_REPOS`, `ALISSA_POLL_INTERVAL`, …) as
-**service variables** — Railway passes any variable matching a declared `ARG`
-into the Dockerfile build, which is why these are ARGs and not plain runtime
-ENV. With `ALISSA_REVIEW_REPOS_SOURCE=bows` you **enroll a repo by creating its
+**service variables** — with the Dockerfile source Railway passes any variable
+matching a declared `ARG` into the build, which is why these are ARGs and not
+plain runtime ENV; with the image source the same variables reach the container
+as runtime env and override the baked defaults. With
+`ALISSA_REVIEW_REPOS_SOURCE=bows` you **enroll a repo by creating its
 lane** in Studio instead of editing `ALISSA_REVIEW_REPOS` and redeploying — see
 [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Set the three **secrets** (`GH_TOKEN`, `ALISSA_API_TOKEN`,
 `ANTHROPIC_API_KEY`) as service variables too; those are read at runtime and
@@ -191,6 +216,142 @@ The **reviewer console** knobs (`ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`,
 runtime-only service variables. See
 [Reviewer console](#reviewer-console-runtime-env-only--alissa_ui_enabled-alissa_ui_passcode-port)
 and [The console on Railway](#the-console-on-railway).
+
+## Published image
+
+Every release of this repo publishes this image to GHCR (issue #151):
+
+```
+ghcr.io/ali-fhr/alissa-dark-factory-revloop
+```
+
+It is the **pilot for the fleet's published seat images** — orcloop, devloop and
+genloop copy [`image-publish.yaml`](../../.github/workflows/image-publish.yaml)
+and change the seat-specific values block at the top of it, nothing else.
+
+### One version axis
+
+The image version **is** the package version — the plain-text `version` file
+next to `version.py` in `alissa-tools-github-revloop`. Three things keep that
+true, all enforced on the pull request by `check-version-bump.yaml`:
+
+| rule | job |
+| --- | --- |
+| a PR that touches `docker/**` must bump the version file (as a PR that touches the dist already had to) — so every image change is a new release and a published tag is never overwritten | `Version Bump Check` |
+| the version must not already be on PyPI | `Version Bump Check` |
+| the Dockerfile's `ARG REVLOOP_VERSION` default must equal the version file — a plain `docker build` installs the ARG default, and the two had drifted to `0.29.0` vs `0.31.7` | `dockerfile-pin-sync` |
+
+### Tags
+
+| tag | moves? | meaning |
+| --- | --- | --- |
+| `:X.Y.Z` | never — an existing version tag is **never overwritten**; the publish is idempotent | this release |
+| `:X.Y` | on every `X.Y.*` release | newest patch of a minor |
+| `:X` | on every `X.*` release | newest of a major |
+
+The floating tags follow the order releases are merged in, which the version
+guard keeps monotonic in practice; deployments pin `:X.Y.Z@sha256:…`, never a
+floating tag (see [the operator lever](#the-operator-lever-pin-by-digest)).
+
+Every image carries the OCI labels `org.opencontainers.image.source` (this
+repo — it is what links the package to the repo on GHCR), `.version`, `.revision`
+(the merge commit on `main`), `.title`, `.description` and `.licenses`. Platform:
+`linux/amd64` only, inherited from [the base](#platform-amd64-only).
+
+### How a release is published
+
+`image-publish.yaml` runs when a pull request is **merged** into `main` that
+touches `alissa-tools-github-revloop/**`, `docker/**` or the workflow itself —
+the same trigger shape as `package-publish.yaml`, and nothing runs on unmerged
+code. In order:
+
+1. **Read the version file** at the merge commit.
+2. **Wait for PyPI** to serve `alissa-tools-github-revloop==<version>` — the
+   package publish uploads in parallel, and the Dockerfile installs from PyPI.
+   Bounded (15 min); a timeout fails the run loudly with nothing pushed, and
+   *Re-run jobs* retries once the package has landed.
+3. **Skip if published**: if `:<version>` already exists on GHCR the run ends
+   green without building or pushing. A registry answer the check cannot
+   classify fails the run rather than risk an overwrite.
+4. **Build** `docker/claude/Dockerfile` for `linux/amd64` with
+   `--build-arg REVLOOP_VERSION=<version>` and the OCI labels.
+5. **Contract-test that image** —
+   [`tests-image-contract.sh`](./tests-image-contract.sh) with
+   `IMAGE_PREBUILT=1` (assert the built image instead of building another) and
+   `REVLOOP_VERSION=<version>` (expect that release installed). What is tested is
+   byte for byte what is pushed.
+6. **Push** `:X.Y.Z`, `:X.Y`, `:X`, read the digest back from the registry,
+   check the three tags agree, and write the digest and the ready-to-paste pin to
+   the job summary.
+
+`packages: write` is granted to the publishing job only, and `GITHUB_TOKEN` is
+the only credential in the workflow. The image carries no secrets — every
+credential is runtime env, and the daemon code is already public on PyPI under
+Apache-2.0 — so the package is meant to be **public**. GHCR creates it private;
+the operator flips it once after the first publish (see below), and until then
+pulls need a token with `read:packages`.
+
+### Run the published image
+
+Same contract as a local build — the image name is the only change. The three
+secrets and the allowlist are runtime env; every knob in the
+[configuration table](#configuration-build-args--railway-friendly) is baked as a
+default and overridable the same way:
+
+```sh
+docker pull ghcr.io/ali-fhr/alissa-dark-factory-revloop:0.31.8
+
+docker run -d --name alissa-review \
+  --restart unless-stopped \
+  -e GH_TOKEN \
+  -e ALISSA_API_TOKEN \
+  -e ANTHROPIC_API_KEY \
+  -e ALISSA_REVIEW_REPOS="fahera-mx/studio.alissa.app|fahera-mx/blog.alissa.app" \
+  -e ALISSA_REVIEW_OPERATORS="RHDZMOTA" \
+  -v alissa-review-workspace:/workspace \
+  ghcr.io/ali-fhr/alissa-dark-factory-revloop:0.31.8 -v
+```
+
+Everything after the image name still goes to `alissa-revloop`; `--once`,
+`--dry-run`, `-v` work as in [Run](#run). `CONTAINER_ROLE=executor` boots the
+same published image as the
+[bridge executor](#bridge-executor-role-a-second-service-from-this-same-image).
+
+### The operator lever: pin by digest
+
+Deploy a **known digest**, not a rebuild. Pin the Railway service (and every
+Managed Dark Factory tenant) to the exact image a run published — tag *and*
+digest, the same two-value shape [the base pin uses](#how-the-pin-is-written):
+
+```
+ghcr.io/ali-fhr/alissa-dark-factory-revloop:0.31.8@sha256:<digest from the run's job summary>
+```
+
+Upgrading the seat is then **changing that pin**, not bumping `REVLOOP_VERSION`
+and rebuilding. Read a published digest back at any time with:
+
+```sh
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-dark-factory-revloop:0.31.8
+```
+
+**After the first publish (operator, once):**
+
+1. Confirm the *Container Image Publish* run for the merge is green and note the
+   digest in its job summary.
+2. Set the GHCR package `alissa-dark-factory-revloop` to **public** (package
+   settings → change visibility).
+3. Verify an anonymous pull resolves the manifest:
+
+   ```sh
+   TOK="$(curl -s 'https://ghcr.io/token?scope=repository:ali-fhr/alissa-dark-factory-revloop:pull' | jq -r .token)"
+   curl -sI -H "Authorization: Bearer ${TOK}" \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
+     https://ghcr.io/v2/ali-fhr/alissa-dark-factory-revloop/manifests/0.31.8 | grep -i docker-content-digest
+   ```
+
+4. Switch `dark-revloop-shared` from the Dockerfile source to the image source
+   pinned by digest. The ARG-matched service variables keep working as runtime
+   env.
 
 ## The three identities (self-onboarding)
 

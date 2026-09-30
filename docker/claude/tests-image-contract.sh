@@ -47,7 +47,8 @@
 #   8. /usr/local/bin/entrypoint.sh is THIS repo's file and not the base's stub
 #   9. the inherited image config (ENTRYPOINT / USER / WORKDIR / EXPOSE) is what
 #      the leaf assumes when it declines to re-declare any of it
-#  10. the installed daemon is the version ARG REVLOOP_VERSION pins
+#  10. the installed daemon is the version ARG REVLOOP_VERSION pins (or the
+#      REVLOOP_VERSION override the build was passed, see below)
 #
 # Two of those deserve a note on HOW they are checked, because the obvious way
 # passes vacuously:
@@ -73,12 +74,32 @@
 #
 # `--platform linux/amd64` is passed explicitly: the base publishes that
 # platform only (see "Base image" in README.md).
+#
+# TWO OVERRIDES (issue #151), both optional, both env:
+#
+#   REVLOOP_VERSION=<x.y.z>  build with `--build-arg REVLOOP_VERSION=<x.y.z>`
+#                            and expect THAT version installed (item 10),
+#                            instead of the Dockerfile's ARG default. The ARG
+#                            default equals the dist's version file, which on a
+#                            release pull request is not on PyPI yet — so
+#                            check-image.yaml passes the newest published
+#                            release here to keep the pull request's build
+#                            honest about what it can install.
+#   IMAGE_PREBUILT=1         skip the build and assert against the image
+#                            IMAGE_TAG already names. image-publish.yaml builds
+#                            the release image itself and runs this script
+#                            against it BEFORE pushing, so what is tested is
+#                            byte for byte what is published.
 # =============================================================================
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${IMAGE_TAG:-alissa-review-daemon:contract-test}"
 PLATFORM="${BUILD_PLATFORM:-linux/amd64}"
+PREBUILT="${IMAGE_PREBUILT:-0}"
+# The daemon version to build with / expect installed: the override, else the
+# pin read out of the Dockerfile the same way check-entrypoint.yaml reads it.
+EXPECT_REVLOOP="${REVLOOP_VERSION:-$(sed -n 's/^ARG REVLOOP_VERSION=\([0-9.]*\).*/\1/p' "${SCRIPT_DIR}/Dockerfile")}"
 
 fail=0
 info() { printf '%s\n' "$*"; }
@@ -99,13 +120,27 @@ if ! command -v docker >/dev/null 2>&1 || ! docker version >/dev/null 2>&1; then
 fi
 
 # --- 1. build ----------------------------------------------------------------
-info "1. docker build --platform ${PLATFORM} ${SCRIPT_DIR}"
-if ! docker build --platform "${PLATFORM}" -t "${IMAGE}" "${SCRIPT_DIR}"; then
-  info ""
-  info "FAILURES: the build itself did not succeed — nothing below could run."
-  exit 1
+if [ "${PREBUILT}" = "1" ]; then
+  info "1. IMAGE_PREBUILT=1 -> not building; asserting the existing image ${IMAGE} (expecting revloop ${EXPECT_REVLOOP})"
+  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    info ""
+    info "FAILURES: IMAGE_PREBUILT=1 but ${IMAGE} is not in the local docker store — nothing below could run."
+    exit 1
+  fi
+  pass "prebuilt image present -> ${IMAGE}"
+else
+  build_args=()
+  if [ -n "${REVLOOP_VERSION:-}" ]; then
+    build_args+=(--build-arg "REVLOOP_VERSION=${REVLOOP_VERSION}")
+  fi
+  info "1. docker build --platform ${PLATFORM} ${build_args[*]:-} ${SCRIPT_DIR}"
+  if ! docker build --platform "${PLATFORM}" ${build_args[@]+"${build_args[@]}"} -t "${IMAGE}" "${SCRIPT_DIR}"; then
+    info ""
+    info "FAILURES: the build itself did not succeed — nothing below could run."
+    exit 1
+  fi
+  pass "build succeeded -> ${IMAGE} (revloop ${EXPECT_REVLOOP})"
 fi
-pass "build succeeded -> ${IMAGE}"
 
 # Expected values the container cannot know on its own.
 EXPECT_EP_SHA="$(sha256sum "${SCRIPT_DIR}/entrypoint.sh"      | cut -d' ' -f1)"
@@ -127,9 +162,6 @@ case "${EXPECT_HOOKS}" in
     pass "hook manifest read from docker/claude/hooks: ${EXPECT_HOOKS}" ;;
   *) bad "hook manifest incomplete — expected guard-shell.py and note-waiting.py under docker/claude/hooks: ${EXPECT_HOOKS:-<empty>}" ;;
 esac
-# The pin, read out of the Dockerfile the same way check-entrypoint.yaml reads it.
-EXPECT_REVLOOP="$(sed -n 's/^ARG REVLOOP_VERSION=\([0-9.]*\).*/\1/p' "${SCRIPT_DIR}/Dockerfile")"
-
 # --- 2-8, 10: assertions inside the image, as root ---------------------------
 info ""
 info "2. contract inside the image (as root)"

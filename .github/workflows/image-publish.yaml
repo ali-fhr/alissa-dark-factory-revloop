@@ -1,0 +1,336 @@
+name: Container Image Publish
+
+# Publishes the seat image to GHCR on every release (issue #151; the pilot
+# for the fleet's published images — orcloop, devloop and genloop copy this
+# file and change the SEAT-SPECIFIC VALUES block below, nothing else).
+#
+# WHY. Until this workflow, Railway built docker/claude/Dockerfile at deploy
+# time, while check-image.yaml built a DIFFERENT copy on the pull request,
+# contract-tested it and threw it away — what ran was never what was tested.
+# Now a merged release builds the image ONCE here, runs the same contract
+# check against THAT image, and pushes it; Railway (and every Managed Dark
+# Factory tenant) deploys a known digest instead of rebuilding.
+#
+# ONE VERSION AXIS. The image version IS the package version in the
+# plain-text `version` file: the Dockerfile's `ARG REVLOOP_VERSION` default is
+# kept equal to it by check-version-bump.yaml, and a docker/** change cannot
+# merge without bumping it, so every image change is a new version and a
+# published tag is never overwritten.
+#
+# ORDER OF EVENTS on a merge. package-publish.yaml uploads the wheel to PyPI in
+# parallel with this workflow; the Dockerfile installs the daemon FROM PyPI, so
+# the `release` job waits (bounded) until PyPI serves the version before the
+# `publish` job builds. The push is idempotent: a version tag that already
+# exists on GHCR ends the run green without building or pushing anything.
+#
+# TRIGGER. Same shape as package-publish.yaml: a pull request CLOSED into main
+# that was MERGED. Nothing runs on unmerged code — the `if:` on the first job
+# gates every job behind it (the second `needs:` it). A failed run (PyPI
+# timeout, contract failure) is retried with the Actions "Re-run jobs" button;
+# the idempotence check makes a re-run after a partial push safe.
+#
+# LEAST PRIVILEGE. `packages: write` is granted to the publishing job ONLY,
+# and GITHUB_TOKEN is the only credential anywhere in this file. The image
+# carries no secrets (credentials are runtime env; see docker/claude/README.md
+# "Published image"), and the daemon code is already public on PyPI under
+# Apache-2.0, so the package is meant to be PUBLIC — GHCR creates it private,
+# and the operator flips it once after the first publish (issue #151).
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/image-publish.yaml
+      - alissa-tools-github-revloop/**
+      - docker/**
+    types:
+      - closed
+    branches:
+      - main
+
+# Default for every job; the publishing job widens its own to packages: write.
+permissions:
+  contents: read
+
+# Two merges close to each other publish in order, never interleaved; a run is
+# never cancelled mid-push.
+concurrency:
+  group: image-publish
+  cancel-in-progress: false
+
+# ---- SEAT-SPECIFIC VALUES ---------------------------------------------------
+# The only lines a sibling seat (orcloop, devloop, genloop) changes when it
+# copies this workflow.
+env:
+  # The published image (GHCR package name = repository name).
+  IMAGE: ghcr.io/ali-fhr/alissa-dark-factory-revloop
+  # The PyPI distribution the Dockerfile installs, and the ARG that pins it.
+  DIST_NAME: alissa-tools-github-revloop
+  VERSION_ARG: REVLOOP_VERSION
+  # The version of record (the same file check-version-bump.yaml keys on).
+  VERSION_FILE: alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version
+  # Build context (holds the Dockerfile) and the contract check run against
+  # the built image before anything is pushed.
+  DOCKER_CONTEXT: docker/claude
+  CONTRACT_SCRIPT: docker/claude/tests-image-contract.sh
+  # The base image publishes linux/amd64 only (docker/claude/README.md,
+  # "Platform: amd64 only"); no multi-arch.
+  PLATFORM: linux/amd64
+  IMAGE_TITLE: alissa-dark-factory-revloop
+  IMAGE_DESCRIPTION: Alissa GitHub review daemon seat (revloop) — poller, worker and claude reviewer runtime
+  # How long to wait for PyPI to serve the release package-publish.yaml uploads
+  # in parallel, and how often to ask.
+  PYPI_API_BASE: https://pypi.org/pypi
+  PYPI_WAIT_SECONDS: '900'
+  PYPI_POLL_SECONDS: '20'
+# -----------------------------------------------------------------------------
+
+jobs:
+  release:
+    # The ONLY gate on unmerged code: a closed-but-not-merged pull request
+    # skips this job, and `publish` needs it.
+    if: github.event.pull_request.merged == true
+    name: Release version and PyPI wait
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          # The commit the merge put on main — what the image's
+          # org.opencontainers.image.revision label names — not the
+          # pull request's transient merge ref.
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          submodules: true
+
+      - name: Read the version of record
+        id: version
+        env:
+          REVISION: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "${VERSION_FILE}" ]; then
+            echo "::error file=${VERSION_FILE}::${VERSION_FILE} is missing — nothing to publish."
+            exit 1
+          fi
+          version="$(head -n 1 "${VERSION_FILE}" | tr -d '[:space:]')"
+          # Only a plain X.Y.Z can be published: the :X.Y and :X floating
+          # tags are computed from it, and image tags cannot carry PEP 440's
+          # `+local` or `!epoch` characters anyway.
+          case "${version}" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error file=${VERSION_FILE}::'${version:-<empty>}' is not a plain X.Y.Z version — the image tags cannot be derived from it."
+              exit 1
+              ;;
+          esac
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${REVISION}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${IMAGE}:${version} from ${REVISION}"
+
+      - name: Wait until PyPI serves the release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # The Dockerfile's `pip install ${DIST_NAME}==${VERSION}` is what the
+        # build runs, so the wait ends only when pip on this runner can fetch
+        # exactly that release from the simple index (the JSON API can lead
+        # the index by a moment). Bounded: past PYPI_WAIT_SECONDS the run
+        # FAILS loudly rather than build an image whose pip would fail
+        # anyway — re-run the workflow once package-publish has landed.
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + PYPI_WAIT_SECONDS ))
+          url="${PYPI_API_BASE}/${DIST_NAME}/${VERSION}/json"
+          dest="${RUNNER_TEMP}/pypi-wait"
+          mkdir -p "${dest}"
+          attempt=0
+          while :; do
+            attempt=$(( attempt + 1 ))
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "${url}" || echo "000")"
+            if [ "${code}" = "200" ] \
+               && python3 -m pip download --quiet --no-deps --no-cache-dir \
+                    --dest "${dest}" "${DIST_NAME}==${VERSION}"; then
+              echo "::notice::PyPI serves ${DIST_NAME} ${VERSION} (attempt ${attempt}); the image build can install it."
+              break
+            fi
+            now="$(date +%s)"
+            if [ "${now}" -ge "${deadline}" ]; then
+              {
+                echo "RULE: the image is built from the PyPI release of ${DIST_NAME} ${VERSION},"
+                echo "      which package-publish.yaml uploads on the same merge."
+                echo ""
+                echo "PyPI did not serve ${DIST_NAME} ${VERSION} within ${PYPI_WAIT_SECONDS}s"
+                echo "(last JSON API answer: HTTP ${code} for ${url})."
+                echo ""
+                echo "Check the 'Python Package Publish' run for this merge. Once the release is on"
+                echo "PyPI, re-run this workflow (Actions -> Re-run jobs): nothing was pushed, and the"
+                echo "publish is idempotent."
+              } | tee -a "${GITHUB_STEP_SUMMARY}"
+              echo "::error::PyPI did not serve ${DIST_NAME} ${VERSION} within ${PYPI_WAIT_SECONDS}s — no image was built or pushed. Re-run once package-publish has landed."
+              exit 1
+            fi
+            echo "attempt ${attempt}: PyPI does not serve ${DIST_NAME} ${VERSION} yet (HTTP ${code}); retrying in ${PYPI_POLL_SECONDS}s ($(( deadline - now ))s left)"
+            sleep "${PYPI_POLL_SECONDS}"
+          done
+
+  publish:
+    needs: release
+    name: Build, contract-test and push the image
+    runs-on: ubuntu-latest
+    # The ONLY job with a write scope, and GITHUB_TOKEN is the only credential.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      REVISION: ${{ needs.release.outputs.revision }}
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          submodules: true
+
+      - name: Docker is present
+        run: |
+          docker version
+          docker buildx version
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Is this version already published?
+        id: exists
+        # IDEMPOTENT, NEVER OVERWRITE. A version tag that already exists is
+        # left exactly as it is: the run ends green without building or
+        # pushing. Only an answer the registry gave in the "absent" shape
+        # proceeds — an unclassified error (network, 5xx) FAILS the run rather
+        # than risk pushing over a tag the check could not see. The "absent"
+        # wordings cover a missing tag in an existing package (no such
+        # manifest / manifest unknown / not found) and a package that does not
+        # exist yet — the first publish — which GHCR answers with
+        # NAME_UNKNOWN or denied; a token that genuinely lacked access could
+        # not push either, so treating those as absent risks a failed push,
+        # never an overwrite.
+        run: |
+          set -uo pipefail
+          ref="${IMAGE}:${VERSION}"
+          for attempt in 1 2 3; do
+            if out="$(docker manifest inspect "${ref}" 2>&1)"; then
+              echo "exists=true" >> "${GITHUB_OUTPUT}"
+              echo "::notice::${ref} is already published — nothing to build or push (a published version is never overwritten)."
+              {
+                echo "## ${ref} already published"
+                echo ""
+                echo "The version tag exists on GHCR; this run built and pushed nothing."
+                echo "A published version is never overwritten — bump the version file to release a new image."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+            case "${out}" in
+              *"no such manifest"*|*"manifest unknown"*|*"MANIFEST_UNKNOWN"*|*"not found"*|*"NAME_UNKNOWN"*|*"name unknown"*|*"denied"*)
+                echo "exists=false" >> "${GITHUB_OUTPUT}"
+                echo "${ref} is not published yet (registry said: ${out})"
+                exit 0
+                ;;
+            esac
+            echo "attempt ${attempt}: could not classify the registry's answer for ${ref}: ${out}"
+            sleep 5
+          done
+          echo "::error::Could not determine whether ${ref} already exists (last answer: ${out}). Refusing to build or push rather than risk overwriting a published version."
+          exit 1
+
+      - name: Build the image at the released version
+        if: steps.exists.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          docker build --platform "${PLATFORM}" \
+            --build-arg "${VERSION_ARG}=${VERSION}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            --label "org.opencontainers.image.title=${IMAGE_TITLE}" \
+            --label "org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            -t "${IMAGE}:${VERSION}" "${DOCKER_CONTEXT}"
+          # The labels are this workflow's, not the Dockerfile's, so assert
+          # them here rather than in the contract script.
+          for pair in "source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" "version=${VERSION}" "revision=${REVISION}"; do
+            key="org.opencontainers.image.${pair%%=*}"
+            want="${pair#*=}"
+            got="$(docker image inspect --format "{{index .Config.Labels \"${key}\"}}" "${IMAGE}:${VERSION}")"
+            if [ "${got}" != "${want}" ]; then
+              echo "::error::label ${key}: expected '${want}', got '${got}'"
+              exit 1
+            fi
+            echo "label ${key} = ${got}"
+          done
+
+      - name: Assert the image contract against the built image
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          # The contract script normally builds its own image; these make it
+          # assert THIS image instead (IMAGE_PREBUILT) at THIS version
+          # (REVLOOP_VERSION), so what is tested is byte for byte what is
+          # pushed. REQUIRE_DOCKER turns its no-daemon skip into a failure.
+          IMAGE_TAG: ${{ env.IMAGE }}:${{ needs.release.outputs.version }}
+          IMAGE_PREBUILT: '1'
+          REVLOOP_VERSION: ${{ needs.release.outputs.version }}
+          REQUIRE_DOCKER: '1'
+        run: bash "${CONTRACT_SCRIPT}"
+
+      - name: Push :X.Y.Z, :X.Y and :X
+        if: steps.exists.outputs.exists == 'false'
+        id: push
+        run: |
+          set -euo pipefail
+          major_minor="${VERSION%.*}"
+          major="${VERSION%%.*}"
+          docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${major_minor}"
+          docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${major}"
+          for tag in "${VERSION}" "${major_minor}" "${major}"; do
+            docker push "${IMAGE}:${tag}"
+          done
+          # Read the digest BACK from the registry — what it serves, not what
+          # the local store thinks — and check the three tags agree.
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}')"
+          for tag in "${major_minor}" "${major}"; do
+            other="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}}')"
+            if [ "${other}" != "${digest}" ]; then
+              echo "::error::${IMAGE}:${tag} resolves to ${other}, not ${digest}"
+              exit 1
+            fi
+          done
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${VERSION} ${major_minor} ${major}" >> "${GITHUB_OUTPUT}"
+          echo "Pushed ${IMAGE}@${digest} as :${VERSION}, :${major_minor}, :${major}"
+
+      - name: Job summary
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.push.outputs.tags }}
+        run: |
+          {
+            echo "## Published ${IMAGE}:${VERSION}"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| tags | $(for t in ${TAGS}; do printf '`:%s` ' "${t}"; done) |"
+            echo "| revision | \`${REVISION}\` |"
+            echo "| platform | \`${PLATFORM}\` |"
+            echo ""
+            echo "Pin a deployment to exactly this image (docker/claude/README.md, \"Published image\"):"
+            echo ""
+            echo '```'
+            echo "${IMAGE}:${VERSION}@${DIGEST}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
