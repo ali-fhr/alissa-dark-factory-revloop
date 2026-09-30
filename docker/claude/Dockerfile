@@ -361,15 +361,16 @@ ARG ALISSA_REVIEW_BOW_OWNERS=""
 ARG ALISSA_AGENT_PROFILE="claude"
 # Reviewer model pinned into the agents.yaml claude command at boot (the reviewer
 # is the quality gate, so it must not silently fall back to a smaller model on a
-# usage-throttled account). Default `claude-fable-5-1`: the latest and most
-# capable generally available Claude model, one tier above Opus (operator
-# decision 2026-09-01).
+# usage-throttled account). Default `opus` (operator decision 2026-09-29,
+# replacing the 2026-09-01 `claude-fable-5-1` pin): the alias tracks the latest
+# Opus the base's claude-code knows — Claude Opus 5.5 on base 0.2.2+ — and can
+# never name a model newer than the shipped CLI.
 # Alias (`opus`/`sonnet`) or full id (`claude-opus-5-5`) pass through verbatim;
 # `default` or empty omits the --model flag. See the entrypoint (step 2e) + README.
-# The shared reviewer fleet (`dark-revloop-shared`) overrides this default with
-# the Railway variable ALISSA_AGENT_MODEL=claude-opus-5-5 (operator, 2026-09-26);
-# that id needs the base pinned above (claude-code >= 2.1.280).
-ARG ALISSA_AGENT_MODEL="claude-fable-5-1"
+# The shared reviewer fleet (`dark-revloop-shared`) sets the Railway variable
+# ALISSA_AGENT_MODEL=claude-opus-5-5 (operator, 2026-09-26), which wins over this
+# default; that id needs the base pinned above (claude-code >= 2.1.280).
+ARG ALISSA_AGENT_MODEL="opus"
 ARG ALISSA_ON_MISSING_HUB="add"
 # Worker reconcile tick, seconds.
 ARG ALISSA_WORKER_INTERVAL="2"
