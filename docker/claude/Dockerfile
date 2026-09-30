@@ -98,21 +98,28 @@
 # versions are unasserted as before; tests-image-contract.sh prints them.
 FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c26cefc718a67cde94195668dc9341c07e14b0fd
 
-# Version of the daemon to install from PyPI. Bump per release: 0.29.0 is the
-# release this repo publishes on merge (it must match the dist's version file,
-# or the image ships a library that cannot read the config this image renders).
-# 0.29.0 is also the release that introduced `repos_source` (issue #119), so a
-# DEFAULT build -- no `--build-arg REVLOOP_VERSION` -- honours
-# ALISSA_REVIEW_REPOS_SOURCE=bows instead of taking the entrypoint's
-# version-skew fall-through (issue #124; the pin sat at 0.16.14 until the
-# release was on PyPI, because check-image.yaml installs the pin from there).
+# Version of the daemon to install from PyPI. This default EQUALS the dist's
+# plain-text `version` file (alissa-tools-github-revloop/src/main/alissa/tools/
+# github/revloop/version) and CI keeps it so: check-version-bump.yaml's
+# dockerfile-pin-sync job fails any pull request on which the two differ
+# (issue #151 — they had drifted to 0.29.0 against a 0.31.7 package, so a
+# plain build installed a daemon that could not read the config this image
+# renders). Bumping the version file therefore means bumping this line in the
+# SAME pull request. The image published on merge (image-publish.yaml) is
+# built with `--build-arg REVLOOP_VERSION=<version file>` once PyPI serves
+# that release; on the pull request itself, where the release is not on PyPI
+# yet, check-image.yaml builds from the newest published release instead and
+# says so. A Dockerfile-SOURCE deploy of main (Railway building this file)
+# has no such wait: right after a release merge this pin names a version PyPI
+# may not serve yet, so that build can fail until package-publish lands —
+# redeploy then, or use the published image (README, "On Railway").
 #
 # The FLOOR is separate from the current pin and moves far less often: never
 # below 0.15.0, the first version shipping the `alissa-revloop-ui` console
 # script the entrypoint starts. Naming the two apart keeps the next release a
-# one-line edit. The bows arm is skew-guarded (capability-probed, not
-# version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.29.0
+# one-line edit. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
+# (capability-probed, not version-pinned), so it does NOT move the floor.
+ARG REVLOOP_VERSION=0.31.8
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.

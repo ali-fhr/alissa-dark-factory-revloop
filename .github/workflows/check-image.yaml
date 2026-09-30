@@ -21,13 +21,27 @@ permissions:
 # against STUBBED CLIs in a plain shell precisely BECAUSE they must run without
 # docker — which is what makes them silent about how the image was assembled.
 #
-# This job is the other half, and it is also the only place a `docker build` of
-# this Dockerfile happens anywhere: it is not built by any other workflow, not by
-# the release pipeline, and not by the agent runners that implement this repo
-# (they have no docker daemon, no root and no user namespaces). Without it, the
+# This job is the other half, and it is the only place a `docker build` of this
+# Dockerfile happens on a PULL REQUEST: the agent runners that implement this
+# repo have no docker daemon, no root and no user namespaces. Without it, the
 # build is verified only by whoever remembers to run it by hand, and the next
 # `FROM` bump — the mechanism this leaf design makes the ONLY way the substrate
-# advances — lands unverified.
+# advances — lands unverified. The other build is the release's:
+# image-publish.yaml builds the merged version once PyPI serves it, runs this
+# same contract script against THAT image, and pushes it (issue #151).
+#
+# WHICH DAEMON VERSION THIS BUILD INSTALLS. The Dockerfile's ARG default equals
+# the dist's version file (check-version-bump.yaml enforces it), and a release
+# pull request bumps both — to a version PyPI does not serve until the merge.
+# The Dockerfile installs from PyPI, so building the pull request's Dockerfile
+# as-is would fail on every release pull request for a reason that has nothing
+# to do with the image. The step below therefore asks PyPI: pinned version
+# published -> default build; not yet -> build at the NEWEST published release
+# (`--build-arg REVLOOP_VERSION=…` through the contract script's override) and
+# say so in the log. The Dockerfile, the base pin and every COPYed file are
+# still exactly the pull request's; only the pip-installed daemon is one
+# release behind, and the release build in image-publish.yaml closes that gap
+# before anything is published.
 jobs:
   image-contract:
     name: Image contract (build + in-image assertions)
@@ -56,10 +70,41 @@ jobs:
           echo "Dockerfile pins: ${ref}"
           docker buildx imagetools inspect "${ref%%@*}" || true
 
+      # See WHICH DAEMON VERSION THIS BUILD INSTALLS above. Emits
+      # `revloop_version` — empty for the default build, or the newest
+      # published release when the pinned one is not on PyPI yet.
+      - name: Resolve the daemon release this build can install
+        id: daemon
+        env:
+          DIST_NAME: alissa-tools-github-revloop
+          PYPI_API_BASE: https://pypi.org/pypi
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/^ARG REVLOOP_VERSION=\([0-9.]*\).*/\1/p' docker/claude/Dockerfile)"
+          if [ -z "${pinned}" ]; then
+            echo "::error file=docker/claude/Dockerfile::no 'ARG REVLOOP_VERSION=<version>' line found in docker/claude/Dockerfile"
+            exit 1
+          fi
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 --retry-delay 3 "${PYPI_API_BASE}/${DIST_NAME}/${pinned}/json" || echo 000)"
+          if [ "${code}" = "200" ]; then
+            echo "revloop_version=" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${DIST_NAME} ${pinned} (the Dockerfile's ARG default) is on PyPI — building the Dockerfile as-is."
+            exit 0
+          fi
+          newest="$(curl -sS --max-time 30 --retry 2 --retry-delay 3 "${PYPI_API_BASE}/${DIST_NAME}/json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')"
+          case "${newest}" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::could not read the newest ${DIST_NAME} release from PyPI (got '${newest}')"; exit 1 ;;
+          esac
+          echo "revloop_version=${newest}" >> "${GITHUB_OUTPUT}"
+          echo "::warning::${DIST_NAME} ${pinned} (the Dockerfile's ARG default) is not on PyPI yet (HTTP ${code}) — this pull request releases it. Building at the newest published release ${newest} instead; image-publish.yaml builds and contract-tests ${pinned} itself once the merge puts it on PyPI."
+
       - name: Build the image and assert its contract
         env:
           # Turns the harness's "no docker daemon -> skip" path into a failure,
           # so a runner that lost docker cannot report this job as green.
           REQUIRE_DOCKER: '1'
+          # Empty -> the Dockerfile's ARG default; else the override above.
+          REVLOOP_VERSION: ${{ steps.daemon.outputs.revloop_version }}
         run: |
           bash docker/claude/tests-image-contract.sh

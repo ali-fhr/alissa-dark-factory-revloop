@@ -392,20 +392,27 @@ Config.build(workspace_root=".", file_data=json.loads(os.environ["CONFIG_JSON"])
 PY
 then bad "the library accepted prompt_responder=yes"; else pass "the library refuses prompt_responder=yes at load"; fi
 
-# The Dockerfile must carry the ARG (and its pass-through ENV line) -- and this
-# PR must NOT re-pin REVLOOP_VERSION: CI installs the pinned release from PyPI,
-# which cannot yet carry 0.30.0 (a sibling task re-pins once it is published).
+# The Dockerfile must carry the ARG (and its pass-through ENV line).
 if grep -qE '^ARG ALISSA_REV_FLEET_VITALS_ENABLED=""$' "${HERE}/Dockerfile" \
    && grep -qE '^\s*ALISSA_REV_FLEET_VITALS_ENABLED=\$\{ALISSA_REV_FLEET_VITALS_ENABLED\}' "${HERE}/Dockerfile"; then
   pass "Dockerfile carries ARG ALISSA_REV_FLEET_VITALS_ENABLED and passes it through ENV"
 else
   bad "Dockerfile is missing the ALISSA_REV_FLEET_VITALS_ENABLED ARG / ENV pass-through"
 fi
-pin="$(grep -E '^ARG REVLOOP_VERSION=' "${HERE}/Dockerfile" | head -n 1)"
-if [ -n "${pin}" ] && ! printf '%s' "${pin}" | grep -qF '0.30.0'; then
-  pass "ARG REVLOOP_VERSION is untouched by the fleet-vitals change (${pin}; the re-pin is a sibling task's)"
+# ARG REVLOOP_VERSION's default EQUALS the dist's version file (issue #151):
+# the published image is built at the version file's value and a plain
+# `docker build` installs the ARG default, so the two copies of the number
+# move together in the same PR. (Before #151 this block asserted the
+# OPPOSITE — that a feature PR left the pin alone, because CI installed the
+# pin from PyPI; check-image.yaml now falls back to the newest published
+# release while the PR's own version is unpublished, and check-version-bump's
+# dockerfile-pin-sync job is the CI half of this same assertion.)
+pin="$(sed -n 's/^ARG REVLOOP_VERSION=\([^ ]*\).*/\1/p' "${HERE}/Dockerfile")"
+want="$(head -n 1 "${REPO_ROOT}/alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version" | tr -d '[:space:]')"
+if [ -n "${pin}" ] && [ "${pin}" = "${want}" ]; then
+  pass "ARG REVLOOP_VERSION=${pin} equals the dist's version file"
 else
-  bad "ARG REVLOOP_VERSION was re-pinned to the unpublished release: ${pin}"
+  bad "ARG REVLOOP_VERSION=${pin:-<missing>} differs from the dist's version file (${want:-<unreadable>}) — the two move together (issue #151)"
 fi
 
 echo "== fleet vitals: skew guard — an old pin drops the key with a WARN naming the re-pin =="
