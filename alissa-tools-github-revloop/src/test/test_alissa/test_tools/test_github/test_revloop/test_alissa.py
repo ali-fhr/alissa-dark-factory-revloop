@@ -3,12 +3,14 @@ devloop #127's `Alissa.capture_pane` / `pane_path` / `send_keys` on the
 reviewer seat): the pinned argv, the allowlist enforced before any process
 is spawned, dry-run sending nothing, and every failure degrading to "" /
 False rather than raising -- plus the roster's real tmux name riding along
-on `ManagedSession`."""
+on `ManagedSession`. Also the reviewer enqueue's spawn stamps (issue #153):
+`--task <origin> --repo <owner/name>` on a CLI that accepts both, probed once."""
 
 from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +23,7 @@ from alissa.tools.github.revloop.alissa import (
     capture_pane_argv,
     check_session_name,
     pane_path_argv,
+    queue_add_accepts_stamps,
     send_keys_argv,
     tmux_socket,
     tmux_target,
@@ -124,3 +127,153 @@ def test_the_roster_carries_the_real_tmux_name_and_a_quiet_time(monkeypatch):
     assert sessions[1].session is None and sessions[1].tmux_name == "ali-review-pr-9"
     assert sessions[1].quiet_for is None, "no timestamp reads as unknown, not as 0"
     assert ManagedSession(name="review-pr-1", status="idle").tmux_name == "ali-review-pr-1"
+
+
+# -- spawn stamps: `queue add --task <origin> --repo <owner/name>` (issue #153) --
+
+# `alissa tmux queue add --help` before and after the Studio lane that adds the
+# spawn stamps: 0.3.0 (verbatim below) already had `--task`, for shell
+# write-back on a queue item, but no `--repo`.
+HELP_WITHOUT_REPO = """Usage: alissa tmux queue add [options] <name> <text...>
+
+Enqueue a command/message for a session (the session may not exist yet)
+
+Options:
+  -a, --agent <profile>  Agent the worker should use if it must create the
+                         session
+  -c, --cwd <dir>        Working directory the worker should use if it must
+                         create the session
+  --stop-on-fail         Pause this queue when a shell item exits nonzero
+                         (sticky, like --agent)
+  -t, --task <ref>       Link the item to an Alissa task (TASK-<n>, id, or URL)
+                         — the worker writes shell results back to it
+  --json                 Output raw JSON
+  -h, --help             display help for command
+"""
+HELP_WITH_STAMPS = HELP_WITHOUT_REPO.replace(
+    "  --json", "  --repo <owner/name>    Stamp the session's repository\n  --json"
+)
+
+
+def stamp_calls(monkeypatch, help_answer):
+    """Record every `run`; the probe answers `help_answer` (or raises it)."""
+    recorded = []
+
+    def fake_run(argv, **kwargs):
+        recorded.append(list(argv))
+        if "--help" in argv:
+            if isinstance(help_answer, Exception):
+                raise help_answer
+            return help_answer
+        return ""
+
+    monkeypatch.setattr(alissa_mod, "run", fake_run)
+    return recorded
+
+
+def probes(recorded):
+    return [argv for argv in recorded if "--help" in argv]
+
+
+def enqueues(recorded):
+    return [argv for argv in recorded
+            if argv[:4] == ["alissa", "tmux", "queue", "add"] and "--help" not in argv]
+
+
+def stamped_enqueue(al, session="s", **overrides):
+    kwargs = dict(
+        session=session, directive="review it", cwd=Path("/hub/main"), agent="claude",
+        task_ref="TASK-4242", repo="Acme/Widgets",
+    )
+    kwargs.update(overrides)
+    al.enqueue_reviewer(**kwargs)
+
+
+def test_both_stamps_go_on_a_cli_that_accepts_them(monkeypatch):
+    recorded = stamp_calls(monkeypatch, HELP_WITH_STAMPS)
+    stamped_enqueue(Alissa())
+
+    assert probes(recorded) == [["alissa", "tmux", "queue", "add", "--help"]]
+    (argv,) = enqueues(recorded)
+    assert argv == [
+        "alissa", "tmux", "queue", "add", "s", "--agent", "claude", "--cwd", "/hub/main",
+        "--task", "TASK-4242", "--repo", "acme/widgets", "review it",
+    ], "the repo is canonical lowercase and the directive stays last"
+    assert ["alissa", "tmux", "queue", "set", "s", "respawn", "off"] in recorded
+
+
+def test_neither_stamp_goes_on_a_cli_without_repo(monkeypatch):
+    """Both or neither: 0.3.0's `--task` is the older write-back link, and the
+    enqueue must not fail on a CLI that has no `--repo`."""
+    recorded = stamp_calls(monkeypatch, HELP_WITHOUT_REPO)
+    stamped_enqueue(Alissa())
+
+    (argv,) = enqueues(recorded)
+    assert "--task" not in argv and "--repo" not in argv
+    assert argv[-1] == "review it"
+
+
+def test_the_stamp_probe_runs_once_per_process(monkeypatch):
+    for help_text, stamped in ((HELP_WITH_STAMPS, True), (HELP_WITHOUT_REPO, False)):
+        recorded = stamp_calls(monkeypatch, help_text)
+        al = Alissa()
+        for session in ("a", "b", "c"):
+            stamped_enqueue(al, session)
+
+        assert len(probes(recorded)) == 1
+        assert [("--task" in argv) for argv in enqueues(recorded)] == [stamped] * 3
+
+
+def test_a_stamp_probe_that_cannot_run_enqueues_unstamped_and_probes_again(monkeypatch):
+    """A probe failure is no verdict on the CLI: this spawn goes unstamped and
+    the next one asks again."""
+    recorded = stamp_calls(monkeypatch, CommandError(["alissa"], -1, "timed out"))
+    al = Alissa()
+    stamped_enqueue(al, "a")
+    stamped_enqueue(al, "b")
+
+    assert len(probes(recorded)) == 2
+    assert len(enqueues(recorded)) == 2
+    assert all("--task" not in argv and "--repo" not in argv for argv in enqueues(recorded))
+
+
+def test_an_unstamped_enqueue_never_probes(monkeypatch):
+    recorded = stamp_calls(monkeypatch, HELP_WITH_STAMPS)
+    stamped_enqueue(Alissa(), task_ref=None, repo=None)
+
+    assert probes(recorded) == []
+    assert enqueues(recorded)[0][-1] == "review it"
+
+
+def test_only_the_stamps_given_are_passed(monkeypatch):
+    """No origin found (no review task title, no body reference): the repo
+    still goes, `--task` does not."""
+    recorded = stamp_calls(monkeypatch, HELP_WITH_STAMPS)
+    stamped_enqueue(Alissa(), task_ref=None)
+
+    (argv,) = enqueues(recorded)
+    assert "--task" not in argv
+    assert argv[-3:] == ["--repo", "acme/widgets", "review it"]
+
+
+def test_a_stamped_dry_run_runs_nothing_not_even_the_probe(monkeypatch, caplog):
+    recorded = stamp_calls(monkeypatch, HELP_WITH_STAMPS)
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github.revloop.alissa"):
+        stamped_enqueue(Alissa(), dry_run=True)
+
+    assert recorded == []
+    assert any("--task TASK-4242 --repo acme/widgets <directive>" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("help_text, expected", [
+    (HELP_WITH_STAMPS, True),
+    (HELP_WITHOUT_REPO, False),
+    ("", False),
+    # Named in another option's description is not an offer of the flag.
+    (HELP_WITHOUT_REPO.replace("Output raw JSON", "Output raw JSON (see --repo)"), False),
+    # Nor is a longer flag that merely starts with it.
+    (HELP_WITHOUT_REPO.replace("  --json", "  --repository <x>  y\n  --json"), False),
+])
+def test_queue_add_accepts_stamps(help_text, expected):
+    assert queue_add_accepts_stamps(help_text) is expected

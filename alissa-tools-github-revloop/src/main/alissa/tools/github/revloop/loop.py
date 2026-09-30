@@ -1215,6 +1215,44 @@ def plan_id_of(pr: PullRequest) -> "str | None":
     return match.group(1) if match else None
 
 
+# The ORIGIN task a reviewer spawn is stamped with (`--task`, issue #153; the
+# Studio cost meter's lane L4). First from the review task's CR2 title --
+# `Review PR <org>/<repo>#<n> (TASK-<origin>)` -- then from the PR body, the
+# way devloop's `pr_origin_task_ref` reads it (issue #149 there): the
+# `Alissa-Task:` trailer, then the worker's own `Origin task:` / `Origin Alissa
+# task:` line (both spellings are on live bodies). There is deliberately NO
+# `Implementation task:` fallback -- the stamp claims the session serves the
+# origin, and a downstream task is not one. A plan's review title carries a
+# plan id, not a task, so a plan PR normally resolves to None.
+_REVIEW_TITLE_ORIGIN_RE = re.compile(r"\(\s*TASK-(\d+)\s*\)", re.IGNORECASE)
+_BODY_ORIGIN_TASK_RES = tuple(
+    re.compile(rf"{key}\**\s*:\**\s*`?TASK-(\d+)", re.IGNORECASE)
+    for key in (r"Alissa-Task", r"Origin(?:\s+Alissa)?\s+task")
+)
+
+
+def pr_origin_task_ref(body: str) -> "str | None":
+    """`TASK-<n>` for the origin task a PR body names, or None."""
+    text = body or ""
+    for pattern in _BODY_ORIGIN_TASK_RES:
+        match = pattern.search(text)
+        if match:
+            return f"TASK-{match.group(1)}"
+    return None
+
+
+def review_origin_task_ref(task: "Task | None", pr: PullRequest) -> "str | None":
+    """The origin `TASK-<n>` a reviewer round serves, or None -- in which case
+    the spawn is stamped with `--repo` alone. The review task's title wins
+    over the PR body: it is the one the CR2 convention writes, and a round
+    with no review task yet (spawn_anyway) still has the body to go on."""
+    if task is not None:
+        match = _REVIEW_TITLE_ORIGIN_RE.search(task.title or "")
+        if match:
+            return f"TASK-{match.group(1)}"
+    return pr_origin_task_ref(pr.body)
+
+
 def plan_review_task_title(pr: PullRequest) -> str:
     """The CR2 title of a plan PR's review task (design §6.1)."""
     return f"Review plan {pr.slug} ({plan_id_of(pr) or '<plan id>'})"
@@ -5851,7 +5889,8 @@ class ReviewWatcher:
             directive=directive,
             cwd=hub,
             agent=self.config.agent_profile,
-            task_ref=task.ref if task else None,
+            task_ref=review_origin_task_ref(task, pr),
+            repo=pr.full_name,
             dry_run=self.config.dry_run,
         )
 
