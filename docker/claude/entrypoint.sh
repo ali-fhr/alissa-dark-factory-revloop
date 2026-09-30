@@ -580,8 +580,8 @@ fi
 # The reviewer is the pipeline's quality gate, but the baked claude profile pins
 # no model — so it inherits the persisted /login account's default, which can
 # silently fall back to a smaller model when a plan hits its usage threshold. We
-# pin it explicitly at boot: ALISSA_AGENT_MODEL (default `claude-fable-5-1`, the
-# latest and most capable generally-available model, one tier above Opus) is
+# pin it explicitly at boot: ALISSA_AGENT_MODEL (default `opus`, the alias for
+# the latest Opus the installed claude-code knows) is
 # appended to the profile's `command:` as `--model <value>`. The value passes
 # through verbatim — aliases (`opus`, `sonnet`) and full ids (`claude-opus-4-8`)
 # are both valid, no allowlist. `default` or an empty value omits the flag
@@ -594,9 +594,9 @@ fi
 # it is pristine on every boot and this rewrite is idempotent.
 # -----------------------------------------------------------------------------
 AGENTS_YAML="${HOME}/.config/alissa/agents.yaml"
-# Default `claude-fable-5-1` only when UNSET (use `-`, not `:-`): an explicitly
+# Default `opus` only when UNSET (use `-`, not `:-`): an explicitly
 # empty value is a valid opt-out and must NOT be re-defaulted back to the pin.
-AGENT_MODEL="${ALISSA_AGENT_MODEL-claude-fable-5-1}"
+AGENT_MODEL="${ALISSA_AGENT_MODEL-opus}"
 # Trim leading/trailing whitespace first: a padded `opus ` pasted out of a
 # platform env editor is a working configuration at base (the shell drops the
 # padding when it splits the command line) and must not become a boot refusal

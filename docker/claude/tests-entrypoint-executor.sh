@@ -282,10 +282,10 @@ assert_contains "${LOG2}" "identity file ${WORKSPACE}/.alissa-config/bridge-exec
 assert_file "${WORKSPACE}/.alissa-config/agents.yaml" \
   "the resolved agents.yaml is copied to the executor's config dir"
 # start_boot runs under `env -i` with no ALISSA_AGENT_MODEL, so this is the
-# UNSET path: the pin must be the baked default, not an alias.
-assert_eq "$(profile_cmd)" "${BASE_CMD} --model claude-fable-5-1" \
-  "...with the model pin applied (unset -> default claude-fable-5-1), exactly as the daemon role gets it"
-assert_contains "${LOG2}" "reviewer model: claude-fable-5-1 (ALISSA_AGENT_MODEL)" \
+# UNSET path: the pin must be the baked default, the `opus` alias.
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model opus" \
+  "...with the model pin applied (unset -> default opus), exactly as the daemon role gets it"
+assert_contains "${LOG2}" "reviewer model: opus (ALISSA_AGENT_MODEL)" \
   "...and the boot log names the default"
 assert_not_contains "${WORKSPACE}/.alissa-config/agents.yaml" "disable_alissa_code" \
   "...and WITHOUT disable_alissa_code, so job sessions still launch via alissa code"
@@ -323,10 +323,12 @@ model_boot() {  # <log> <ALISSA_AGENT_MODEL assignment>
 }
 
 LOG2B="${TMPROOT}/model-alias.log"
-model_boot "${LOG2B}" ALISSA_AGENT_MODEL=opus
-assert_eq "$(profile_cmd)" "${BASE_CMD} --model opus" \
-  "an explicit alias (opus) is pinned verbatim, not re-defaulted"
-assert_contains "${LOG2B}" "reviewer model: opus (ALISSA_AGENT_MODEL)" \
+# An alias other than the `opus` default, so a value that is silently
+# re-defaulted cannot pass for one that was honoured.
+model_boot "${LOG2B}" ALISSA_AGENT_MODEL=sonnet
+assert_eq "$(profile_cmd)" "${BASE_CMD} --model sonnet" \
+  "an explicit alias (sonnet) is pinned verbatim, not re-defaulted"
+assert_contains "${LOG2B}" "reviewer model: sonnet (ALISSA_AGENT_MODEL)" \
   "...and the log names the explicit value"
 
 LOG2C="${TMPROOT}/model-fullid.log"

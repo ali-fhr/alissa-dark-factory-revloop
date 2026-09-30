@@ -387,9 +387,10 @@ reviewer inherits whatever the persisted `claude /login` account defaults to —
 and on plan-based accounts that default can **silently fall back to a smaller
 model** once a usage threshold is hit. `ALISSA_AGENT_MODEL` makes the model an
 explicit boot-time decision instead of a rebuild-time one. The unset default is
-`claude-fable-5-1` — the latest and most capable generally-available Claude
-model, one tier above Opus — because the reviewer is the pipeline's quality
-gate.
+the `opus` alias (operator decision 2026-09-29, replacing the 2026-09-01
+`claude-fable-5-1` pin): it tracks the latest Opus the base's claude-code knows —
+Claude Opus 5.5 on base 0.2.2+ — and, unlike a full id, can never name a model
+newer than the shipped CLI.
 
 At container boot the entrypoint appends `--model "$ALISSA_AGENT_MODEL"` to the
 claude profile's `command:` and logs the effective command (grep the startup log
@@ -397,7 +398,7 @@ for `effective reviewer command:`).
 
 | `ALISSA_AGENT_MODEL` | reviewer `command:` becomes |
 | --- | --- |
-| *(unset)* → default `claude-fable-5-1` | `claude … --model claude-fable-5-1` |
+| *(unset)* → default `opus` | `claude … --model opus` |
 | `claude-opus-5-5` (any alias or full id) | `claude … --model claude-opus-5-5` |
 | `default` *or* empty | `claude …` (no `--model` — restores account default) |
 
@@ -525,7 +526,7 @@ automatically; locally pass `--build-arg`):
 | `ALISSA_WAITING_DIR` | `/workspace/.waiting` | where the image's `note-waiting.py` hook leaves the `<tmux session>.json` "waiting for input" markers **and** where the daemon reads them (the renderer writes the same value into `waiting_dir`). Read at run time by the hooks; **pass-through** to the daemon. Needs `REVLOOP_VERSION >= 0.31.3` for the daemon half |
 | `ALISSA_SHELL_GUARD` | *(unset — **on**)* | `off` / `0` / `false` / `no` skips the rm guard's `PreToolUse` registration **and removes one a previous boot wrote** into the persisted `$CLAUDE_CONFIG_DIR/settings.json` — the rollback lever, effective on the next boot. Runtime env only, deliberately not a build ARG: a baked `off` would be a fleet-wide rollback nobody can see in a running container |
 | `ALISSA_AGENT_PROFILE` | `claude` | agent the worker launches (must name a profile in `agents.yaml`) |
-| `ALISSA_AGENT_MODEL` | `claude-fable-5-1` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin. The shared fleet (`dark-revloop-shared`) sets `claude-opus-5-5` here, which needs base ≥ `0.2.2` (claude-code ≥ `2.1.280`) |
+| `ALISSA_AGENT_MODEL` | `opus` | model pinned into the reviewer's claude command (see [Pinning the reviewer model](#pinning-the-reviewer-model)); `default` or empty omits the pin. The shared fleet (`dark-revloop-shared`) sets `claude-opus-5-5` here, which needs base ≥ `0.2.2` (claude-code ≥ `2.1.280`) |
 | `ALISSA_ON_MISSING_HUB` | `add` | `add` hub-ifies on demand; `skip` to require a mounted workspace |
 | `ALISSA_WORKER_INTERVAL` | `2` | worker reconcile tick (seconds) |
 | `ALISSA_ENABLE_FIREWALL` | `0` | `1` raises the egress firewall (needs `--cap-add=NET_ADMIN`) |
@@ -1128,7 +1129,7 @@ the rest only mean anything on a service that already set those two.
 | `ALISSA_BRIDGE_POLL_SECONDS` | *(CLI default: 15)* | seconds between queue polls; maps to the CLI's `--interval`; **pass-through** |
 
 The model pin works exactly as it does for the daemon: `ALISSA_AGENT_MODEL`
-(default `claude-fable-5-1`) is rewritten into the `claude` profile's `command:`
+(default `opus`) is rewritten into the `claude` profile's `command:`
 at boot, and job sessions inherit it. The profile deliberately carries **no**
 `disable_alissa_code`, which is what makes the CLI launch it via `alissa code -y
 --handoff claude` — that wrapper is what registers the codeSession and its
