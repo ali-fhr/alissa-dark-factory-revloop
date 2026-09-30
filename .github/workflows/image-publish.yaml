@@ -26,8 +26,11 @@ name: Container Image Publish
 # TRIGGER. Same shape as package-publish.yaml: a pull request CLOSED into main
 # that was MERGED. Nothing runs on unmerged code — the `if:` on the first job
 # gates every job behind it (the second `needs:` it). A failed run (PyPI
-# timeout, contract failure) is retried with the Actions "Re-run jobs" button;
-# the idempotence check makes a re-run after a partial push safe.
+# timeout, contract failure) is retried with the Actions "Re-run jobs" button.
+# A re-run after a partial push is safe because the push order makes the
+# version tag the commit marker: the floating :X.Y / :X are pushed FIRST and
+# :X.Y.Z LAST, so the existence check (keyed on :X.Y.Z) sees a half-pushed
+# release as absent, rebuilds and re-pushes all three, and the tags converge.
 #
 # LEAST PRIVILEGE. `packages: write` is granted to the publishing job ONLY,
 # and GITHUB_TOKEN is the only credential anywhere in this file. The image
@@ -50,12 +53,6 @@ on:
 # Default for every job; the publishing job widens its own to packages: write.
 permissions:
   contents: read
-
-# Two merges close to each other publish in order, never interleaved; a run is
-# never cancelled mid-push.
-concurrency:
-  group: image-publish
-  cancel-in-progress: false
 
 # ---- SEAT-SPECIFIC VALUES ---------------------------------------------------
 # The only lines a sibling seat (orcloop, devloop, genloop) changes when it
@@ -180,6 +177,19 @@ jobs:
     needs: release
     name: Build, contract-test and push the image
     runs-on: ubuntu-latest
+    # Publishes are serialized HERE, on the job, not on the workflow: the
+    # `release` job's PyPI wait (up to PYPI_WAIT_SECONDS) stays outside the
+    # serialized section, and a pull request closed WITHOUT merging never
+    # reaches this job (its skipped `release` skips it), so it cannot take the
+    # pending slot from a real publish. A running publish is never cancelled.
+    # LIMIT: GitHub keeps at most ONE pending run per group — two merges close
+    # together publish in order, but a THIRD that queues while one runs and
+    # one waits cancels the waiting one (it shows as cancelled, not failed).
+    # Recovery: "Re-run jobs" on the cancelled run; the existence check makes
+    # that safe, and the push order below lets it re-point the floating tags.
+    concurrency:
+      group: image-publish
+      cancel-in-progress: false
     # The ONLY job with a write scope, and GITHUB_TOKEN is the only credential.
     permissions:
       contents: read
@@ -286,16 +296,20 @@ jobs:
           REQUIRE_DOCKER: '1'
         run: bash "${CONTRACT_SCRIPT}"
 
-      - name: Push :X.Y.Z, :X.Y and :X
+      - name: Push :X.Y and :X, then :X.Y.Z last
         if: steps.exists.outputs.exists == 'false'
         id: push
+        # :X.Y.Z is pushed LAST: it is the marker the existence check keys on,
+        # so a run that dies after the floating tags but before the version tag
+        # is seen as unpublished on re-run and pushes all three again. Pushing
+        # it first would let that re-run end green with stale floating tags.
         run: |
           set -euo pipefail
           major_minor="${VERSION%.*}"
           major="${VERSION%%.*}"
           docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${major_minor}"
           docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${major}"
-          for tag in "${VERSION}" "${major_minor}" "${major}"; do
+          for tag in "${major_minor}" "${major}" "${VERSION}"; do
             docker push "${IMAGE}:${tag}"
           done
           # Read the digest BACK from the registry — what it serves, not what

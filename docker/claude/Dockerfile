@@ -109,7 +109,10 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c
 # built with `--build-arg REVLOOP_VERSION=<version file>` once PyPI serves
 # that release; on the pull request itself, where the release is not on PyPI
 # yet, check-image.yaml builds from the newest published release instead and
-# says so.
+# says so. A Dockerfile-SOURCE deploy of main (Railway building this file)
+# has no such wait: right after a release merge this pin names a version PyPI
+# may not serve yet, so that build can fail until package-publish lands —
+# redeploy then, or use the published image (README, "On Railway").
 #
 # The FLOOR is separate from the current pin and moves far less often: never
 # below 0.15.0, the first version shipping the `alissa-revloop-ui` console

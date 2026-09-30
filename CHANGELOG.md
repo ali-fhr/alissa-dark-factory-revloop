@@ -43,6 +43,14 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     with the runtime env contract, and the operator lever: pin Railway to
     `ghcr.io/ali-fhr/alissa-dark-factory-revloop:<version>@sha256:<digest>`
     instead of bumping `REVLOOP_VERSION`.
+  - **Publish ordering (review round 1).** `:X.Y` / `:X` are pushed before
+    `:X.Y.Z`, so the version tag the existence check keys on is the commit
+    marker and a re-run after a partial push re-pushes all three; the
+    `concurrency` group sits on the `publish` job (the PyPI wait and unmerged
+    closes stay out of it) and its one-pending-run limit is documented.
+    `check-version-bump.yaml` ignores an empty `image_prefix` instead of
+    matching every path. README *On Railway* and the Dockerfile name the
+    release-merge race of a Dockerfile-source deploy against PyPI.
   - **Operator, after merge:** confirm the first *Container Image Publish*
     run; set the GHCR package `alissa-dark-factory-revloop` to public;
     verify an anonymous manifest pull; switch `dark-revloop-shared` to the

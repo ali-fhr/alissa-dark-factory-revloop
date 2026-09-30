@@ -200,6 +200,20 @@ Two ways to source the service, and the second is the one to move to:
   the default). Switching the existing service is an operator step after the
   first publish; revloop is restart-safe (boot re-enqueues open review requests).
 
+**Release merges race PyPI (Dockerfile source).** The Dockerfile's
+`ARG REVLOOP_VERSION` default equals the version file (see
+[One version axis](#one-version-axis)), so at the moment a release merges,
+`main` pins a version `package-publish.yaml` is still uploading. A
+Dockerfile-source service that auto-deploys `main` starts its build at once, and
+`pip install alissa-tools-github-revloop==<new>` can 404 — a failed deploy, the
+old build keeps running. `image-publish.yaml` waits for PyPI; a Railway build
+does not. Until the service is switched to the image source (which removes the
+race), after a release merge either **redeploy once the *Python Package Publish*
+run is green**, or enable Railway's *Wait for CI* on the service so the deploy
+waits for that run. The first merge under this rule also moves a Dockerfile-source
+build from the old pin (`0.29.0`) to the version file's release — a production
+upgrade of the service, not only a CI change.
+
 Set the config values (`ALISSA_REVIEW_REPOS`, `ALISSA_POLL_INTERVAL`, …) as
 **service variables** — with the Dockerfile source Railway passes any variable
 matching a declared `ARG` into the build, which is why these are ARGs and not
@@ -280,9 +294,18 @@ code. In order:
    `IMAGE_PREBUILT=1` (assert the built image instead of building another) and
    `REVLOOP_VERSION=<version>` (expect that release installed). What is tested is
    byte for byte what is pushed.
-6. **Push** `:X.Y.Z`, `:X.Y`, `:X`, read the digest back from the registry,
-   check the three tags agree, and write the digest and the ready-to-paste pin to
-   the job summary.
+6. **Push** `:X.Y` and `:X` first and `:X.Y.Z` **last**, read the digest back
+   from the registry, check the three tags agree, and write the digest and the
+   ready-to-paste pin to the job summary. The version tag is the marker step 3
+   keys on, so a run that died mid-push is seen as unpublished on *Re-run jobs*
+   and pushes all three again — the floating tags cannot be left stale by a
+   green re-run.
+
+Publishes are serialized (a `concurrency` group on the publishing job, so the
+PyPI wait is outside it and an unmerged close never enters it). GitHub keeps at
+most **one pending** run per group: if a third release merges while one publish
+runs and another waits, the waiting one is **cancelled** (not failed) and its
+version has no image. Recover with *Re-run jobs* on the cancelled run.
 
 `packages: write` is granted to the publishing job only, and `GITHUB_TOKEN` is
 the only credential in the workflow. The image carries no secrets — every
@@ -662,7 +685,7 @@ automatically; locally pass `--build-arg`):
 | ARG / env | default | meaning |
 | --- | --- | --- |
 | `ALISSA_REVIEW_REPOS` | *(required under `static` if no manifest mounted)* | allowlist as one `\|`-separated string (see below). Under `ALISSA_REVIEW_REPOS_SOURCE=bows` it is the optional static *seed* and may be empty — the allowlist then derives from the operator's feed Bodies of Work |
-| `ALISSA_REVIEW_REPOS_SOURCE` | *(unset ⇒ library default `static`)* | `bows` derives the allowlist from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (unioned with `ALISSA_REVIEW_REPOS`), so **enrolling a repo is creating the lane** — see [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Under `bows` an *empty* allowlist watches **nothing** (unlike `static`, where empty means every PR that requests this reviewer). The daemon library also reads this exact variable directly and it wins over the rendered config and the CLI flags; a blank value falls through. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0`, which the default build ships (the Dockerfile `ARG` default is `0.29.0`) — only a deliberate `--build-arg REVLOOP_VERSION` below that makes the entrypoint WARN by name and boot the static path |
+| `ALISSA_REVIEW_REPOS_SOURCE` | *(unset ⇒ library default `static`)* | `bows` derives the allowlist from the operator's active `autodev: <owner>/<repo>` feed Bodies of Work (unioned with `ALISSA_REVIEW_REPOS`), so **enrolling a repo is creating the lane** — see [Enrolling by creating the lane](#enrolling-by-creating-the-lane-alissa_review_repos_sourcebows). Under `bows` an *empty* allowlist watches **nothing** (unlike `static`, where empty means every PR that requests this reviewer). The daemon library also reads this exact variable directly and it wins over the rendered config and the CLI flags; a blank value falls through. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0`, which the default build ships (the Dockerfile `ARG` default equals the version file, `>= 0.29.0`) — only a deliberate `--build-arg REVLOOP_VERSION` below that makes the entrypoint WARN by name and boot the static path |
 | `ALISSA_REVIEW_BOWS_REFRESH_POLLS` | *daemon default* (currently 5) | `bows` only: re-derive the allowlist every N poll passes (≥1), rendered as a JSON number. The enrollment-latency knob. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_BOW_OWNERS` | *(unset ⇒ the token's own actor)* | `bows` only: the Alissa actor **id(s)** whose Bodies of Work may enroll a repo, one `\|`- or `,`-separated string, rendered as a JSON array. Unset, the daemon resolves the authority to its own token's actor at boot (`GET /v1/ping`) and refuses to start if it cannot. Ids only — a username or display name is refused by the daemon at load. **pass-through**; needs `REVLOOP_VERSION >= 0.29.0` |
 | `ALISSA_REVIEW_OPERATORS` | *(empty — no ack honoured)* | logins allowed to re-open a capped PR with `alissa-review: re-enter +N`, one `\|`-separated string; **pass-through** |
@@ -1043,8 +1066,8 @@ already derive their allowlists from those feeds; set
 `ALISSA_REVIEW_REPOS_SOURCE=bows` on **this** service too and the reviewer
 derives its allowlist the same way — so a new lane needs **no
 `ALISSA_REVIEW_REPOS` edit and no redeploy** here either. The mode is honoured
-on a **default build**: `ARG REVLOOP_VERSION` defaults to `0.29.0`, the
-release that landed `repos_source`, so a `docker build docker/claude` with no
+on a **default build**: `ARG REVLOOP_VERSION` defaults to the version file's
+release, at or above `0.29.0` (the release that landed `repos_source`), so a `docker build docker/claude` with no
 `--build-arg` (a self-run fleet, the CI image check, a customer build) boots a
 library that understands the key. Only an image deliberately built with
 `--build-arg REVLOOP_VERSION` below `0.29.0` takes the version-skew
@@ -1082,8 +1105,8 @@ Four things the entrypoint does on this path, each logged by name:
   `wedged:first-run-dialog` classification cover the first boot.
 - **Version-skew guard**: the mode is honoured only when the *installed*
   `alissa-tools-github-revloop` understands `repos_source` — probed from the
-  library at boot, not read off the pin. The default build installs `0.29.0`
-  and passes the probe; the guard exists for an image built with an explicit
+  library at boot, not read off the pin. The default build installs the version
+  file's release (`>= 0.29.0`) and passes the probe; the guard exists for an image built with an explicit
   older `--build-arg REVLOOP_VERSION`. On such a pin the
   entrypoint WARNs (`bows mode landed in revloop 0.29.0 — re-pin ARG
   REVLOOP_VERSION`), the renderer drops the three keys so the old library can

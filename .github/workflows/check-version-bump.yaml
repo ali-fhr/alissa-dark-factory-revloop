@@ -121,6 +121,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          # An include entry without image_prefix guards no image: an empty
+          # prefix must not become a pattern that matches every path.
+          guarded="${DIST_PREFIX}**"
+          if [ -n "${IMAGE_PREFIX}" ]; then
+            guarded="${guarded} or ${IMAGE_PREFIX}**"
+          fi
+
           dist_changed=false
           image_changed=false
           version_changed=false
@@ -131,7 +138,13 @@ jobs:
             case "${file}" in
               "${TEST_PREFIX}"*) ;;
               "${DIST_PREFIX}"*) dist_changed=true ;;
-              "${IMAGE_PREFIX}"*) image_changed=true ;;
+              *)
+                if [ -n "${IMAGE_PREFIX}" ]; then
+                  case "${file}" in
+                    "${IMAGE_PREFIX}"*) image_changed=true ;;
+                  esac
+                fi
+                ;;
             esac
             if [ "${file}" = "${VERSION_FILE}" ]; then
               version_changed=true
@@ -142,7 +155,7 @@ jobs:
             echo "dist_changed=false" >> "${GITHUB_OUTPUT}"
             echo "image_changed=false" >> "${GITHUB_OUTPUT}"
             echo "version_changed=false" >> "${GITHUB_OUTPUT}"
-            echo "::notice::No published files changed under ${DIST_PREFIX} (${TEST_PREFIX} is exempt — nothing under it is packaged) or ${IMAGE_PREFIX} — the version-bump rule does not apply to this pull request."
+            echo "::notice::No published files changed under ${guarded} (${TEST_PREFIX}** is exempt — nothing under it is packaged) — the version-bump rule does not apply to this pull request."
             exit 0
           fi
           echo "dist_changed=${dist_changed}" >> "${GITHUB_OUTPUT}"
@@ -151,7 +164,7 @@ jobs:
           if [ "${version_changed}" = "false" ]; then
             current="$(head -n 1 "${VERSION_FILE}" 2>/dev/null | tr -d '[:space:]' || true)"
             {
-              echo "RULE: a pull request that modifies ${DIST_PREFIX}** or ${IMAGE_PREFIX}** must also change ${VERSION_FILE}"
+              echo "RULE: a pull request that modifies ${guarded} must also change ${VERSION_FILE}"
               echo "      (${TEST_PREFIX}** is exempt — nothing under it is packaged)"
               echo ""
               echo "This pull request changes published files (package: ${dist_changed}; image: ${image_changed})"
@@ -170,10 +183,10 @@ jobs:
               echo "Fix: bump ${VERSION_FILE} to the next unpublished version"
               echo "(the version.py beside it is a derived reader — editing that file alone changes nothing;"
               echo "the Dockerfile's ARG REVLOOP_VERSION default must move with it, see the"
-              echo "dockerfile-pin-sync job), or move the change out of ${DIST_PREFIX}** / ${IMAGE_PREFIX}**"
+              echo "dockerfile-pin-sync job), or move the change out of ${guarded}"
               echo "if this pull request must not release."
             } | tee -a "${GITHUB_STEP_SUMMARY}"
-            echo "::error file=${VERSION_FILE}::Published files under ${DIST_PREFIX} and/or ${IMAGE_PREFIX} changed without bumping ${VERSION_FILE} — the merge-triggered publish would be a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident; the image publish is idempotent the same way, issue #151). Bump the version file."
+            echo "::error file=${VERSION_FILE}::Published files under ${guarded} changed without bumping ${VERSION_FILE} — the merge-triggered publish would be a silent no-op (see the 2026-07-28 develop-daemon #62/#64 incident; the image publish is idempotent the same way, issue #151). Bump the version file."
             exit 1
           fi
 
