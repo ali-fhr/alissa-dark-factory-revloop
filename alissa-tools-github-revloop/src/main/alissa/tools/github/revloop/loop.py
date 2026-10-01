@@ -100,6 +100,8 @@ from .loop_events import (
     auth_rejected_prefix,
     build_emitter,
     credential_identity,
+    round_verdict_kind,
+    round_verdict_prefix,
 )
 from .proc import CommandError
 from .state import State
@@ -2250,6 +2252,10 @@ class ResolvedTask:
     verdicts: int = 0
     verdict: "str | None" = None
     verdict_read: bool = False
+    # The newest envelope whole, when the resolution read a task detail
+    # (issue #155): the session-closed round's `round.verdict` reads its
+    # readiness and contract version off it. None on the bare-count fallback.
+    envelope: "VerdictEnvelope | None" = None
 
     @classmethod
     def from_detail(cls, detail: TaskDetail) -> "ResolvedTask":
@@ -2264,6 +2270,7 @@ class ResolvedTask:
             verdicts=detail.verdicts,
             verdict=detail.verdict,
             verdict_read=True,
+            envelope=detail.envelope,
         )
 
     def newest_verdict(self, alissa: Alissa) -> "str | None":
@@ -2988,6 +2995,12 @@ class ReviewWatcher:
         # decides nothing -- it reports; and it must run on the pass that
         # converges, since a converged PR leaves the search set.
         self._observe_session_readiness(pr, my_reviews, completed)
+        # Same placement, same reason (issue #155): a session-closed round's
+        # verdict of record is recorded for `round.verdict` on the pass that
+        # sees it -- including the pass that converges.
+        self._observe_round_verdict(
+            pr, resolved, my_reviews, completed, task is not None and owed <= native,
+        )
 
         if task is not None and owed > native:
             # Terminal for this pass either way. On a landed post the review
@@ -4289,6 +4302,17 @@ class ReviewWatcher:
         )
         class_term = readiness_class_term(posted_value, posted_class)
         readiness_name = "commit-readiness" if plan else "readiness"
+        # The verdict of record, for the `round.verdict` event (issue #155):
+        # what the posted review CARRIES -- the readiness read back off the
+        # emitted trailer, so an approve whose envelope had no line reads
+        # `operator` with the unclassed marker, exactly what the merge edge
+        # will see -- and nothing on a degraded or request_changes post.
+        self._record_round_verdict(
+            pr, round_, judged, verdict,
+            posted_value if trailer else None, posted_class,
+            envelope.contract_version if envelope is not None else None,
+            task.ref,
+        )
         readiness_note = (
             f" {readiness_name}={readiness_value}{class_term}" if trailer else ""
         )
@@ -4973,6 +4997,96 @@ class ReviewWatcher:
             round_,
             session=session,
             deferred=True,
+        )
+
+    def _record_round_verdict(
+        self,
+        pr: PullRequest,
+        round_: int,
+        head: str,
+        verdict: "str | None",
+        readiness: "str | None",
+        klass: "str | None",
+        contract_version: "int | None",
+        task_ref: "str | None",
+    ) -> None:
+        """Record round `round_`'s verdict of record ONCE, as the ledger row
+        the `round.verdict` loop event derives from (issue #155; see
+        loop_events.round_verdict_kind).
+
+        Once per (PR, round): the first record wins, whichever path wrote it
+        -- the native post records at post time, a session-closed round on
+        the first pass that sees it. Never under `--dry-run`, which shares
+        the production ledger and must leave no durable row behind (see
+        `_warn_identity_drift`).
+        """
+        if self.config.dry_run:
+            return
+        prefix = round_verdict_prefix(round_)
+        if any(
+            row["repo"] == pr.full_name and int(row["number"]) == pr.number
+            for row in self.state.read_pings(kind_prefix=prefix)
+        ):
+            return
+        self.state.record_ping(
+            pr.full_name, pr.number,
+            round_verdict_kind(
+                round_, head, verdict, readiness, klass, contract_version, task_ref,
+            ),
+        )
+
+    def _observe_round_verdict(
+        self,
+        pr: PullRequest,
+        resolved: "ResolvedTask",
+        my_reviews: list[Review],
+        round_: int,
+        closed_by_session: bool,
+    ) -> None:
+        """Record a SESSION-closed round's verdict of record (issue #155).
+
+        The round is `round_` (the envelopes counted on the review task) and
+        it is the session's when its own review exists on GitHub
+        (`closed_by_session`: the native count has caught up with the
+        envelopes) and the daemon neither posted nor abandoned a fallback for
+        it. The verdict, the readiness and the contract version come from the
+        envelope -- the verdict of record (D3) -- with the readiness mapped
+        exactly as the native post maps it (readiness_trailer, read back with
+        the trailer grammar): an approve whose envelope names none is
+        `operator`, unclassed. A request_changes carries no readiness. The
+        head is the session's own newest review's commit, else the head the
+        round was queued against.
+
+        Observation only: nothing is posted or narrated, and a resolution
+        that did not read the envelope (the bare-count fallback) records
+        nothing this pass -- the next pass reads it on the cached path.
+        """
+        envelope = resolved.envelope
+        if (
+            not closed_by_session
+            or resolved.task is None
+            or envelope is None
+            or round_ < 1
+            or envelope.verdict not in (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
+        ):
+            return
+        row = self.state.get_verdict_post(pr.full_name, pr.number, round_)
+        if row is not None and (row["posted_at"] or row["abandoned_at"]):
+            return  # the native path's round: recorded there, or released
+        readiness = klass = None
+        if envelope.verdict == VERDICT_APPROVE:
+            if is_plan_pr(self.config, pr):
+                readiness, _, klass = parse_commit_trailer(commit_readiness_trailer(envelope))
+            else:
+                readiness, _, klass = parse_trailer(readiness_trailer(envelope))
+        newest = my_reviews[-1] if my_reviews else None
+        head = (
+            newest.commit_id if newest is not None and newest.commit_id
+            else self._judged_head(pr, round_)
+        )
+        self._record_round_verdict(
+            pr, round_, head, envelope.verdict, readiness, klass,
+            envelope.contract_version, resolved.task.ref,
         )
 
     def _observe_session_readiness(

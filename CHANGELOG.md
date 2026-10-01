@@ -4,6 +4,37 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.10
+
+- **`round.verdict` is posted for every verdict of record** (issue #155;
+  origin TASK-934123099, implementation TASK-1627052337) — lane L10 of the
+  Studio design `docs/design/loop-operator-surface.md` (§1.3, §6.4). Until
+  now the kind derived only from `verdict_posts`, the native-fallback
+  obligation record, so a fleet whose sessions post their own reviews
+  emitted none. Every `round.verdict` now carries the six data keys
+  `verdict`, `headSha`, `readiness`, `readinessClass`, `contractVersion`
+  and `taskRef` (null where unknown) and is keyed on
+  `(repo, pr, round, head)`.
+  - **The ledger row** is one `round-verdict:` ping per (PR, round)
+    (`loop_events.round_verdict_kind`), written by the native post at post
+    time and, for a round the SESSION closed, on the first pass that sees
+    the envelope and the session's review together. First record wins; a
+    dry run writes none. A native post's `verdict_posts` row and its ping
+    derive ONE event.
+  - **Readiness** is what the approve carries: the native post's trailer
+    read back with the trailer grammar, or the session envelope mapped
+    through the same fail-closed rule — so an approve whose envelope names
+    no readiness is `operator` with `readinessClass: "unclassed"`. A
+    `request_changes` (or an approve the CI gate downgraded) carries null.
+    A plan PR reads its `Commit-Readiness`.
+  - **`contractVersion`** is the envelope's `Contract: v<n>` line
+    (`alissa.parse_contract_version`, on `VerdictEnvelope.contract_version`);
+    null until reviewers record it (design lane L11). `TaskDetail` now carries
+    the newest envelope whole, so the session path costs no extra task read.
+  - `taskRef` is the review task, as on `round.spawned`.
+  - A `verdict_posts` row that predates the verdict column now carries
+    `data.verdict: null` instead of omitting the key.
+
 ## 0.31.9
 
 - **Every reviewer spawn is stamped with the origin task and the repo**

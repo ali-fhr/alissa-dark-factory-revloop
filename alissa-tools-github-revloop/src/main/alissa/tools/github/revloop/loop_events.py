@@ -76,6 +76,21 @@ round) -- `round.spawned`, `round.verdict`, `round.abandoned`,
 `round.capped` and both gates' `checks.held` -- carries `data.kind: "plan"`.
 A code round carries no `kind` at all, so every pre-existing payload is
 unchanged byte for byte.
+
+``round.verdict`` is posted for EVERY verdict of record (issue #155; Studio
+design `loop-operator-surface.md` §1.3, §6.4, lane L10), not only for the
+rounds the daemon closed with its native fallback post. The fact is again a
+ledger ROW: when a round's verdict of record exists -- the daemon's own
+native post landed, or the session's own review closed the round and the
+review task's envelope says what it decided -- the watcher records ONE
+`round-verdict:` ping for that (PR, round) (`round_verdict_kind`), carrying
+the verdict word, the head, the readiness the approve carries and its class,
+the envelope's `Contract: v<n>` and the review task's ref. Every
+`round.verdict` has the same six data keys -- `verdict`, `headSha`,
+`readiness`, `readinessClass`, `contractVersion`, `taskRef` -- null when
+the ledger does not know one, and is keyed on `(repo, pr, round, head)`, so a
+native post's `verdict_posts` row and its ping derive ONE event (the row's,
+with the ping folded in), never two.
 """
 
 from __future__ import annotations
@@ -132,6 +147,30 @@ ROUND_EVENT_KINDS = frozenset({
     "round.spawned", "round.verdict", "round.abandoned", "round.capped",
     "checks.held",
 })
+
+# The verdict-of-record row (issue #155): one per (PR, round),
+# `round-verdict:<round>@<head>:<verdict>:<readiness>:<class>:<contract>:<taskRef>`.
+# The round leads so "already recorded for this round" is one prefix read
+# (`round_verdict_prefix`); every later field is drawn from a closed
+# vocabulary or a ref/sha the daemon itself holds, and is empty when unknown.
+# `class` is the READINESS_CLASSES token, or ROUND_VERDICT_UNCLASSED on an
+# operator judgment that names none -- the marker the merge policy holds on.
+ROUND_VERDICT_PREFIX = "round-verdict:"
+_ROUND_VERDICT_RE = re.compile(
+    r"^round-verdict:(?P<round>\d+)@(?P<head>[^:@]*):(?P<verdict>[a-z_]*):"
+    r"(?P<readiness>[a-z]*):(?P<klass>[a-z-]*):(?P<contract>\d*):"
+    r"(?P<task>[A-Za-z0-9_-]*)$"
+)
+ROUND_VERDICT_UNCLASSED = "unclassed"
+# Each field's own vocabulary, the same character classes the regex above
+# reads back -- so a value the writer accepts is one the reader parses.
+_ROUND_VERDICT_FIELDS = {
+    "head": re.compile(r"^[^:@]*$"),
+    "verdict": re.compile(r"^[a-z_]*$"),
+    "klass": re.compile(r"^[a-z-]*$"),
+    "contract": re.compile(r"^\d*$"),
+    "task": re.compile(r"^[A-Za-z0-9_-]*$"),
+}
 
 # The `auth.rejected` row (issue #146): one per SESSION,
 # `auth-rejected:<session>#<round>:<source>:<matched>:<envName>:<suffix>`.
@@ -216,6 +255,81 @@ def auth_rejected_key(session: str) -> str:
     return f"{SEAT}:auth.rejected:{session}"
 
 
+def round_verdict_prefix(round_: int) -> str:
+    """The prefix every `round-verdict:` row of ONE round starts with -- the
+    watcher's "already recorded" read, scoped to the PR by the row's own
+    (repo, number) columns."""
+    return f"{ROUND_VERDICT_PREFIX}{int(round_)}@"
+
+
+def round_verdict_kind(
+    round_: int,
+    head: "str | None",
+    verdict: "str | None",
+    readiness: "str | None",
+    klass: "str | None",
+    contract_version: "int | None",
+    task_ref: "str | None",
+) -> str:
+    """The ledger kind of ONE verdict of record (see ROUND_VERDICT_PREFIX).
+    A field outside its vocabulary is written empty -- the row is the
+    event's source and its grammar is closed -- and a class on anything but
+    an `operator` readiness is dropped (`auto` never carries one)."""
+    def field(value: object, name: str) -> str:
+        text = "" if value is None else str(value)
+        return text if _ROUND_VERDICT_FIELDS[name].fullmatch(text) else ""
+
+    readiness_text = readiness if readiness in ("auto", "operator") else ""
+    klass_text = (
+        field(klass or ROUND_VERDICT_UNCLASSED, "klass")
+        if readiness_text == "operator" else ""
+    )
+    contract = "" if contract_version is None else field(int(contract_version), "contract")
+    return (
+        f"{round_verdict_prefix(round_)}{field(head, 'head')}:"
+        f"{field(verdict, 'verdict')}:{readiness_text}:{klass_text}:"
+        f"{contract}:{field(task_ref, 'task')}"
+    )
+
+
+def _round_verdicts(
+    pings: "list[dict]",
+) -> "dict[tuple[str, int, int], tuple[int, dict]]":
+    """Every parseable `round-verdict:` row, by (repo, PR, round), as
+    (pinged_at, the parsed fields). One row per round by construction (the
+    watcher checks the prefix first); should two ever exist, the OLDEST --
+    the first record of the round -- wins."""
+    out: "dict[tuple[str, int, int], tuple[int, dict]]" = {}
+    for row in pings:
+        match = _ROUND_VERDICT_RE.match(str(row["kind"]))
+        if match is None:
+            continue
+        key = (row["repo"], int(row["number"]), int(match.group("round")))
+        at = int(row["pinged_at"])
+        if key in out and out[key][0] <= at:
+            continue
+        out[key] = (at, match.groupdict())
+    return out
+
+
+def _verdict_data(
+    verdict: "str | None", head: str, fields: "dict | None"
+) -> "dict[str, Any]":
+    """The six keys every `round.verdict` carries (issue #155), null where
+    the ledger does not know one. `fields` is the round's parsed
+    `round-verdict:` row, or None (a `verdict_posts` row that predates it)."""
+    fields = fields or {}
+    contract = fields.get("contract") or ""
+    return {
+        "verdict": verdict or fields.get("verdict") or None,
+        "headSha": head,
+        "readiness": fields.get("readiness") or None,
+        "readinessClass": fields.get("klass") or None,
+        "contractVersion": int(contract) if contract else None,
+        "taskRef": fields.get("task") or None,
+    }
+
+
 def _ms(seconds: "int | float") -> int:
     """A ledger stamp (epoch seconds) as the API's epoch-ms `at`."""
     return int(seconds) * 1000
@@ -280,31 +394,47 @@ def _spawn_events(rows: "list[dict]") -> "list[tuple[int, dict]]":
     return out
 
 
-def _verdict_events(rows: "list[dict]") -> "list[tuple[int, dict]]":
-    """`round.verdict` for posted rows, `round.abandoned` for abandoned ones.
+def _verdict_events(
+    rows: "list[dict]", pings: "list[dict] | None" = None
+) -> "list[tuple[int, dict]]":
+    """`round.verdict` for every verdict of record, `round.abandoned` for
+    abandoned native posts.
 
-    A row with neither `posted_at` nor `abandoned_at` is an OPEN obligation —
-    the round's native verdict has not landed — and emits nothing until it
-    closes one way or the other. `data.verdict` is omitted (never invented)
-    on rows that predate the ledger's verdict column.
+    Two sources, one event per (repo, PR, round, head) (issue #155):
 
-    COVERAGE BOUND (PR #113 round 2, major): `verdict_posts` is the
-    per-round OBLIGATION record, not the per-round record — a row exists
-    only when the reviewer session defaulted and the daemon posted the
-    native fallback verdict itself. On a fleet whose sessions post every
-    review, these two kinds are expected to be EMPTY; issue #112 maps them
-    to this table and puts the round bookkeeping a session-covering source
-    needs out of scope, so the widening is TASK-1086576582, and the README's
-    telemetry table states the bound where an operator will read it."""
+    * a POSTED `verdict_posts` row -- the daemon's native fallback closed the
+      round -- derives the event at `posted_at`, with the round's
+      `round-verdict:` row folded in for readiness, class, contract and task
+      (a row that predates that ping carries them null) plus the fallback's
+      own `reviewUrl`, `attempts` and `checksHeldMs`;
+    * a `round-verdict:` row with no posted `verdict_posts` row for its round
+      -- the SESSION's own review closed it -- derives the event at the ping's
+      stamp. A round whose native post was ABANDONED derives no verdict from
+      its ping: the round was released, not judged.
+
+    A `verdict_posts` row with neither `posted_at` nor `abandoned_at` is an
+    OPEN obligation -- the round's native verdict has not landed -- and emits
+    nothing until it closes one way or the other. `data.verdict` is null
+    (never invented) on rows that predate the ledger's verdict column.
+
+    COVERAGE BOUND: the session-closed rounds are recorded from the pass that
+    first sees them, so rounds closed before the daemon ran a version with
+    the `round-verdict:` ping (0.31.10) are not backfilled -- the ledger
+    never recorded them."""
+    verdicts = _round_verdicts(pings or [])
     out = []
+    closed: "set[tuple[str, int, int]]" = set()
     for row in rows:
         repo, number = row["repo"], int(row["number"])
         round_, head = int(row["round"]), row["head_sha"] or ""
+        if row.get("posted_at") or row.get("abandoned_at"):
+            closed.add((repo, number, round_))
         if row.get("posted_at"):
             posted = int(row["posted_at"])
-            data: dict[str, Any] = {"headSha": head}
-            if row.get("verdict"):
-                data["verdict"] = row["verdict"]
+            pinged = verdicts.get((repo, number, round_))
+            data: dict[str, Any] = _verdict_data(
+                row.get("verdict"), head, None if pinged is None else pinged[1]
+            )
             if row.get("review_url"):
                 data["reviewUrl"] = row["review_url"]
             data["attempts"] = int(row.get("attempts") or 0)
@@ -331,6 +461,19 @@ def _verdict_events(rows: "list[dict]") -> "list[tuple[int, dict]]":
                 reason=row.get("last_error") or None,
                 data={"headSha": head},
             ))
+    for (repo, number, round_), (at, fields) in verdicts.items():
+        if (repo, number, round_) in closed:
+            continue
+        head = fields["head"]
+        out.append(_event(
+            "round.verdict",
+            at,
+            f"revloop:round.verdict:{repo}:{number}:{round_}:{head}",
+            repo=repo,
+            pr=number,
+            round_=round_,
+            data=_verdict_data(None, head, fields),
+        ))
     return out
 
 
@@ -385,7 +528,9 @@ def _ping_events(
     `kind` is free-form text carrying the episode identity, so it is parsed
     by prefix; kinds this module does not report (`activity-deferred:`,
     `capout:`, `checks-hold:`, `verdict-post-failed:` — each the dedupe of a
-    GitHub-side comment, not a fact of its own) derive nothing.
+    GitHub-side comment, not a fact of its own) derive nothing here, and
+    `round-verdict:` rows derive through `_verdict_events`, which joins them
+    with the native posts of the same round.
 
     A stability event's payload is split by provenance, deliberately
     (PR #113 round 1, minor). `data.headSha` and `data.grantsSeen` come from
@@ -609,9 +754,9 @@ def derive_events(state: State, *, since: int = 0) -> "list[dict]":
 
     stamped: "list[tuple[int, dict]]" = []
     stamped += _spawn_events(spawns)
-    stamped += _verdict_events(state.read_verdict_posts())
-    stamped += _capped_events(state.read_escalations(), spawns)
     pings = state.read_pings()
+    stamped += _verdict_events(state.read_verdict_posts(), pings)
+    stamped += _capped_events(state.read_escalations(), spawns)
     stamped += _ping_events(pings, notices)
     stamped += _spawn_hold_events(state.read_spawn_checks_holds())
     stamped += _grant_events(state.read_grants())

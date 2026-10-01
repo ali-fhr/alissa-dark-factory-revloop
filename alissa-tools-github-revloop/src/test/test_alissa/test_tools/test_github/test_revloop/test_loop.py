@@ -369,6 +369,8 @@ class FakeAlissa:
         # a PLAN PR's native approve carries. None: no line.
         self.commit_readiness = None
         self.commit_readiness_reason = ""
+        # The same envelope's `Contract: v<n>` (issue #155). None: no line.
+        self.contract_version = None
         self.verdict_count = verdict_count  # envelopes on the task = rounds done
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
@@ -452,7 +454,8 @@ class FakeAlissa:
         if found is None:
             return None
         return TaskDetail(
-            task=found, verdicts=self.verdict_count, verdict=self.verdict
+            task=found, verdicts=self.verdict_count, verdict=self.verdict,
+            envelope=self._envelope(),
         )
 
     @property
@@ -485,6 +488,11 @@ class FakeAlissa:
         # The same read as `latest_verdict` in production, so the same call
         # record: a test counting verdict reads sees this one too.
         self.verdict_calls.append(task_ref)
+        return self._envelope()
+
+    def _envelope(self):
+        """The newest envelope both reads return, as production's
+        `_newest_envelope` builds it for `get_task` and `latest_envelope`."""
         if self.verdict is None:
             return None
         # No class here, as in production: the class is a function of the
@@ -497,6 +505,7 @@ class FakeAlissa:
             readiness_reason=self.readiness_reason,
             commit_readiness=self.commit_readiness,
             commit_readiness_reason=self.commit_readiness_reason,
+            contract_version=self.contract_version,
         )
 
     def count_verdicts(self, task_ref):
@@ -12617,3 +12626,264 @@ def test_a_session_plan_approve_with_only_a_merge_trailer_reads_as_missing(confi
     assert "plan close edge will hold it" in warning.getMessage()
     (row,) = readiness_rows(gh)
     assert "commit-readiness=missing" in row
+
+
+# -- round.verdict on every verdict of record (issue #155; operator surface L10)
+#
+# c1: one `round.verdict` per verdict of record, keyed on (repo, pr, round,
+# head), with the six data keys -- whether the SESSION's own review closed the
+# round or the daemon's native fallback did. c2: a native-fallback approve
+# whose envelope names no readiness carries `operator` and the unclassed
+# marker, because that is what the posted trailer says.
+
+ROUND_VERDICT_KEYS = (
+    "verdict", "headSha", "readiness", "readinessClass", "contractVersion", "taskRef",
+)
+
+
+def round_verdicts(w):
+    return [e for e in loop_events.derive_events(w.state) if e["kind"] == "round.verdict"]
+
+
+def verdict_data(event):
+    return {k: event["data"][k] for k in ROUND_VERDICT_KEYS}
+
+
+def test_a_session_closed_approve_posts_one_round_verdict_with_the_six_keys(config):
+    w, gh, al = watcher(
+        config, make_pr(), [session_approve("Merge-Readiness: auto")],
+        verdict=VERDICT_APPROVE, readiness=READINESS_AUTO,
+    )
+    al.contract_version = 2
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    (event,) = round_verdicts(w)
+    assert event["dedupeKey"] == f"revloop:round.verdict:{SLUG}:{NUMBER}:1:abc123"
+    assert event["repo"] == SLUG and event["prNumber"] == NUMBER and event["round"] == 1
+    assert verdict_data(event) == {
+        "verdict": "approve", "headSha": "abc123", "readiness": "auto",
+        "readinessClass": None, "contractVersion": 2, "taskRef": "TASK-500",
+    }
+    assert gh.submitted == [], "observation only: nothing posted"
+
+
+def test_a_session_closed_operator_approve_carries_its_class(config):
+    w, _, _ = watcher(
+        config, make_pr(), [session_approve()],
+        verdict=VERDICT_APPROVE, readiness=READINESS_OPERATOR,
+        readiness_reason="schema-migration: drops users.legacyId",
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["readiness"] == "operator"
+    assert event["data"]["readinessClass"] == "schema-migration"
+    assert event["data"]["contractVersion"] is None, "no Contract: line -> null"
+
+
+def test_a_session_closed_approve_with_no_readiness_fails_closed_unclassed(config):
+    w, _, _ = watcher(
+        config, make_pr(), [session_approve()], verdict=VERDICT_APPROVE,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["readiness"] == "operator"
+    assert event["data"]["readinessClass"] == "unclassed"
+
+
+def test_a_session_closed_request_changes_carries_no_readiness(config):
+    w, _, _ = watcher(
+        config, make_pr(), [review("CHANGES_REQUESTED")],
+        verdict=VERDICT_REQUEST_CHANGES, readiness=READINESS_AUTO,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    (event,) = round_verdicts(w)
+    assert verdict_data(event) == {
+        "verdict": "request_changes", "headSha": "abc123", "readiness": None,
+        "readinessClass": None, "contractVersion": None, "taskRef": "TASK-500",
+    }
+
+
+def test_each_round_posts_its_own_round_verdict_keyed_on_its_head(config):
+    w, gh, al = watcher(
+        config, make_pr(), [review("CHANGES_REQUESTED")],
+        verdict=VERDICT_REQUEST_CHANGES,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    # Round 2 on a pushed head: a new envelope, a new session review.
+    gh._pr = dataclasses.replace(gh._pr, head_sha="def456")
+    gh._reviews.append(session_approve(sha="def456", at="2026-07-18T11:00:00Z"))
+    al.verdict, al.verdict_count, al.readiness = VERDICT_APPROVE, 2, READINESS_AUTO
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    events = round_verdicts(w)
+    assert [(e["round"], e["data"]["headSha"], e["data"]["verdict"]) for e in events] == [
+        (1, "abc123", "request_changes"), (2, "def456", "approve"),
+    ]
+    assert len({e["dedupeKey"] for e in events}) == 2
+
+
+def test_the_native_fallback_posts_exactly_one_round_verdict(config, no_post_grace):
+    w, gh, al = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    al.contract_version = 3
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    (event,) = round_verdicts(w)
+    assert event["dedupeKey"] == f"revloop:round.verdict:{SLUG}:{NUMBER}:1:abc123"
+    assert verdict_data(event) == {
+        "verdict": "approve", "headSha": "abc123", "readiness": "auto",
+        "readinessClass": None, "contractVersion": 3, "taskRef": "TASK-500",
+    }
+    assert event["data"]["reviewUrl"] == gh._reviews[-1].url
+
+
+def test_a_native_fallback_approve_with_no_readiness_is_operator_unclassed(config, no_post_grace):
+    """c2: the envelope named no Merge-Readiness, so the native approve's
+    trailer failed closed -- and the event says what the trailer says."""
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert trailer_of(gh.submitted[0]["body"]).startswith("Merge-Readiness: operator")
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["readiness"] == "operator"
+    assert event["data"]["readinessClass"] == "unclassed"
+
+
+def test_a_native_fallback_request_changes_carries_no_readiness(config, no_post_grace):
+    w, _, _ = envelope_ahead(config, VERDICT_REQUEST_CHANGES, readiness=READINESS_AUTO)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "request_changes"
+    assert event["data"]["readiness"] is None and event["data"]["readinessClass"] is None
+
+
+def test_a_round_awaiting_its_native_post_posts_no_round_verdict(config):
+    """Inside the grace window the round is not closed: no verdict of record
+    exists on GitHub yet, so nothing is recorded."""
+    w, _, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+    assert round_verdicts(w) == []
+    assert w.state.read_pings(kind_prefix=loop_events.ROUND_VERDICT_PREFIX) == []
+
+
+def test_a_session_that_closes_its_round_inside_the_grace_window_is_recorded(config):
+    """The owed row opened, then the session's own review landed: the round
+    is the session's, and the open obligation row must not swallow it."""
+    w, gh, al = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.AWAITING_POST
+
+    gh._reviews.append(session_approve("Merge-Readiness: auto"))
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "approve"
+    assert event["data"]["readiness"] == "auto"
+
+
+def test_an_abandoned_round_posts_no_round_verdict(config):
+    w, gh, _ = watcher(
+        config, make_pr(), [review("CHANGES_REQUESTED")],
+        verdict=VERDICT_REQUEST_CHANGES,
+    )
+    w.state.note_verdict_post_owed(SLUG, NUMBER, 1, "gone")
+    w.state.record_verdict_post_abandoned(SLUG, NUMBER, 1, "head gone")
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert round_verdicts(w) == []
+
+
+def test_dry_run_records_no_round_verdict(config):
+    w, _, _ = watcher(
+        dataclasses.replace(config, dry_run=True), make_pr(), [session_approve()],
+        verdict=VERDICT_APPROVE, readiness=READINESS_AUTO,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert w.state.read_pings(kind_prefix=loop_events.ROUND_VERDICT_PREFIX) == []
+
+
+def test_round_verdict_rows_are_scoped_to_their_own_pr(config):
+    """The once-per-round read is by prefix across the ledger; another PR's
+    round 1 must not stand in for this one's."""
+    w, _, _ = watcher(
+        config, make_pr(), [session_approve()],
+        verdict=VERDICT_APPROVE, readiness=READINESS_AUTO,
+    )
+    w.state.record_ping(
+        "acme/other", 9, loop_events.round_verdict_kind(1, "fff", "approve", "auto", None, None, None),
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert {(e["repo"], e["prNumber"]) for e in round_verdicts(w)} == {
+        ("acme/other", 9), (SLUG, NUMBER),
+    }
+
+
+def test_a_session_closed_plan_approve_reads_the_commit_readiness(config):
+    w, _, al = plan_watcher(
+        config, reviews=[session_approve("Commit-Readiness: auto")],
+        verdict=VERDICT_APPROVE, readiness=READINESS_OPERATOR,
+    )
+    al.commit_readiness = READINESS_AUTO
+    # The plan gate marks the round when it spawns it (issue #148).
+    w.state.record_ping(SLUG, NUMBER, loop_module.plan_round_kind(1))
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["readiness"] == "auto", "Commit-Readiness, not Merge-Readiness"
+    assert event["data"]["kind"] == "plan"
+
+
+# The envelope's `Contract: v<n>` line (issue #155; design §6.4): read off the
+# same evidence item as the verdict, tolerant of the envelope's markdown,
+# None when absent -- never a default v1.
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("- **Contract:** v2", 2),
+        ("**Contract**: v12", 12),
+        ("Contract: 3", 3),
+        ("- **Contract:** vX", None),
+        ("The contract was read.", None),
+    ],
+)
+def test_the_envelope_contract_line_is_parsed(monkeypatch, line, expected):
+    item = envelope("approve", 1, "2026-10-01T10:00:00Z")
+    item["markdownContent"] += f"- **Reviewed head:** abc123\n{line}\n"
+    got = envelope_from(monkeypatch, {"evidence": [item]})
+    assert got.contract_version == expected
+
+
+def test_the_contract_line_is_read_off_the_newest_envelope_only(monkeypatch):
+    old = envelope("request_changes", 1, "2026-10-01T10:00:00Z")
+    old["markdownContent"] += "- **Contract:** v1\n"
+    new = envelope("approve", 2, "2026-10-01T11:00:00Z")
+    got = envelope_from(monkeypatch, {"evidence": [old, new]})
+    assert got.verdict == "approve" and got.contract_version is None
+
+
+def test_get_task_carries_the_newest_envelope_whole(monkeypatch):
+    from alissa.tools.github.revloop import alissa as alissa_mod
+
+    item = envelope("approve", 1, "2026-10-01T10:00:00Z")
+    item["markdownContent"] += "- **Merge-Readiness:** auto\n- **Contract:** v4\n"
+    payload = {"_id": "x", "taskNumber": 500, "title": "Review PR a/b#1 (TASK-1)",
+               "status": "in_progress", "evidence": [item]}
+    monkeypatch.setattr(alissa_mod, "run_json", lambda *a, **k: payload)
+    detail = alissa_mod.Alissa().get_task("TASK-500")
+    assert detail.verdict == "approve"
+    assert detail.envelope == VerdictEnvelope(
+        "approve", readiness="auto", contract_version=4,
+    )
