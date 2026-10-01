@@ -12854,8 +12854,11 @@ def test_a_session_closed_plan_approve_reads_the_commit_readiness(config):
     [
         ("- **Contract:** v2", 2),
         ("**Contract**: v12", 12),
-        ("Contract: 3", 3),
         ("- **Contract:** vX", None),
+        # The `v` is required (PR #156 round 1): prose that opens with
+        # `Contract` and a number must not set the version.
+        ("Contract: 3", None),
+        ("- **Contract** 3 criteria re-checked", None),
         ("The contract was read.", None),
     ],
 )
@@ -12887,3 +12890,208 @@ def test_get_task_carries_the_newest_envelope_whole(monkeypatch):
     assert detail.envelope == VerdictEnvelope(
         "approve", readiness="auto", contract_version=4,
     )
+
+
+# PR #156 round 1: the head a session-closed round is keyed on is the review
+# that round's count reaches, not the newest review; and a native post the CI
+# gate downgraded reports the POSTED verdict, not the envelope's.
+
+def test_a_round_is_keyed_on_its_own_review_not_the_next_rounds(config):
+    """Round 2's session has submitted its review but not yet written its
+    envelope: the count still says round 1, which must keep round 1's head."""
+    w, gh, al = watcher(
+        config, make_pr(sha="def456"),
+        [review("CHANGES_REQUESTED"),
+         session_approve(sha="def456", at="2026-07-18T11:00:00Z")],
+        verdict=VERDICT_REQUEST_CHANGES, verdict_count=1,
+    )
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    (event,) = round_verdicts(w)
+    assert event["round"] == 1
+    assert event["data"]["headSha"] == "abc123"
+    assert event["dedupeKey"] == f"revloop:round.verdict:{SLUG}:{NUMBER}:1:abc123"
+
+
+def test_a_native_approve_the_checks_gate_downgrades_reports_request_changes(
+    config, no_post_grace,
+):
+    w, gh, _ = envelope_ahead(config, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    gh.default_rollup = rollup_of([failing_check()])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "REQUEST_CHANGES"
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "request_changes", "what GitHub holds"
+    assert event["data"]["readiness"] is None
+
+
+def test_a_native_approve_degraded_to_a_comment_reports_comment(
+    config, no_post_grace, monkeypatch,
+):
+    _clock(monkeypatch, start=time.time())
+    impatient = dataclasses.replace(config, checks_wait_seconds=0, checks_spawn_wait_seconds=0)
+    w, gh, _ = envelope_ahead(impatient, VERDICT_APPROVE, readiness=READINESS_AUTO)
+    gh.default_rollup = rollup_of([running_check("test")])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "COMMENT"
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "comment"
+    assert event["data"]["readiness"] is None
+
+
+# PR #156 round 1 [major]: a session's own review consumes the review request,
+# so its PR leaves the review-requested:@me search -- the only feed evaluate()
+# has -- at the moment the round closes. These drive poll_once with a search
+# that drops the PR the way GitHub does, so the recording has to come from the
+# search-independent round-verdict sweep.
+
+def _spawned_round_1(config):
+    """poll_once spawns round 1 off the search; returns the fixtures."""
+    w, gh, al = watcher(config, make_pr(), [], verdict_count=0)
+    w.poll_once()
+    assert len(al.enqueued) == 1, "round 1 spawned"
+    assert w.state.get_spawn(SLUG, NUMBER, 1) is not None
+    return w, gh, al
+
+
+def _session_closes(gh, al, review_, verdict, readiness=None):
+    """The session submits its review (the request is consumed: the search
+    stops returning the PR) and writes its envelope."""
+    gh._reviews.append(review_)
+    gh.requests = []
+    al.verdict, al.verdict_count, al.readiness = verdict, 1, readiness
+
+
+def test_a_terminal_session_approve_is_recorded_after_the_pr_leaves_the_search(config):
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(
+        gh, al, session_approve("Merge-Readiness: auto"), VERDICT_APPROVE, READINESS_AUTO,
+    )
+
+    assert w.poll_once() == [], "nothing in the search: evaluate() never runs"
+
+    (event,) = round_verdicts(w)
+    assert event["round"] == 1
+    assert verdict_data(event) == {
+        "verdict": "approve", "headSha": "abc123", "readiness": "auto",
+        "readinessClass": None, "contractVersion": None, "taskRef": "TASK-500",
+    }
+    assert gh.submitted == [], "observation only"
+
+
+def test_a_request_changes_nobody_re_requests_is_recorded(config):
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(gh, al, review("CHANGES_REQUESTED"), VERDICT_REQUEST_CHANGES)
+
+    w.poll_once()
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "request_changes"
+    assert event["data"]["readiness"] is None
+
+
+def test_the_sweep_reads_a_review_task_validated_after_the_final_approve(config):
+    """The ledger's task ref, not find_review_task: a validated task is no
+    longer open, which the search's filter would drop."""
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(
+        gh, al, session_approve("Merge-Readiness: auto"), VERDICT_APPROVE, READINESS_AUTO,
+    )
+
+    class Validated(FakeTask):
+        status = "validated"
+        is_open = False
+
+    al.task = Validated()
+    w.poll_once()
+
+    (event,) = round_verdicts(w)
+    assert event["data"]["verdict"] == "approve"
+
+
+def test_a_recorded_round_stops_costing_reads(config):
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(
+        gh, al, session_approve("Merge-Readiness: auto"), VERDICT_APPROVE, READINESS_AUTO,
+    )
+    w.poll_once()
+    reads, fetches = len(al.get_calls), gh.pr_fetches
+
+    w.poll_once()
+
+    assert len(round_verdicts(w)) == 1
+    assert (len(al.get_calls), gh.pr_fetches) == (reads, fetches)
+
+
+def test_a_round_whose_envelope_has_not_landed_costs_one_task_read(config):
+    """The review is in, the envelope is not: nothing is recorded, and the
+    sweep stops at the task read -- no GitHub fetch for an undecided round."""
+    w, gh, al = _spawned_round_1(config)
+    gh._reviews.append(session_approve("Merge-Readiness: auto"))
+    gh.requests = []
+    reads, fetches = len(al.get_calls), gh.pr_fetches
+
+    w.poll_once()
+
+    assert round_verdicts(w) == []
+    assert al.get_calls[reads:] == ["TASK-500"]
+    assert gh.pr_fetches == fetches
+
+
+def test_a_pr_still_in_the_search_is_left_to_evaluate(config):
+    """evaluate() records the PRs the search returns; the sweep does not read
+    them a second time."""
+    w, gh, al = _spawned_round_1(config)
+    gh._reviews.append(session_approve("Merge-Readiness: auto"))
+    al.verdict, al.verdict_count, al.readiness = VERDICT_APPROVE, 1, READINESS_AUTO
+
+    w.poll_once()
+
+    assert len(round_verdicts(w)) == 1
+    assert w.sweep_round_verdicts({(SLUG, NUMBER)}) == 0
+
+
+def test_the_sweep_ignores_spawns_outside_its_window(config, monkeypatch):
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(
+        gh, al, session_approve("Merge-Readiness: auto"), VERDICT_APPROVE, READINESS_AUTO,
+    )
+    monkeypatch.setattr(loop_module, "ROUND_VERDICT_SWEEP_WINDOW_SECONDS", -60)
+
+    w.poll_once()
+
+    assert round_verdicts(w) == []
+
+
+def test_the_sweep_records_nothing_in_dry_run(config):
+    w, gh, al = watcher(
+        dataclasses.replace(config, dry_run=True), make_pr(), [session_approve()],
+        verdict=VERDICT_APPROVE, readiness=READINESS_AUTO,
+    )
+    _record(w, make_pr(), 1)
+    gh.requests = []
+
+    assert w.sweep_round_verdicts(set()) == 0
+    assert w.state.read_pings(kind_prefix=loop_events.ROUND_VERDICT_PREFIX) == []
+    assert al.get_calls == []
+
+
+def test_a_failing_sweep_never_takes_down_the_pass(config, caplog):
+    w, gh, al = _spawned_round_1(config)
+    _session_closes(
+        gh, al, session_approve("Merge-Readiness: auto"), VERDICT_APPROVE, READINESS_AUTO,
+    )
+
+    def boom(ref):
+        raise RuntimeError("task read blew up")
+
+    al.get_task = boom
+    with caplog.at_level(logging.WARNING):
+        assert w.poll_once() == []
+
+    assert "round-verdict sweep failed" in caplog.text
+    assert round_verdicts(w) == []

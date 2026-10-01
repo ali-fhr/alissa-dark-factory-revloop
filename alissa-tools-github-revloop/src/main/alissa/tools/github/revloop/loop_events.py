@@ -312,6 +312,12 @@ def _round_verdicts(
     return out
 
 
+def recorded_round_verdicts(pings: "list[dict]") -> "set[tuple[str, int, int]]":
+    """The (repo, PR, round) of every parseable `round-verdict:` row -- the
+    round-verdict sweep's "already recorded" read, one ledger read per pass."""
+    return set(_round_verdicts(pings))
+
+
 def _verdict_data(
     verdict: "str | None", head: str, fields: "dict | None"
 ) -> "dict[str, Any]":
@@ -320,8 +326,12 @@ def _verdict_data(
     `round-verdict:` row, or None (a `verdict_posts` row that predates it)."""
     fields = fields or {}
     contract = fields.get("contract") or ""
+    # The ping's word first: it is what the posted review carries, where the
+    # `verdict_posts` row stores the envelope's (an approve the CI gate
+    # downgraded is not an approve on GitHub -- PR #156 round 1). The row's
+    # word is the fallback for a row that predates the ping.
     return {
-        "verdict": verdict or fields.get("verdict") or None,
+        "verdict": fields.get("verdict") or verdict or None,
         "headSha": head,
         "readiness": fields.get("readiness") or None,
         "readinessClass": fields.get("klass") or None,

@@ -1895,8 +1895,13 @@ class State:
         limit: int | None = None,
         *,
         sessions: "Iterable[str] | None" = None,
+        since: "float | None" = None,
     ) -> list[dict]:
         """Spawn rows (one per enqueued reviewer round), newest first.
+
+        `since` keeps only rows spawned at or after that epoch second -- the
+        round-verdict sweep's window (loop.sweep_round_verdicts), which wants
+        the recent rounds and not the whole table every poll.
 
         `sessions` restricts the read to those session names. That is the
         bound the console's session->round pairing wants, and a recency bound
@@ -1913,12 +1918,18 @@ class State:
             "FROM spawns"
         )
         params: tuple = ()
+        where: list[str] = []
         if sessions is not None:
             names = tuple(sessions)
             if not names:
                 return []
-            sql += " WHERE session IN (%s)" % ",".join("?" * len(names))
+            where.append("session IN (%s)" % ",".join("?" * len(names)))
             params = names
+        if since is not None:
+            where.append("spawned_at >= ?")
+            params += (int(since),)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY spawned_at DESC, number DESC, round DESC"
         return self._read_rows(sql, limit, params)
 

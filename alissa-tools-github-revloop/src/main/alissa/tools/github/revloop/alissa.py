@@ -532,12 +532,15 @@ def parse_commit_readiness(blob: object) -> "tuple[str | None, str, str | None]"
 # the task at round start and records `**Contract:** v<n>` under the reviewed
 # head. The same markdown tolerance as the readiness lines -- an optional
 # bullet, optional bold around the label with the colon inside or outside --
-# and an optional `v`. Absent (every envelope written before L11 ships) reads
-# as None, never as v1: the event's key is then null, the design's "absent"
-# case, rather than a version nobody recorded.
+# but the `v` is REQUIRED: L11 has not shipped the line yet, and without it any
+# prose that opens with `Contract` and a number (`Contract 3 criteria
+# re-checked`) would set the version (PR #156 round 1). Absent (every
+# envelope written before L11 ships) reads as None, never as v1: the event's
+# key is then null, the design's "absent" case, rather than a version nobody
+# recorded.
 _CONTRACT_RE = re.compile(
     r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*Contract[ \t]*:?[ \t]*(?:\*\*)?"
-    r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*v?(\d{1,9})\b",
+    r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*v(\d{1,9})\b",
     re.MULTILINE,
 )
 

@@ -100,8 +100,10 @@ from .loop_events import (
     auth_rejected_prefix,
     build_emitter,
     credential_identity,
+    recorded_round_verdicts,
     round_verdict_kind,
     round_verdict_prefix,
+    ROUND_VERDICT_PREFIX,
 )
 from .proc import CommandError
 from .state import State
@@ -137,6 +139,22 @@ STALLED_DEFER_MULTIPLE = 2
 # genuinely missing post (the studio #298 shape) still heals within one cycle
 # of the operator noticing nothing.
 VERDICT_POST_GRACE_SECONDS = 5 * 60
+
+# The `round.verdict` word for each native post event (issue #155): the
+# verdict of record is what GitHub holds, so an approve the CI gate turned into
+# a REQUEST_CHANGES or a COMMENT reports as that (PR #156 round 1).
+_POSTED_VERDICT = {
+    EVENT_APPROVE: VERDICT_APPROVE,
+    EVENT_REQUEST_CHANGES: VERDICT_REQUEST_CHANGES,
+    EVENT_COMMENT: "comment",
+}
+
+# How far back the round-verdict sweep looks in the spawn ledger
+# (`sweep_round_verdicts`). A session-closed round is recorded within a poll
+# or two of its envelope landing; the window bounds what a round whose
+# verdict NEVER lands (a PR closed mid-round, a session that died with the
+# request already withdrawn) costs: one task read per pass, for a day.
+ROUND_VERDICT_SWEEP_WINDOW_SECONDS = 24 * 60 * 60
 
 # Failed post attempts before the daemon stops treating it as transient and
 # pages a human. It keeps retrying afterwards -- the round stays OPEN either
@@ -4306,9 +4324,13 @@ class ReviewWatcher:
         # what the posted review CARRIES -- the readiness read back off the
         # emitted trailer, so an approve whose envelope had no line reads
         # `operator` with the unclassed marker, exactly what the merge edge
-        # will see -- and nothing on a degraded or request_changes post.
+        # will see -- and nothing on a degraded or request_changes post. The
+        # verdict word is the POSTED event's, not the envelope's: an approve
+        # the CI gate downgraded is a `request_changes` or `comment` on
+        # GitHub, and an event saying `approve` would count an approval the
+        # merge edge never acts on (PR #156 round 1).
         self._record_round_verdict(
-            pr, round_, judged, verdict,
+            pr, round_, judged, _POSTED_VERDICT.get(event, verdict),
             posted_value if trailer else None, posted_class,
             envelope.contract_version if envelope is not None else None,
             task.ref,
@@ -5009,7 +5031,7 @@ class ReviewWatcher:
         klass: "str | None",
         contract_version: "int | None",
         task_ref: "str | None",
-    ) -> None:
+    ) -> bool:
         """Record round `round_`'s verdict of record ONCE, as the ledger row
         the `round.verdict` loop event derives from (issue #155; see
         loop_events.round_verdict_kind).
@@ -5018,22 +5040,23 @@ class ReviewWatcher:
         -- the native post records at post time, a session-closed round on
         the first pass that sees it. Never under `--dry-run`, which shares
         the production ledger and must leave no durable row behind (see
-        `_warn_identity_drift`).
+        `_warn_identity_drift`). True when THIS call wrote the row.
         """
         if self.config.dry_run:
-            return
+            return False
         prefix = round_verdict_prefix(round_)
         if any(
             row["repo"] == pr.full_name and int(row["number"]) == pr.number
             for row in self.state.read_pings(kind_prefix=prefix)
         ):
-            return
+            return False
         self.state.record_ping(
             pr.full_name, pr.number,
             round_verdict_kind(
                 round_, head, verdict, readiness, klass, contract_version, task_ref,
             ),
         )
+        return True
 
     def _observe_round_verdict(
         self,
@@ -5042,8 +5065,9 @@ class ReviewWatcher:
         my_reviews: list[Review],
         round_: int,
         closed_by_session: bool,
-    ) -> None:
+    ) -> bool:
         """Record a SESSION-closed round's verdict of record (issue #155).
+        True when this call recorded it.
 
         The round is `round_` (the envelopes counted on the review task) and
         it is the session's when its own review exists on GitHub
@@ -5055,7 +5079,14 @@ class ReviewWatcher:
         the trailer grammar): an approve whose envelope names none is
         `operator`, unclassed. A request_changes carries no readiness. The
         head is the session's own newest review's commit, else the head the
-        round was queued against.
+        round was queued against (`_round_review_head`).
+
+        Reached from two places, because a session's own review consumes the
+        review request and so drops its PR out of the search that feeds
+        evaluate() at exactly the moment its round closes: evaluate() for a
+        PR still in the search, and `sweep_round_verdicts` -- search-
+        independent, off the spawn ledger -- for every other one (PR #156
+        round 1). Once per round either way (`_record_round_verdict`).
 
         Observation only: nothing is posted or narrated, and a resolution
         that did not read the envelope (the bare-count fallback) records
@@ -5069,25 +5100,128 @@ class ReviewWatcher:
             or round_ < 1
             or envelope.verdict not in (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
         ):
-            return
+            return False
         row = self.state.get_verdict_post(pr.full_name, pr.number, round_)
         if row is not None and (row["posted_at"] or row["abandoned_at"]):
-            return  # the native path's round: recorded there, or released
+            return False  # the native path's round: recorded there, or released
         readiness = klass = None
         if envelope.verdict == VERDICT_APPROVE:
             if is_plan_pr(self.config, pr):
                 readiness, _, klass = parse_commit_trailer(commit_readiness_trailer(envelope))
             else:
                 readiness, _, klass = parse_trailer(readiness_trailer(envelope))
-        newest = my_reviews[-1] if my_reviews else None
-        head = (
-            newest.commit_id if newest is not None and newest.commit_id
-            else self._judged_head(pr, round_)
-        )
-        self._record_round_verdict(
+        head = self._round_review_head(pr, my_reviews, round_)
+        return self._record_round_verdict(
             pr, round_, head, envelope.verdict, readiness, klass,
             envelope.contract_version, resolved.task.ref,
         )
+
+    def _round_review_head(
+        self, pr: PullRequest, my_reviews: list[Review], round_: int
+    ) -> str:
+        """The commit round `round_`'s session review judged.
+
+        NOT simply the newest review (PR #156 round 1): on the first pass after
+        an upgrade, and on any pass where round k+1's session has submitted its
+        review but not yet written its envelope, the envelope count still says
+        k while the newest review is k+1's -- and round k would be keyed on
+        k+1's commit. Nor "the newest review on the queued head": a round
+        re-requested without a push shares its queued head with the round
+        before it, whose review is then the match.
+
+        So it is the review `countable_rounds` counts as this round's -- the
+        first one whose prefix of the list reaches it -- discounting the
+        abandoned rounds, which hold an envelope and no review. When no prefix
+        reaches it (the reviews list lags), the head the round was queued
+        against (`_judged_head`).
+        """
+        target = round_ - self.state.abandoned_rounds(pr.full_name, pr.number)
+        for i, rev in enumerate(my_reviews if target >= 1 else []):
+            if countable_rounds(my_reviews[:i + 1]) >= target:
+                if rev.commit_id:
+                    return rev.commit_id
+                break
+        return self._judged_head(pr, round_)
+
+    def sweep_round_verdicts(self, searched: "set[tuple[str, int]]") -> int:
+        """Record the session-closed rounds the search can no longer see.
+        Runs every poll, after the per-PR evaluate loop. Returns the number of
+        rounds recorded this pass.
+
+        evaluate() is fed by the review-requested:@me search, and a reviewer
+        session's own review CLEARS that request -- so a round the session
+        closed leaves the search at the moment its verdict lands. Recording it
+        only from evaluate() deferred round k to the re-request of round k+1
+        and never recorded a terminal round at all: the final approve, a
+        request_changes nobody re-requests, a cap-out (PR #156 round 1, the
+        same trap the reap sweep's docstring names). This sweep is search-
+        independent for the same reason the reap sweep is: it starts from the
+        spawn ledger, which cannot lose a round.
+
+        Candidates: the NEWEST spawn row of each PR, spawned inside
+        ROUND_VERDICT_SWEEP_WINDOW_SECONDS, whose round has no `round-verdict:`
+        row yet, and whose PR this pass's search did not return (evaluate()
+        already looked at those). Older rounds of a PR were recorded by the
+        evaluate() pass that spawned their successor, which the search fed.
+
+        Cost, per candidate per pass: one task read by the ledger's task ref --
+        the reap sweep's choice, for its reason: find_review_task's open-status
+        filter loses a review task validated right after the final approve,
+        which is precisely the round this sweep exists for. Only when that read
+        shows the round's envelope landed does the sweep fetch the PR and its
+        reviews (two calls), and then the round is recorded and stops being a
+        candidate. A spawn row with no task ref (a round 1 recorded before the
+        review task existed) falls back to the cached PR -> task mapping, and
+        is skipped when there is none.
+
+        Not gated on `watches`: the round was spawned by this daemon, and a
+        repo dropping out of the allowlist after its final approve must not
+        lose the verdict. Never in `--dry-run` (nothing would be recorded).
+        Best-effort: a failed read skips the candidate until the next pass.
+        """
+        if self.config.dry_run:
+            return 0
+        since = time.time() - ROUND_VERDICT_SWEEP_WINDOW_SECONDS
+        newest: dict[tuple[str, int], dict] = {}
+        for row in self.state.read_spawns(since=since):
+            key = (row["repo"], int(row["number"]))
+            if key not in newest or int(row["round"]) > int(newest[key]["round"]):
+                newest[key] = row
+        recorded = recorded_round_verdicts(
+            self.state.read_pings(kind_prefix=ROUND_VERDICT_PREFIX)
+        )
+        count = 0
+        for (full_name, number), row in sorted(newest.items()):
+            round_ = int(row["round"])
+            if (full_name, number) in searched or (full_name, number, round_) in recorded:
+                continue
+            ref = row["task_ref"] or self.state.review_task(full_name, number)
+            if not ref or "/" not in full_name:
+                continue
+            owner, repo = full_name.split("/", 1)
+            try:
+                detail = self.alissa.get_task(ref)
+                if detail is None or detail.verdicts < round_:
+                    continue  # unreadable, or the round's envelope has not landed
+                pr = self.github.pull_request(owner, repo, number)
+                my_reviews = self.github.my_reviews(owner, repo, number)
+            except RateLimited:
+                raise
+            except CommandError as exc:
+                log.debug("round-verdict sweep: %s#%d skipped: %s", full_name, number, exc)
+                continue
+            resolved = ResolvedTask.from_detail(detail)
+            owed = resolved.verdicts - self.state.abandoned_rounds(full_name, number)
+            if self._observe_round_verdict(
+                pr, resolved, my_reviews, resolved.verdicts,
+                owed <= countable_rounds(my_reviews),
+            ):
+                log.info(
+                    "%s round %d: session-closed verdict recorded off-search",
+                    pr.slug, resolved.verdicts,
+                )
+                count += 1
+        return count
 
     def _observe_session_readiness(
         self, pr: PullRequest, my_reviews: list[Review], round_: int
@@ -7377,6 +7511,19 @@ class ReviewWatcher:
             results.append((slug, decision))
 
         self._note_deferrals(results)
+
+        # AFTER the evaluate loop (which records the rounds of every PR the
+        # search returned) and BEFORE the loop-events push, so a round the
+        # sweep records this pass is emitted this pass. Search-independent on
+        # purpose: see sweep_round_verdicts. Telemetry, so never fatal to the
+        # pass -- the same promise _emit_loop_events keeps -- except for the
+        # rate limit, whose backoff belongs to run_forever.
+        try:
+            self.sweep_round_verdicts(live_keys)
+        except RateLimited:
+            raise
+        except Exception:
+            log.warning("round-verdict sweep failed; retried next pass", exc_info=True)
 
         # Persist one poll_snapshots row per pass, built entirely from the
         # Decision list already in hand plus the reap count -- no new GitHub
