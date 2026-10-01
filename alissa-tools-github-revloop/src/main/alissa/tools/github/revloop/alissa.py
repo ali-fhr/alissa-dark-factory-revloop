@@ -219,6 +219,30 @@ def _advertises(helptext: str, flag: str) -> bool:
     ) is not None
 
 
+# The two spawn stamps of the Studio loop cost meter (studio.alissa.app
+# docs/design/loop-cost-meter.md §2.3, §2.4, lane L4; issue #153, the port of
+# devloop's issue #149): `--task` names the ORIGIN task the reviewer serves and
+# `--repo` the canonical lowercase `owner/name`, so the session row carries
+# `focusTaskId` and `repo` from its first second. The reviewer's skill then
+# re-anchors `current_task` on its review task and that write wins the focus;
+# the origin keeps its `code_session` evidence row and the meter resolves the
+# rest at read time (§2.4).
+QUEUE_ADD_TASK_FLAG = "--task"
+QUEUE_ADD_REPO_FLAG = "--repo"
+
+
+def queue_add_accepts_stamps(helptext: str) -> bool:
+    """Whether `alissa tmux queue add --help` lists BOTH `--task` and `--repo`.
+
+    Both or neither: the CLI this daemon shipped against (0.3.0) already lists
+    `-t, --task <ref>`, but with the older meaning -- link a queue item for
+    shell write-back -- and has no `--repo`; that CLI is not the stamp-aware
+    one, so it gets neither flag.
+    """
+    text = helptext or ""
+    return _advertises(text, QUEUE_ADD_TASK_FLAG) and _advertises(text, QUEUE_ADD_REPO_FLAG)
+
+
 # CR6 verdict envelope outcomes.
 VERDICT_APPROVE = "approve"
 VERDICT_REQUEST_CHANGES = "request_changes"
@@ -879,6 +903,9 @@ class Alissa:
         # One diagnostic per client for a status filter that could not be sent
         # (see `_warn_status_filter_dropped`); this path runs every poll pass.
         self._status_filter_warned = False
+        # The spawn-stamp probe's answer, memoized like `_task_list_flags`;
+        # None = not probed yet (or the last probe could not run).
+        self._spawn_stamps_accepted: "bool | None" = None
 
     @property
     def task_list_bow_id(self) -> "str | None":
@@ -1385,6 +1412,37 @@ class Alissa:
                     break
         return count
 
+    # -- the `alissa tmux queue add` spawn-stamp probe -----------------------
+
+    def accepts_spawn_stamps(self) -> bool:
+        """Whether the installed `queue add` takes `--task` AND `--repo`.
+
+        Read off the CLI's own `--help`, for the reasons `probe_task_list`
+        gives. An answer, yes or no, is memoized for the process; a probe that
+        cannot run at all reads as "no" for THIS spawn and is not memoized, so
+        a transient failure never switches the stamps off until a restart.
+        """
+        if self._spawn_stamps_accepted is not None:
+            return self._spawn_stamps_accepted
+        try:
+            helptext = run(["alissa", "tmux", "queue", "add", "--help"], timeout=20)
+        except CommandError as exc:
+            log.warning(
+                "could not probe `alissa tmux queue add --help` (%s) — this "
+                "reviewer is enqueued without --task/--repo", exc,
+            )
+            return False
+        except Exception:  # pragma: no cover - defence in depth
+            log.exception("unexpected failure probing `alissa tmux queue add --help`")
+            return False
+        self._spawn_stamps_accepted = queue_add_accepts_stamps(helptext)
+        if not self._spawn_stamps_accepted:
+            log.info(
+                "the installed alissa CLI does not accept `queue add --task/--repo`; "
+                "reviewer spawns go unstamped"
+            )
+        return self._spawn_stamps_accepted
+
     def enqueue_reviewer(
         self,
         *,
@@ -1393,8 +1451,18 @@ class Alissa:
         cwd: Path,
         agent: str,
         task_ref: str | None,
+        repo: str | None = None,
         dry_run: bool = False,
     ) -> None:
+        """Enqueue one reviewer session.
+
+        `task_ref` is the ORIGIN task (`TASK-<n>`) the round serves -- not the
+        review task, which the directive names and the ledger records -- and
+        `repo` the PR's `owner/name`, lowercased here. They are passed as
+        `--task` / `--repo` only when the installed CLI accepts both (see
+        `accepts_spawn_stamps`); an older CLI gets neither, so the enqueue
+        never fails for want of a stamp.
+        """
         argv = [
             "alissa",
             "tmux",
@@ -1406,14 +1474,21 @@ class Alissa:
             "--cwd",
             str(cwd),
         ]
+        stamps: "list[str]" = []
         if task_ref:
-            argv += ["--task", task_ref]
-        argv.append(directive)
+            stamps += [QUEUE_ADD_TASK_FLAG, task_ref]
+        if repo:
+            stamps += [QUEUE_ADD_REPO_FLAG, repo.lower()]
 
         if dry_run:
-            log.info("[dry-run] would enqueue: %s", " ".join(argv[:-1]) + " <directive>")
+            # Runs nothing, the probe included: the line shows the stamps a
+            # stamp-aware CLI would receive.
+            log.info("[dry-run] would enqueue: %s", " ".join(argv + stamps) + " <directive>")
             return
 
+        if stamps and self.accepts_spawn_stamps():
+            argv += stamps
+        argv.append(directive)
         run(argv, timeout=60)
 
         # Reviewers are one-shot per round (CR3): once the session finishes and is

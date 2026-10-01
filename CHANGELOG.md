@@ -4,6 +4,33 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.9
+
+- **Every reviewer spawn is stamped with the origin task and the repo**
+  (issue #153; origin TASK-98337484, implementation TASK-1158257469) — the
+  revloop part of the Studio loop cost meter's lane L4
+  (`docs/design/loop-cost-meter.md` §2.3, §2.4), mirroring devloop's merged
+  lane (devloop issue #149, PR #150). The enqueue is `alissa tmux queue add …
+  --task TASK-<origin> --repo <owner/name>` (repo lowercased), so the Studio
+  session row carries the origin as `focusTask` and the repo from its first
+  second; the reviewer's own `current_task` write of its review task may
+  follow and win, which the meter already resolves.
+  - **`Alissa.enqueue_reviewer`** gains `repo`, and its `task_ref` now means
+    the ORIGIN (it used to carry the review task as `--task`, unconditionally).
+    The flags go only on a CLI whose `queue add --help` lists BOTH
+    (`accepts_spawn_stamps`: probed once per process and memoized; a probe
+    that cannot run is not memoized and that spawn goes unstamped). A CLI
+    with the older `--task` but no `--repo` — 0.3.0 — gets neither. A dry run
+    runs nothing, the probe included, and logs the stamps it would pass.
+  - **Origin** (`loop.review_origin_task_ref`): the review task's CR2 title
+    (`Review PR <org>/<repo>#<n> (TASK-<origin>)`) first, then the PR body's
+    `Alissa-Task:` or `Origin [Alissa] task:` line — never the
+    `Implementation task:`. None found (a plan PR, a bare body): `--repo` alone.
+  - Ledger rows (the spawn row keeps the review task) and the `round.*` loop
+    events derived from them are unchanged.
+  - `ARG REVLOOP_VERSION` follows the version file (the `dockerfile-pin-sync`
+    rule since 0.31.8).
+
 ## 0.31.8
 
 - **The seat image is published to GHCR on every release** (issue #151;

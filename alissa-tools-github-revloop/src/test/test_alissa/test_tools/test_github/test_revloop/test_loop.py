@@ -675,7 +675,9 @@ def test_pending_request_with_no_prior_review_spawns_round_1(config):
     assert d.action is Action.SPAWNED
     assert d.round == 1
     assert al.enqueued[0]["session"].startswith("review-widgets-pr7-r1-")
-    assert al.enqueued[0]["task_ref"] == "TASK-500"
+    # The enqueue is stamped with the ORIGIN (issue #153); the review task
+    # itself is what the directive names.
+    assert al.enqueued[0]["task_ref"] == "TASK-499"
     directive = al.enqueued[0]["directive"]
     assert "TASK-500" in directive
     assert "NEVER push commits" in directive
@@ -1119,6 +1121,60 @@ def test_missing_review_task_spawns_with_pr_url_by_default(config):
     assert d.action is Action.SPAWNED
     assert al.enqueued[0]["task_ref"] is None
     assert "https://github.com/acme/widgets/pull/7" in al.enqueued[0]["directive"]
+
+
+# -- spawn stamps: the origin task and the repo (issue #153) ----------------
+
+
+def test_the_reviewer_spawn_is_stamped_with_the_origin_and_the_repo(config):
+    """The origin comes off the review task's CR2 title; the ledger row keeps
+    the REVIEW task, so the rows and the `round.spawned` event derived from
+    them (`data.taskRef`) are what they were."""
+    w, _, al = watcher(config, make_pr(body="Alissa-Task: TASK-111"), [])
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    (kwargs,) = al.enqueued
+    assert kwargs["task_ref"] == "TASK-499", "the title wins over the body"
+    assert kwargs["repo"] == SLUG
+    assert w.state.get_spawn(SLUG, NUMBER, 1)["task_ref"] == "TASK-500"
+
+
+def test_with_no_review_task_the_origin_comes_from_the_pr_body(config):
+    body = "Closes #3\n\n- Origin Alissa task: TASK-4242\n- Implementation task: TASK-4243\n"
+    w, _, al = watcher(config, make_pr(body=body), [], task=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert al.enqueued[0]["task_ref"] == "TASK-4242"
+    assert al.enqueued[0]["repo"] == SLUG
+    assert w.state.get_spawn(SLUG, NUMBER, 1)["task_ref"] is None
+
+
+def test_with_no_origin_anywhere_only_the_repo_is_stamped(config):
+    body = "- Implementation task: TASK-4243\n"
+    w, _, al = watcher(config, make_pr(body=body), [], task=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert al.enqueued[0]["task_ref"] is None, "never the implementation task"
+    assert al.enqueued[0]["repo"] == SLUG
+
+
+@pytest.mark.parametrize("title, body, expected", [
+    ("Review PR acme/widgets#7 (TASK-499)", "", "TASK-499"),
+    ("Review PR acme/widgets#7 ( task-499 )", "", "TASK-499"),
+    ("Review PR acme/widgets#7", "Alissa-Task: TASK-12", "TASK-12"),
+    ("Review plan acme/plans#3 (2026-09-01-cost-meter)", "", None),
+    (None, "**Alissa-Task:** `TASK-12`", "TASK-12"),
+    (None, "Origin task: TASK-13", "TASK-13"),
+    (None, "Origin Alissa task: TASK-14\nAlissa-Task: TASK-15", "TASK-15"),
+    (None, "Implementation task: TASK-16", None),
+    (None, "", None),
+])
+def test_review_origin_task_ref(title, body, expected):
+    task = None
+    if title is not None:
+        task = FakeTask()
+        task.title = title
+    assert loop_module.review_origin_task_ref(task, make_pr(body=body)) == expected
 
 
 def test_missing_review_task_skips_when_configured(config):
