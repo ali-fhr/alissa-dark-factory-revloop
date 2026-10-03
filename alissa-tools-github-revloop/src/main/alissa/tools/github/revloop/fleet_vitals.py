@@ -41,6 +41,15 @@ Design rules, all load-bearing:
   user has not activated the loop app) warns ONCE per boot with the activate
   URL and logs at DEBUG after, because it is a fixed condition the operator
   resolves out of band, and the next pass after activation lands on its own.
+
+Seat parking (issue #157, studio.alissa.app seat-parking design §2.2/§2.4)
+adds the `idle` block -- the seat's own idle verdict (`parking.idle_block`),
+with `drainedAt` while a drain holds -- so Studio can re-check a park against
+the seat's OWN snapshot. The console's drain pushes one snapshot before it
+answers (`FleetVitalsPusher.push_now`). Until Studio's schema carries the
+block (the design's lane L3), a strict 400 naming `idle` makes the pusher
+resend without it and leave it out for IDLE_REPROBE_S: the vitals the Factory
+already renders never go dark over a field nobody reads yet.
 """
 
 from __future__ import annotations
@@ -51,6 +60,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import parking
 from .alissa import parse_session_name, session_repo_slug
 from .alissa_client import (
     NOT_ACTIVATED,
@@ -86,6 +96,12 @@ DURATION_POINTS = 60
 VITALS_PUSHED = "pushed"
 VITALS_SKIPPED = "skipped"
 VITALS_FAILED = "failed"
+
+# How long a snapshot leaves the `idle` block out after Studio refused it as
+# an unknown key (a schema that predates seat parking), before it offers the
+# block again. An hour: one extra POST an hour against an old Studio, and a
+# newly deployed one starts receiving the block within the hour.
+IDLE_REPROBE_S = 3600.0
 
 # The operator's lever per inbox kind, in the Factory's `lever` slot. The
 # cap-out and the stability hold are both lifted by the same re-entry ack;
@@ -252,6 +268,11 @@ def build_snapshot(
     optional field degrades to null on its own -- a broken tmux does not
     blank the memory split, and vice versa -- and `kpis` is always null (an
     orcloop-only section).
+
+    `idle` (seat parking, issue #157) is the seat's idle block: owed and
+    timers from the newest poll snapshot, live / managed from the SAME roster
+    read as `sessions`, queued from the alissa queue, and `drainedAt` while
+    a drain holds.
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -277,6 +298,12 @@ def build_snapshot(
         )
         session_list = [_session_row(r, repos) for r in ordered[:LIST_CAP]]
     inbox = [_inbox_row(item) for item in sources.inbox()["live"][:LIST_CAP]]
+    live, managed = parking.roster_counts(rows)
+    idle = parking.idle_block(
+        snaps[0] if snaps else None,
+        live=live, managed=managed, queued=sources.queued(),
+        drain=sources.drain(), now=stamp,
+    )
     return {
         "schemaVersion": SCHEMA_VERSION,
         "seat": SEAT,
@@ -297,6 +324,7 @@ def build_snapshot(
         "queueDepth": _int_or_none(queue_depth),
         "kpis": None,
         "inbox": inbox,
+        "idle": idle,
     }
 
 
@@ -366,6 +394,9 @@ class FleetVitalsPusher:
         # every later refusal is a DEBUG line. The push itself is still
         # attempted every pass -- the pass after activation lands on its own.
         self._not_activated_warned = False
+        # Until when the `idle` block is left out (Studio refused it as an
+        # unknown key); 0 = offer it.
+        self._idle_refused_until = 0.0
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
@@ -400,9 +431,31 @@ class FleetVitalsPusher:
                 type(exc).__name__, exc,
             )
             return VITALS_FAILED
+        if self._clock() < self._idle_refused_until:
+            snapshot.pop("idle", None)
         if self.config.dry_run:
             log.info("[dry-run] would push fleet vitals (%s)", describe(snapshot))
             return VITALS_SKIPPED
+        return self._post(snapshot)
+
+    def push_now(self) -> str:
+        """The console's out-of-pass push (the drain handshake, issue #157):
+        the same snapshot, its `heartbeatAt` the daemon's LAST completed pass
+        -- the console completes none of its own, and stamping now would read
+        as a heartbeat the loop never gave -- and `asOf` now. `queueDepth` is
+        null: the slot queue lives in the daemon's memory, and the console
+        cannot say. One of VITALS_PUSHED, VITALS_SKIPPED or VITALS_FAILED."""
+        snaps = self._sources.snapshots(1)
+        heartbeat = snaps[0]["ts"] if snaps else self._clock()
+        return self.push_once(heartbeat_at=heartbeat, queue_depth=None)
+
+    @staticmethod
+    def _refuses_idle(exc: AlissaError) -> bool:
+        """A 400 that names the `idle` key: a Studio whose strict schema
+        predates seat parking (the design's lane L3 adds the field)."""
+        return exc.status == 400 and "idle" in str(exc.detail)
+
+    def _post(self, snapshot: dict) -> str:
         try:
             result = self._client.post_fleet_vitals(snapshot)
         except AlissaAuthError as exc:
@@ -412,6 +465,17 @@ class FleetVitalsPusher:
             self._warn_failed(exc)
             return VITALS_FAILED
         except AlissaError as exc:
+            if "idle" in snapshot and self._refuses_idle(exc):
+                self._idle_refused_until = self._clock() + IDLE_REPROBE_S
+                log.warning(
+                    "fleet-vitals: Studio refused the seat-parking `idle` "
+                    "block (status %s: %s) — its schema predates it; "
+                    "resending without it, and leaving it out for %d min",
+                    exc.status, exc.detail, int(IDLE_REPROBE_S // 60),
+                )
+                trimmed = dict(snapshot)
+                trimmed.pop("idle")
+                return self._post(trimmed)
             self._warn_failed(exc)
             return VITALS_FAILED
         log.info(

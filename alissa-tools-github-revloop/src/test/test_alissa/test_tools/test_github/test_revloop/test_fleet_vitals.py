@@ -123,6 +123,8 @@ def _runner(*, roster=TMUX_ROSTER, rate=RATE, tmux_fails=False):
             if rate is None:
                 raise CommandError(argv, 1, "gh missing")
             return json.dumps(rate)
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(f"unexpected run: {argv}")
     return run
 
@@ -233,13 +235,22 @@ def test_console_fixtures_build_the_exact_contract_body(
              "url": f"https://github.com/{REPO}/pull/16",
              "lever": fleet_vitals.LEVER_STALLED},
         ],
+        # Seat parking (issue #157): the newest pass's in-flight round is
+        # owed (a pre-#157 stage, so its stage's default), the capped PR is
+        # settled; live / managed are the `sessions` reading.
+        "idle": {
+            "asOf": iso_utc(WALL),
+            "passAt": iso_utc(sources.snapshots(1)[0]["ts"]),
+            "owed": 1, "live": 3, "managed": 3, "queued": 0, "timers": [],
+            "drainedAt": None,
+        },
     }
     # The wire form the strict API validates: every key the contract names,
     # and nothing else.
     assert set(snapshot) == {
         "schemaVersion", "seat", "asOf", "heartbeatAt", "pollIntervalS",
         "version", "drift", "pollDurationsMs", "sessions", "sessionList",
-        "rate", "memory", "queueDepth", "kpis", "inbox",
+        "rate", "memory", "queueDepth", "kpis", "inbox", "idle",
     }
 
 
@@ -468,7 +479,7 @@ def test_fit_body_gives_up_once_both_lists_are_empty():
 
 
 class FakeSources:
-    """The six console reads the builder makes, canned."""
+    """The eight console reads the builder makes, canned."""
 
     def __init__(self, *, roster=None):
         self.roster = [] if roster is None else roster
@@ -493,6 +504,12 @@ class FakeSources:
     def inbox(self):
         return {"live": [], "settled": [], "settled_dropped": 0,
                 "truncated": False}
+
+    def queued(self):
+        return 0
+
+    def drain(self):
+        return None
 
 
 class FakeVitalsClient:

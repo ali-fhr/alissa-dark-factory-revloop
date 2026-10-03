@@ -351,6 +351,29 @@ CREATE TABLE IF NOT EXISTS poll_snapshots (
 -- and never read by the daemon itself -- it is the console's window onto the
 -- effective allowlist (`/api/state` renders it beside `repos`), so it is
 -- telemetry-class: a write that fails costs a warning, not the refresh.
+-- Seat parking (studio.alissa.app seat-parking design §2.4, issue #157).
+-- `seat_drain` holds at most ONE row -- the drain orcloop asked the console
+-- for, its TTL as an absolute `expires_at` -- and `spawn_claims` one row per
+-- round spawn between its drain gate and its ledger write. The daemon clears
+-- both when it boots (`reset_parking`), so neither outlives the process that
+-- saw it: the design calls the flag "in memory", and the console and the
+-- daemon are two processes whose only shared memory is this file. A drain and
+-- a claim are each taken inside ONE `BEGIN IMMEDIATE` transaction that also
+-- reads the other table, so sqlite's writer lock serialises them: either the
+-- claim lands first and the drain sees it (and refuses), or the drain lands
+-- first and the claim sees it (and the spawn stands down).
+CREATE TABLE IF NOT EXISTS seat_drain (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    drained_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    reason     TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS spawn_claims (
+    session    TEXT    NOT NULL PRIMARY KEY,
+    claimed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS derived_repos (
     repo       TEXT    NOT NULL PRIMARY KEY,
     bow_id     TEXT    NOT NULL DEFAULT '',
@@ -2008,3 +2031,104 @@ class State:
         )
         self._db.commit()
         return True
+
+    # -- seat parking: the drain flag and the spawn claims (issue #157) ------
+
+    def drain(self, now: "float | None" = None) -> "dict | None":
+        """The drain that holds now -- `{drained_at, expires_at, reason}` --
+        or None when there is none or its TTL has run out. An expired row is
+        not deleted here (a read never writes); it simply stops holding."""
+        at = int(time.time() if now is None else now)
+        row = self._db.execute(
+            "SELECT drained_at, expires_at, reason FROM seat_drain WHERE id=1"
+        ).fetchone()
+        if row is None or int(row["expires_at"]) <= at:
+            return None
+        return dict(row)
+
+    def set_drain(
+        self, ttl: int, reason: str, now: "float | None" = None,
+        claim_ttl: int = 600,
+    ) -> "tuple[dict, list[dict]]":
+        """Raise the drain flag for `ttl` seconds and return it with the spawn
+        claims standing at that instant (younger than `claim_ttl` -- an older
+        one is a spawn whose process died mid-way, cleared at the next boot).
+        ONE immediate transaction, so a spawn either claimed before this (and
+        is in the list) or claims after it (and sees the flag). A drain that
+        is already up is replaced: a re-drain restarts the TTL. Raises
+        sqlite3.Error -- the caller answers it as a drain that did not
+        happen."""
+        at = int(time.time() if now is None else now)
+        self._db.commit()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO seat_drain "
+                "(id, drained_at, expires_at, reason) VALUES (1,?,?,?)",
+                (at, at + int(ttl), reason),
+            )
+            claims = [
+                dict(row) for row in self._db.execute(
+                    "SELECT session, claimed_at FROM spawn_claims "
+                    "WHERE claimed_at > ? ORDER BY claimed_at",
+                    (at - int(claim_ttl),),
+                ).fetchall()
+            ]
+            self._db.commit()
+        except sqlite3.Error:
+            self._db.rollback()
+            raise
+        drain = {"drained_at": at, "expires_at": at + int(ttl), "reason": reason}
+        return drain, claims
+
+    def clear_drain(self) -> bool:
+        """Lower the drain flag. True when a row was there to clear (expired
+        or not). Raises sqlite3.Error."""
+        cur = self._db.execute("DELETE FROM seat_drain")
+        self._db.commit()
+        return cur.rowcount > 0
+
+    def claim_spawn(self, session: str, now: "float | None" = None) -> "dict | None":
+        """Claim the right to spawn `session`: None when the claim landed,
+        else the drain that refused it. The read of the flag and the claim
+        are one immediate transaction (see `set_drain`). Raises sqlite3.Error:
+        a spawn that cannot prove the seat is not drained does not happen."""
+        at = int(time.time() if now is None else now)
+        self._db.commit()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(
+                "SELECT drained_at, expires_at, reason FROM seat_drain "
+                "WHERE id=1 AND expires_at > ?",
+                (at,),
+            ).fetchone()
+            if row is not None:
+                self._db.rollback()
+                return dict(row)
+            self._db.execute(
+                "INSERT OR REPLACE INTO spawn_claims (session, claimed_at) "
+                "VALUES (?,?)",
+                (session, at),
+            )
+            self._db.commit()
+        except sqlite3.Error:
+            self._db.rollback()
+            raise
+        return None
+
+    def release_spawn(self, session: str) -> None:
+        """Drop `session`'s spawn claim once its spawn has landed or stood
+        down. Best-effort: a claim that cannot be dropped only makes a drain
+        refuse until it ages out (or the next boot clears it)."""
+        def write() -> None:
+            self._db.execute("DELETE FROM spawn_claims WHERE session=?", (session,))
+            self._db.commit()
+
+        self._write_telemetry(write, "release_spawn")
+
+    def reset_parking(self) -> None:
+        """Boot: no drain and no spawn claim survives a daemon restart (the
+        design's "clears at boot"). Raises sqlite3.Error."""
+        self._db.execute("DELETE FROM seat_drain")
+        self._db.execute("DELETE FROM spawn_claims")
+        self._db.commit()

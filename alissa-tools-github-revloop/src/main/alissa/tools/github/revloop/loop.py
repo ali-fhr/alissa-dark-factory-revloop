@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from . import parking as parking_mod
 from . import prompts as prompts_mod
 from .alissa import (
     COMMIT_READINESS_TRAILER_LABEL,
@@ -2201,6 +2202,32 @@ class Decision:
     # exactly as `checks_held` is -- the operator's remedy is the account,
     # not a session slot.
     prompt_held: bool = False
+    # `drained` marks a QUEUED that the seat-parking drain held back (issue
+    # #157): orcloop asked the console to drain the seat for a park, so the
+    # round is owed and stands down before its first side effect. Same column,
+    # its own stage, excluded from the gate's capacity summary like the two
+    # holds above -- the remedy is the park/wake cycle, not a session slot.
+    drained: bool = False
+    # The seat-parking verdict (issue #157): whether this PR is OWED -- the
+    # seat's own work, or a clock the seat owns, is still running on it -- or
+    # settled. None takes the action's default (`decision_owed`); the sites
+    # that know better say so. `timer` is the seat-owned clock behind an owed
+    # verdict, `(kind, until)` with `kind` one of parking.TIMER_KINDS and
+    # `until` a unix second. Observational: only the poll snapshot (and from
+    # it the idle block) reads them.
+    owed: bool | None = None
+    timer: "tuple[str, int] | None" = None
+
+
+def decision_owed(decision: Decision) -> bool:
+    """Whether a decision leaves its PR OWED (seat-parking design §2.1): an
+    explicit verdict on the decision wins; otherwise every action but a
+    convergence, a cap or a skip is the seat's own work in progress -- a
+    round spawned, queued, in flight or held, a verdict still to post, an
+    escalation posted this pass."""
+    if decision.owed is not None:
+        return decision.owed
+    return decision.action.value in parking_mod.OWED_STAGES
 
 
 @dataclass(frozen=True)
@@ -3095,7 +3122,15 @@ class ReviewWatcher:
 
         age = self.state.spawn_age(pr.full_name, number, round_)
         if age is not None and age < STALE_ROUND_SECONDS:
-            return Decision(Action.IN_FLIGHT, f"round {round_} enqueued {int(age)}s ago", round_)
+            return Decision(
+                Action.IN_FLIGHT,
+                f"round {round_} enqueued {int(age)}s ago",
+                round_,
+                timer=(
+                    parking_mod.TIMER_STALE_WINDOW,
+                    int(time.time() - age + STALE_ROUND_SECONDS),
+                ),
+            )
         if age is not None:
             deferred = self._defer_stale_round(pr, round_, age, cap)
             if deferred is not None:
@@ -3345,11 +3380,19 @@ class ReviewWatcher:
                 "the review-request snapshot says",
                 pr.slug, round_, pr.head_sha[:8], since, _stamp(verdict_at), cooldown,
             )
+            # Owed (issue #157): the request still stands, and whether the
+            # round is admitted is decided when the cooldown ends -- a moment
+            # nothing on GitHub marks, so a seat parked across it would never
+            # be woken for a round it owes.
             return Decision(
                 Action.SKIPPED,
                 f"head {pr.head_sha[:8]} had a verdict {int(since)}s ago — inside "
                 f"the {cooldown}s post-verdict cooldown",
                 round_,
+                owed=True,
+                timer=(
+                    parking_mod.TIMER_STALE_WINDOW, int(verdict_at + cooldown)
+                ),
             )
 
         requested = self._fresh_request_at(pr)
@@ -3506,7 +3549,10 @@ class ReviewWatcher:
         # PR that was deferred while the fleet was full, and is refused once the
         # census clears, keeps its seat forever.
         self._waiting.pop((pr.full_name, pr.number), None)
-        return Decision(Action.SKIPPED, problem, round_)
+        # Owed (issue #157): an owed round the seat cannot start for a reason
+        # of its own -- no review task yet, no hub -- is not settled, and its
+        # remedy (a task, a hub) moves nothing a parked seat is woken by.
+        return Decision(Action.SKIPPED, problem, round_, owed=True)
 
     # -- the product-stability guard (issue #105) ---------------------------
 
@@ -3858,6 +3904,10 @@ class ReviewWatcher:
                     f"{rollup.summary} ({int(waited)}s of {bound}s)",
                     round_,
                     checks_held=True,
+                    timer=(
+                        parking_mod.TIMER_CHECKS_HOLD,
+                        int(time.time() - waited + bound),
+                    ),
                 )
             )
 
@@ -4064,10 +4114,16 @@ class ReviewWatcher:
         # The responder's account hold is excluded for the same reason: the
         # remedy is the account, not a freed slot, and the hold has its own
         # WARNING every pass it stands (see poll_once).
+        # A drained round is excluded too (issue #157): a seat being parked
+        # holds every spawn by design, and a park outlasting the stall window
+        # must not page as a review outage.
         held = [
             (slug, d)
             for slug, d in results
-            if d.action is Action.QUEUED and not d.checks_held and not d.prompt_held
+            if d.action is Action.QUEUED
+            and not d.checks_held
+            and not d.prompt_held
+            and not d.drained
         ]
         if not held:
             self._gate_stall.clear()
@@ -4231,6 +4287,7 @@ class ReviewWatcher:
                 f"yet — {reason}",
                 round_,
                 task_ref=task.ref,
+                timer=(parking_mod.TIMER_STALE_WINDOW, int(time.time() + left)),
             )
 
         judged = str(row["head_sha"] or pr.head_sha)
@@ -4482,6 +4539,10 @@ class ReviewWatcher:
                     f"({int(held // 60)}m held in total)",
                     round_,
                     task_ref=task.ref,
+                    timer=(
+                        parking_mod.TIMER_CHECKS_HOLD,
+                        int(time.time() - waited + bound),
+                    ),
                 ),
                 state=rollup.state,
             )
@@ -6072,6 +6133,95 @@ class ReviewWatcher:
         checks: str = "",
         stability: "StabilityNotice | None" = None,
     ) -> Decision:
+        """The round spawn, behind the drain gate (`_drain_gated`). The
+        session name is drawn ONCE, here: it carries a nonce, and the claim
+        must name the session the spawn then enqueues."""
+        name = session_name(pr, round_)
+        return self._drain_gated(
+            pr,
+            round_,
+            name,
+            lambda: self._spawn_claimed(
+                pr, round_, task, cap, name,
+                reenqueued=reenqueued, checks=checks, stability=stability,
+            ),
+        )
+
+    def _drain_gated(
+        self,
+        pr: PullRequest,
+        round_: int,
+        name: str,
+        spawn: "Callable[[], Decision]",
+    ) -> Decision:
+        """The round spawn's drain gate (seat-parking design §2.4, issue
+        #157): claim the spawn of this round's session against the drain
+        flag, run `spawn` under the claim, and drop the claim however it ends.
+
+        The gate sits ABOVE every side effect of the spawn -- the hub add,
+        the `alissa tmux queue add`, the census bump, the ledger row, the
+        activity line -- so a drained seat touches nothing, and the round
+        stays owed: a QUEUED `drained` decision writes no spawn row, burns no
+        round number and spends no attempt, exactly like the slot gate. The
+        claim and the flag are read and written in one immediate transaction
+        on each side (`State.claim_spawn` / `State.set_drain`): a drain that
+        lands while this spawn is between its gate and its ledger write sees
+        the claim and refuses itself, so a park can never race a spawn. A
+        ledger that cannot answer stands the spawn down too -- a spawn that
+        cannot prove the seat is not drained does not happen.
+
+        Dry-run READS the flag and claims nothing: it shares the production
+        state path, and a dry pass must write no durable row."""
+        try:
+            if self.config.dry_run:
+                drain = self.state.drain()
+            else:
+                drain = self.state.claim_spawn(name)
+        except sqlite3.Error as exc:
+            log.warning(
+                "%s round %d: could not claim the spawn against the drain flag "
+                "(%s) — standing it down this pass", pr.slug, round_, exc,
+            )
+            return Decision(
+                Action.QUEUED,
+                f"round {round_} stood down — the state ledger could not prove "
+                f"the seat is not drained ({exc}); retrying next poll",
+                round_,
+                drained=True,
+            )
+        if drain is not None:
+            since = parking_mod.iso(drain["drained_at"])
+            until = parking_mod.iso(drain["expires_at"])
+            log.info(
+                "%s round %d: not spawning — the seat is drained for parking "
+                "since %s (until %s)", pr.slug, round_, since, until,
+            )
+            return Decision(
+                Action.QUEUED,
+                f"round {round_} held — the seat is drained for parking since "
+                f"{since} (until {until}: {drain['reason'] or 'no reason given'}); "
+                f"retrying once it is undrained",
+                round_,
+                drained=True,
+            )
+        try:
+            return spawn()
+        finally:
+            if not self.config.dry_run:
+                self.state.release_spawn(name)
+
+    def _spawn_claimed(
+        self,
+        pr: PullRequest,
+        round_: int,
+        task: Task | None,
+        cap: int,
+        name: str,
+        *,
+        reenqueued: bool = False,
+        checks: str = "",
+        stability: "StabilityNotice | None" = None,
+    ) -> Decision:
         # `task is None` here means spawn_anyway/warn_and_spawn: the skip mode
         # was decided in _refused_before_start, above the CI gate, so a round
         # that will never start buys no rollup.
@@ -6111,7 +6261,6 @@ class ReviewWatcher:
         else:
             assignment = f"You've been assigned Alissa review task {task.ref}."
 
-        name = session_name(pr, round_)
         if plan:
             template = PLAN_ROUND_1_DIRECTIVE if round_ == 1 else PLAN_ROUND_K_DIRECTIVE
         else:
@@ -6130,7 +6279,9 @@ class ReviewWatcher:
 
         hub, problem = self._ensure_hub(pr, task_ref=task.ref if task else None)
         if problem is not None:
-            return Decision(Action.SKIPPED, problem, round_)
+            # Owed (issue #157): the round is owed and the hub could not be
+            # provisioned -- unknown, never settled.
+            return Decision(Action.SKIPPED, problem, round_, owed=True)
 
         self.alissa.enqueue_reviewer(
             session=name,
@@ -7504,7 +7655,9 @@ class ReviewWatcher:
                 raise
             except CommandError as exc:
                 log.error("%s: %s", slug, exc)
-                decision = Decision(Action.SKIPPED, str(exc))
+                # Owed (issue #157): an evaluation that failed is unknown,
+                # never settled.
+                decision = Decision(Action.SKIPPED, str(exc), owed=True)
 
             level = logging.INFO if decision.action != Action.SKIPPED else logging.DEBUG
             log.log(level, "%s → %s (%s)", slug, decision.action.value, decision.reason)
@@ -7668,6 +7821,10 @@ class ReviewWatcher:
             # Same column again; its own stage because the operator's remedy
             # is different from both: the reviewer ACCOUNT (issue #138).
             stage = "prompt-held"
+        elif decision.drained:
+            # Same column once more; its own stage because nothing is wrong:
+            # the seat is being parked (issue #157).
+            stage = "drained"
         return {
             "slug": slug,
             "number": int(tail),
@@ -7677,6 +7834,14 @@ class ReviewWatcher:
             "stage": stage,
             "reason": decision.reason,
             "task_ref": decision.task_ref,
+            # The seat-parking verdict (issue #157): read back by the idle
+            # block (`parking.idle_block`), so the block costs no GitHub call.
+            "owed": decision_owed(decision),
+            "timer": (
+                {"kind": decision.timer[0], "until": decision.timer[1]}
+                if decision.timer is not None
+                else None
+            ),
         }
 
     def _write_snapshot(
@@ -7744,6 +7909,7 @@ class ReviewWatcher:
         # SystemExit pass through (neither is an `Exception`), and only startup
         # -- resolve_config, before this loop is ever entered -- still exits
         # fast.
+        self._reset_parking()
         backoff = self.config.poll_interval
         failures = PollFailures()
         while True:
@@ -7788,6 +7954,29 @@ class ReviewWatcher:
             except KeyboardInterrupt:
                 log.info("stopping")
                 return
+
+    def _reset_parking(self) -> None:
+        """The daemon's boot clears the drain flag and every spawn claim
+        (seat-parking design §2.4, issue #157): a drain -- and any claim a
+        dead process left behind -- never outlives the daemon that saw it, so
+        a redeploy (the wake) or a restart starts with the flag down.
+
+        Here, at the top of `run_forever`, and not in the constructor: the
+        one-shot modes (`--once`, `--pr`) build a watcher too, and a hand-run
+        diagnostic must not lift a drain orcloop is holding on the running
+        daemon. Never under --dry-run, which shares the production state path
+        and writes no durable state. A ledger that cannot be written leaves
+        the flag to its TTL, and says so."""
+        if self.config.dry_run:
+            return
+        try:
+            self.state.reset_parking()
+        except sqlite3.Error as exc:
+            log.warning(
+                "parking: could not clear the drain flag at boot (%s) — a "
+                "drain left by the previous process holds until its TTL runs "
+                "out", exc,
+            )
 
     def _note_poll_failure(
         self, failures: PollFailures, exc: Exception, backoff: int
