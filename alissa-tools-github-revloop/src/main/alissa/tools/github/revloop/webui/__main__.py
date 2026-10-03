@@ -13,8 +13,11 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
+from ..alissa_client import AlissaClient
 from ..config import Config, load_config_file, resolve_config_path
+from ..fleet_vitals import FleetVitalsPusher
 from ..version import version
 from .auth import Auth, PasscodeUnset, require_passcode
 from .server import App, make_server
@@ -77,6 +80,22 @@ def resolve_config(args: argparse.Namespace) -> Config:
     return Config.build(workspace_root, file_data, overrides)
 
 
+def _drain_pusher(
+    config: Config, sources: Sources,
+) -> "Callable[[], str] | None":
+    """The drain handshake's vitals push (seat parking, issue #157): the
+    daemon's own pusher, built on the console's Sources, when the push is on
+    and the config is not a dry run (a dry daemon pushes nothing either).
+    The token is the CLI's own `ALISSA_API_TOKEN`, read by `AlissaClient`,
+    exactly as the daemon's pusher reads it."""
+    if not config.fleet_vitals_enabled or config.dry_run:
+        return None
+    pusher = FleetVitalsPusher(
+        config, sources, AlissaClient(base=config.alissa_endpoint)
+    )
+    return pusher.push_now
+
+
 def main(argv: "list[str] | None" = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -106,7 +125,7 @@ def main(argv: "list[str] | None" = None) -> int:
     secure_cookie = _env_flag(os.environ.get("ALISSA_UI_SECURE_COOKIE"))
     app = App(
         auth=auth, sources=sources, version=version.value,
-        secure_cookie=secure_cookie,
+        secure_cookie=secure_cookie, push_vitals=_drain_pusher(config, sources),
     )
     server = make_server(app, args.host, args.port)
 

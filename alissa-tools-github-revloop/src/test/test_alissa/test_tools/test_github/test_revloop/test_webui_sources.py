@@ -89,6 +89,8 @@ def _quiet_runner(argv, **kw):
         return "[]"
     if argv[:3] == ["gh", "api", "rate_limit"]:
         return "{}"
+    if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+        return "[]"
     raise AssertionError(argv)
 
 
@@ -165,6 +167,8 @@ def test_sessions_parsed_gone_skips_proc(tmp_path):
             ])
         if argv[:2] == ["tmux", "list-panes"]:
             return ""  # no pane -> usage stays None
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
@@ -190,6 +194,8 @@ def test_sessions_unmanaged_and_unpaired(tmp_path):
         if argv[:3] == ["alissa", "tmux", "ls"]:
             return json.dumps([{"name": "develop-acme-widgets-i7-a1",
                                 "session": "s9", "status": "idle", "live": False}])
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
@@ -217,6 +223,8 @@ def test_sessions_walks_proc_for_live_pane(tmp_path):
                                 "status": "busy", "live": True}])
         if argv[:2] == ["tmux", "list-panes"]:
             return "77\n"
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner, proc_root=str(proc))
@@ -417,6 +425,8 @@ def test_dashboard_shape(tmp_path):
         if argv[:3] == ["gh", "api", "rate_limit"]:
             return json.dumps({"resources": {"core": {
                 "limit": 5000, "remaining": 4900, "used": 100, "reset": 0}}})
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
@@ -469,6 +479,8 @@ def test_tiles_count_reviewer_sessions_apart_from_the_hosts(tmp_path):
             return ""
         if argv[:3] == ["gh", "api", "rate_limit"]:
             return "{}"
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     tiles = make_sources(tmp_path, runner=runner).dashboard()["tiles"]
@@ -506,6 +518,8 @@ def test_dashboard_spends_no_github_budget_beyond_the_cached_checks(tmp_path):
         if argv[:3] == ["gh", "api", "rate_limit"]:
             return json.dumps({"resources": {"core": {"limit": 1, "remaining": 1,
                                                       "used": 0, "reset": 0}}})
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
@@ -603,6 +617,8 @@ def test_sessions_builds_the_proc_index_once(tmp_path, monkeypatch):
                  "status": "busy", "live": True} for n in (77, 78, 79)])
         if argv[:2] == ["tmux", "list-panes"]:
             return argv[3].lstrip("s") + "\n"  # session sN -> pane pid N
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     builds = []
@@ -620,6 +636,8 @@ def test_sessions_never_walks_proc_without_a_live_pane(tmp_path, monkeypatch):
         if argv[:3] == ["alissa", "tmux", "ls"]:
             return json.dumps([{"name": SESSION, "session": "s1",
                                 "status": "gone", "live": False}])
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     builds = []
@@ -690,6 +708,8 @@ def test_session_pairing_survives_an_old_spawn_row(tmp_path):
                                 "status": "busy", "live": True}])
         if argv[:2] == ["tmux", "list-panes"]:
             return ""
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner)
@@ -740,6 +760,8 @@ def _one_session_runner(argv, **kw):
         return "77\n"
     if argv[:3] == ["gh", "api", "rate_limit"]:
         return "{}"
+    if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+        return "[]"
     raise AssertionError(argv)
 
 
@@ -798,6 +820,8 @@ def test_top_procs_are_bounded(tmp_path):
             return "[]"
         if argv[:3] == ["gh", "api", "rate_limit"]:
             return "{}"
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     rows = make_sources(tmp_path, runner=runner,
@@ -1043,6 +1067,8 @@ def test_the_split_costs_no_github_call_and_writes_no_ledger_row(tmp_path):
             return "[]"
         if argv[:3] == ["gh", "api", "rate_limit"]:
             return "{}"
+        if argv[:4] == ["alissa", "tmux", "queue", "ls"]:
+            return "[]"
         raise AssertionError(argv)
 
     src = make_sources(tmp_path, runner=runner,

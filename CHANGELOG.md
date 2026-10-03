@@ -4,6 +4,49 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.11
+
+- **Seat parking for the reviewer seat** (issue #157; origin TASK-1827515064,
+  implementation TASK-193024056) — lane L5 of the Studio design
+  `docs/design/managed-dark-factory-seat-parking.md` (§2.1, §2.2, §2.4), the
+  devloop L4 contract for rounds. A leaf: nothing changes in production until
+  orcloop (lane L6) calls the drain and reads the block.
+  - **The idle block** `{asOf, passAt, owed, live, managed, queued, timers,
+    drainedAt}` on the console's `GET /api/state` (`idle`) and in the
+    fleet-vitals snapshot. Every `Decision` now carries an owed verdict and an
+    optional seat-owned timer, recorded on the poll snapshot's stage, so the
+    block costs no GitHub call. Owed: a round spawned, queued for a slot,
+    held on CI (`checks_hold` timer), held by the drain or in flight inside
+    its stale window (`stale_window` timer); a verdict still to post
+    natively; an escalation posted this pass; the post-verdict cooldown
+    (`stale_window` timer); a round with no hub or no review task; an
+    evaluation that failed. Settled: converged, capped, already
+    stability-held, waiting on a fresh re-request, out of scope. Unknown is
+    never idle: no pass yet is `owed: null`, an unlistable roster or queue is
+    a null count. `live` / `managed` follow the vitals `sessions` rule;
+    `queued` counts undispatched `alissa tmux queue` items.
+  - **The drain.** `POST /action/drain {ttlS, reason}` and
+    `POST /action/undrain`, behind the passcode session and the CSRF token,
+    audited. The drain raises the flag first, then reads the block; if D2 is
+    broken or a round spawn holds a claim it lowers the flag and answers
+    `drained: false` with `refusals`. If it holds, it pushes a vitals
+    snapshot carrying `idle.drainedAt` before it answers (`vitals:
+    pushed|failed|skipped`). `ttlS` defaults to 300 and is capped at 900; a
+    bad `ttlS`/`reason` is a 400, an unreachable `state.db` a 503.
+  - **Round spawning honours it.** The one spawn path (`_spawn`) passes the
+    drain gate before any side effect — hub add, `alissa tmux queue add`,
+    census, ledger row, activity line. A drained round is `QUEUED` with the
+    `drained` stage: owed, no spawn row, no round number burned, and kept out
+    of the slot-gate stall summary. Claim and drain are serialised by one
+    `BEGIN IMMEDIATE` transaction on each side (`spawn_claims`,
+    `seat_drain`). Dry-run reads the flag and claims nothing.
+  - **TTL and boot.** The flag is one `seat_drain` row with an absolute
+    expiry; `run_forever` clears it and every spawn claim at boot (never in
+    dry-run, and not in the `--once` / `--pr` one-shots).
+  - **Studio compatibility.** Until Studio's strict vitals schema carries
+    `idle` (lane L3), a 400 naming `idle` makes the pusher resend without the
+    block and leave it out for an hour.
+
 ## 0.31.10
 
 - **`round.verdict` is posted for every verdict of record** (issue #155;

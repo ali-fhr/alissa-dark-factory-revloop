@@ -1,4 +1,5 @@
-"""The console's read-only data layer (plus the one retry-now UPDATE).
+"""The console's read-only data layer (plus the retry-now UPDATE and the
+seat-parking drain flag).
 
 Every panel the dashboard renders is assembled here from four kinds of source,
 in strict budget order:
@@ -36,7 +37,13 @@ page) instead of quietly conjuring an empty state.db that renders exactly like
 an idle daemon -- the one distinction the console exists to make, and easy to
 get wrong because `--workspace-root` defaults to the cwd.
 
-The single mutation is `retry_now`: it ages the newest ledger row of one round
+Seat parking (issue #157) adds the idle block (`idle`, the seat's own verdict
+for orcloop's park rule) and the drain flag's two writes, `set_drain` /
+`clear_drain`, which the console's `/action/drain` and `/action/undrain` call.
+Unlike every read here those RAISE on a ledger they cannot reach: a drain that
+did not happen must never be answered as one that did.
+
+The other mutation is `retry_now`: it ages the newest ledger row of one round
 past the stale window (an UPDATE, via `State.age_out_spawn`), so the daemon's
 own re-enqueue path can respawn it on its next pass. No new retry logic lives
 here -- the console only moves a clock the daemon already reads. It reports a
@@ -54,6 +61,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from .. import parking
 from ..alissa import REVIEW_SESSION_PREFIX
 from ..config import Config
 from ..loop import (
@@ -613,6 +621,66 @@ class Sources:
         tail = text.splitlines()[-lines:]
         return {"path": str(path), "lines": tail}
 
+    # -- seat parking (issue #157) -----------------------------------------
+
+    def queued(self) -> "int | None":
+        """Undispatched items in the alissa tmux queue (every queue on the
+        machine), or None when `alissa tmux queue ls --json` cannot be read
+        -- unknown, never zero."""
+        return parking.queued_items(
+            self._safe_json(["alissa", "tmux", "queue", "ls", "--json"])
+        )
+
+    def drain(self) -> "dict | None":
+        """The drain that holds now (`State.drain`), or None. A state.db
+        that cannot be read answers None: the console then shows no drain,
+        and the daemon's own gate reads the ledger strictly."""
+        now = self._wall()
+        return self._read_state(None, lambda st: st.drain(now))
+
+    def idle(self, rows: object = None, *, read_rows: bool = True) -> dict:
+        """The seat's idle block (`parking.idle_block`): owed and timers from
+        the newest poll snapshot, live / managed from the session rows (read
+        here unless the caller hands in the rows it already holds, None
+        meaning the roster could not be listed), queued from the alissa
+        queue, and `drainedAt` while a drain holds. A failed listing is null
+        counts, never zeros."""
+        if read_rows:
+            rows = self.session_rows()
+        snaps = self.snapshots(1)
+        live, managed = parking.roster_counts(
+            rows if isinstance(rows, list) else None
+        )
+        return parking.idle_block(
+            snaps[0] if snaps else None,
+            live=live, managed=managed, queued=self.queued(),
+            drain=self.drain(), now=self._wall(),
+        )
+
+    def set_drain(self, ttl: int, reason: str) -> "tuple[dict, list[dict]]":
+        """Raise the drain flag (`State.set_drain`, with the spawn claims
+        standing at that instant). Raises sqlite3.Error -- an absent state.db
+        included: a console with no daemon state has nothing to drain, and a
+        drain must never be the thing that creates one."""
+        if not self.state_present():
+            raise sqlite3.OperationalError(
+                f"no state.db at {self.config.state_db}"
+            )
+        with State(self.config.state_db) as st:
+            return st.set_drain(
+                ttl, reason, now=self._wall(),
+                claim_ttl=parking.SPAWN_CLAIM_TTL,
+            )
+
+    def clear_drain(self) -> bool:
+        """Lower the drain flag (`State.clear_drain`): True when a row was
+        cleared. Raises sqlite3.Error; an absent state.db has no flag up, so
+        it answers False."""
+        if not self.state_present():
+            return False
+        with State(self.config.state_db) as st:
+            return st.clear_drain()
+
     # -- the retry-now mutation --------------------------------------------
 
     def retry_now(self, repo_slug: str, number: int, round_: int) -> str:
@@ -662,7 +730,10 @@ class Sources:
         # missing from `stats` and its row shows "--" for CPU%/RSS for one
         # poll. Self-healing in ~10s, and cheaper than walking /proc twice.
         proc_index = sysinfo.build_index(self._proc_root)
-        sessions = self.sessions(index=proc_index)
+        # One roster read feeds the session table and the idle block; the
+        # block needs the unlistable None the table degrades to [].
+        rows = self.session_rows(index=proc_index)
+        sessions = rows or []
         rate = self.rate_limit()
         disk = sysinfo.disk_usage(self.config.workspace_root)
         memory = sysinfo.cgroup_memory(self._cgroup_root)
@@ -752,6 +823,9 @@ class Sources:
             # IS resident, this is what names the holder.
             "top_procs": top_procs,
             "log": self.log_tail(),
+            # Seat parking (issue #157): the seat's own idle verdict, read by
+            # orcloop's park rule (design §2.1, §2.2).
+            "idle": self.idle(rows, read_rows=False),
         }
 
     def inbox(self) -> dict:

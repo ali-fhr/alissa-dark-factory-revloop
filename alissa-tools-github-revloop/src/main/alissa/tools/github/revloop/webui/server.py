@@ -20,6 +20,12 @@ Route map:
                        (accept | decline | escape; session + CSRF required;
                        409 not_waiting when the pane is not parked on one,
                        409 not_answerable for an account-level notice)
+  POST /action/drain -> seat parking's drain handshake (issue #157): raise
+                       the drain flag for `ttlS` seconds, answer the idle
+                       block, and keep the flag only if the seat is idle --
+                       then push a vitals snapshot BEFORE answering
+                       (session + CSRF required)
+  POST /action/undrain -> lower the drain flag (session + CSRF required)
 
 Every action POST is gated on BOTH the signed session cookie AND a CSRF token
 bound to it, and every action is audit-logged to stdout as a JSON line.
@@ -29,14 +35,16 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import sys
+import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
-from .. import prompts
+from .. import parking, prompts
 from ..alissa import SAFE_SESSION, capture_pane_argv, send_keys_argv
 from ..proc import CommandError, run as proc_run
 from .auth import SESSION_COOKIE, Auth
@@ -105,12 +113,18 @@ class App:
         run: "Callable[..., str]" = proc_run,
         audit: "Callable[[str, dict], None]" = _default_audit,
         secure_cookie: bool = False,
+        push_vitals: "Callable[[], str] | None" = None,
+        clock: "Callable[[], float]" = time.time,
     ) -> None:
         self.auth = auth
         self.sources = sources
         self.version = version
         self._run = run
         self._audit = audit
+        # The drain's vitals push (`FleetVitalsPusher.push_now`), or None when
+        # the push is off (issue #157).
+        self._push_vitals = push_vitals
+        self._clock = clock
         # Add `Secure` to the session cookie. Off by default (the localhost-HTTP
         # posture, where Secure would break the cookie), switched on for the
         # reverse-proxied-under-TLS posture auth.py contemplates so the cookie
@@ -235,6 +249,91 @@ class App:
                                "ok": True, "kind": finding.kind, "keys": list(keys)})
         return 200, {"ok": True, "message": "answered", "kind": finding.kind,
                      "keys": list(keys)}
+
+    def drain(self, ttl_s: Any = None, reason: Any = None) -> "tuple[int, dict]":
+        """`POST /action/drain` (seat-parking design §2.4, issue #157): the
+        first step of a park. (status, payload); every outcome is audited.
+
+        Raises the drain flag for `ttl_s` seconds (default 300, at most
+        parking.DRAIN_TTL_MAX) and only THEN reads the idle block -- so a
+        round spawn that slips in before the flag is either a claim the drain
+        sees or a session (or an owed stage) the block counts. When the block
+        breaks D2 (a live, managed or queued session, anything owed, a timer,
+        a stale pass, an unknown) or a spawn holds a claim, the flag comes
+        straight back down and the answer is `drained: false` with the
+        reasons. When the drain holds, a vitals snapshot carrying
+        `idle.drainedAt` is pushed BEFORE the answer, because that snapshot
+        is what Studio re-checks before it removes anything; the answer says
+        how the push went."""
+        if ttl_s is None:
+            ttl = parking.DRAIN_TTL_DEFAULT
+        elif (
+            isinstance(ttl_s, int) and not isinstance(ttl_s, bool)
+            and 0 < ttl_s <= parking.DRAIN_TTL_MAX
+        ):
+            ttl = ttl_s
+        else:
+            self._audit("drain", {"ok": False, "error": "bad ttlS", "ttlS": ttl_s})
+            return 400, {"drained": False, "error": (
+                f"ttlS must be an integer in 1..{parking.DRAIN_TTL_MAX}"
+            )}
+        if reason is None:
+            reason = ""
+        if not isinstance(reason, str) or len(reason) > parking.DRAIN_REASON_MAX:
+            self._audit("drain", {"ok": False, "error": "bad reason"})
+            return 400, {"drained": False, "error": (
+                f"reason must be a string of at most "
+                f"{parking.DRAIN_REASON_MAX} characters"
+            )}
+        try:
+            drain, claims = self.sources.set_drain(ttl, reason)
+        except sqlite3.Error as exc:
+            self._audit("drain", {"ok": False, "error": str(exc)})
+            return 503, {"drained": False, "error": "state_unavailable"}
+        idle = self.sources.idle()
+        refusals = parking.idle_refusals(
+            idle, poll_interval=self.sources.config.poll_interval,
+            now=self._clock(),
+        )
+        refusals += [f"spawn in progress: {c['session']}" for c in claims]
+        if idle.get("drainedAt") is None:
+            refusals.append("the drain flag could not be read back")
+        if refusals:
+            try:
+                self.sources.clear_drain()
+            except sqlite3.Error as exc:
+                # The TTL still bounds it, and the spawn gate reads the flag
+                # strictly; say so rather than pretend it is down.
+                refusals.append(f"the flag could not be cleared ({exc})")
+            else:
+                idle = dict(idle, drainedAt=None)
+            self._audit("drain", {
+                "ok": False, "ttlS": ttl, "reason": reason, "refusals": refusals,
+            })
+            return 200, {"drained": False, "refusals": refusals, "idle": idle}
+        vitals = self._push_vitals() if self._push_vitals is not None else "skipped"
+        self._audit("drain", {
+            "ok": True, "ttlS": ttl, "reason": reason, "vitals": vitals,
+        })
+        return 200, {
+            "drained": True,
+            "drainedAt": parking.iso(drain["drained_at"]),
+            "expiresAt": parking.iso(drain["expires_at"]),
+            "idle": idle,
+            "vitals": vitals,
+        }
+
+    def undrain(self) -> "tuple[int, dict]":
+        """`POST /action/undrain`: lower the drain flag -- orcloop's step 4
+        on any failure of a park. Idempotent: undraining a seat that is not
+        drained answers `cleared: false`. (status, payload), audited."""
+        try:
+            cleared = self.sources.clear_drain()
+        except sqlite3.Error as exc:
+            self._audit("undrain", {"ok": False, "error": str(exc)})
+            return 503, {"drained": True, "error": "state_unavailable"}
+        self._audit("undrain", {"ok": True, "cleared": cleared})
+        return 200, {"drained": False, "cleared": cleared}
 
     def retry(
         self, repo_slug: "str | None", number: Any, round_: Any
@@ -388,7 +487,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         # Everything below is a state-changing action: session + CSRF required.
-        if path in ("/action/kill", "/action/retry", "/action/answer"):
+        if path in (
+            "/action/kill", "/action/retry", "/action/answer",
+            "/action/drain", "/action/undrain",
+        ):
             if not self._authed():
                 self._send_json({"error": "unauthorized"},
                                 status=HTTPStatus.UNAUTHORIZED)
@@ -397,6 +499,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "csrf"}, status=HTTPStatus.FORBIDDEN)
                 return
             payload = self._json_body()
+            if path == "/action/drain":
+                status, body = self.app.drain(
+                    payload.get("ttlS"), payload.get("reason")
+                )
+                self._send_json(body, status=status)
+                return
+            if path == "/action/undrain":
+                status, body = self.app.undrain()
+                self._send_json(body, status=status)
+                return
             if path == "/action/answer":
                 status, body = self.app.answer(
                     payload.get("session"), payload.get("verb")
