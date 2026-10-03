@@ -4,6 +4,38 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.12
+
+- **The `config` block on the fleet-vitals snapshot** (issue #159; origin
+  TASK-1127468277, implementation TASK-427421490) — the revloop part of lane
+  L9 of the Studio design `docs/design/managed-dark-factory-provisioner.md`
+  (§1.4, §2.7), mirroring devloop 0.8.38. The smoke's SM2–SM4 compare what
+  Studio provisioned with what each seat derived; this release gives the
+  reviewer seat's word.
+  - **`{feedOwnerActorId, repos, reviewersRequested, ghLogin}`**: the
+    bodies-of-work authority under `repos_source: bows` (null in static
+    mode, or when several owners are trusted), the effective allowlist the
+    last feed refresh bound (sorted case-insensitively), an empty
+    `reviewersRequested` (the reviewer seat requests no reviewer; the key
+    keeps the block one shape across seats) and the reviewer identity's
+    own GitHub login. Read off the config the watcher RUNS on, not the boot
+    config the pusher was built with.
+  - **No secret.** The block is built from typed config fields, and any
+    value carrying a credential the process holds (`GH_TOKEN`,
+    `GITHUB_TOKEN`, `ALISSA_API_TOKEN`, `ALISSA_UI_PASSCODE`, the
+    Anthropic/Claude credentials, and the variable `reviewer_token_env`
+    names) is blanked before sending, with a WARNING naming the field only.
+  - **Daemon only.** The console's out-of-pass push (the drain handshake)
+    leaves the block out: that process never resolves the feed authority
+    nor refreshes the allowlist. A derivation that fails costs the block,
+    never the snapshot.
+  - **An old Studio still gets its vitals.** Until Studio's schema carries
+    the block (lane L5), a strict 400 naming `config` is answered like the
+    `idle` one: resent without it, left out for an hour, then offered again.
+    A 400 naming both blocks drops both in one resend; the match is on the
+    whole word, so a message merely containing "configuration" is an
+    ordinary failure.
+
 ## 0.31.11
 
 - **Seat parking for the reviewer seat** (issue #157; origin TASK-1827515064,

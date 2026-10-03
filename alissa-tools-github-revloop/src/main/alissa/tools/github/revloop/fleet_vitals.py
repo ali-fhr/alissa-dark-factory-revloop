@@ -50,15 +50,32 @@ answers (`FleetVitalsPusher.push_now`). Until Studio's schema carries the
 block (the design's lane L3), a strict 400 naming `idle` makes the pusher
 resend without it and leave it out for IDLE_REPROBE_S: the vitals the Factory
 already renders never go dark over a field nobody reads yet.
+
+The managed fleet's smoke (issue #159, studio.alissa.app provisioner design
+§2.7, lane L9) adds the `config` block -- what this seat DERIVED, in its own
+words: the feed owner actor id, the effective review allowlist, the reviewer
+login(s) it requests (none: the reviewer seat is the one requested) and its
+own GitHub login, the reviewer identity SM4 compares with the rev seat
+credential. Every value is an identity or a name, never a credential: the
+block is built from the config the watcher RUNS on, not from the
+environment, and any value carrying a secret the process holds
+(`SECRET_ENV`, plus the variable `reviewer_token_env` names) is blanked
+before it can leave. The daemon's own pass sends it; the console's
+out-of-pass push leaves it out (that process never resolves the feed
+authority nor refreshes the allowlist, so its answer would be a different
+one). A Studio whose strict schema predates the block gets the `idle`
+treatment: resent without it, offered again after BLOCK_REPROBE_S.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from . import parking
 from .alissa import parse_session_name, session_repo_slug
@@ -68,7 +85,7 @@ from .alissa_client import (
     AlissaClient,
     AlissaError,
 )
-from .config import Config
+from .config import REPOS_BOWS, Config
 from .proc import CommandError, run as proc_run
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -97,11 +114,31 @@ VITALS_PUSHED = "pushed"
 VITALS_SKIPPED = "skipped"
 VITALS_FAILED = "failed"
 
-# How long a snapshot leaves the `idle` block out after Studio refused it as
-# an unknown key (a schema that predates seat parking), before it offers the
-# block again. An hour: one extra POST an hour against an old Studio, and a
-# newly deployed one starts receiving the block within the hour.
-IDLE_REPROBE_S = 3600.0
+# The blocks Studio's schema gained after the base contract, each in its own
+# lane: `idle` (seat parking L3) and `config` (provisioner L5). A strict 400
+# naming one of them is an old Studio, not a bad snapshot.
+OPTIONAL_BLOCKS = ("idle", "config")
+
+# How long a snapshot leaves an optional block out after Studio refused it as
+# an unknown key, before it offers the block again. An hour: one extra POST
+# an hour against an old Studio, and a newly deployed one starts receiving
+# the block within the hour.
+BLOCK_REPROBE_S = 3600.0
+IDLE_REPROBE_S = BLOCK_REPROBE_S
+
+# The `config` block's keys (provisioner design §2.7 / lane L9), in order.
+CONFIG_KEYS = ("feedOwnerActorId", "repos", "reviewersRequested", "ghLogin")
+
+# The credentials a revloop container holds (the provisioner's variable
+# collection, design §2.6, plus gh's own fallback name); the variable a
+# `reviewer_token_env` names is added per config. No `config` value may carry
+# one. A value shorter than SECRET_MIN is not a credential and is not matched
+# (a passcode of "1" must not blank every login holding a 1).
+SECRET_ENV = (
+    "GH_TOKEN", "GITHUB_TOKEN", "ALISSA_API_TOKEN", "ALISSA_UI_PASSCODE",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+)
+SECRET_MIN = 8
 
 # The operator's lever per inbox kind, in the Factory's `lever` slot. The
 # cap-out and the stability hold are both lifted by the same re-entry ack;
@@ -258,6 +295,7 @@ def build_snapshot(
     queue_depth: "int | None",
     repos: "tuple[str, ...]" = (),
     now: "int | float | None" = None,
+    config: "Mapping | None" = None,
 ) -> dict:
     """The contract body for this pass, off the console's builders.
 
@@ -273,6 +311,9 @@ def build_snapshot(
     timers from the newest poll snapshot, live / managed from the SAME roster
     read as `sessions`, queued from the alissa queue, and `drainedAt` while
     a drain holds.
+
+    `config` is the seat's `config_block`, or None to leave the key out (the
+    console's push, which has no derived answer to give).
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -304,7 +345,7 @@ def build_snapshot(
         live=live, managed=managed, queued=sources.queued(),
         drain=sources.drain(), now=stamp,
     )
-    return {
+    snapshot = {
         "schemaVersion": SCHEMA_VERSION,
         "seat": SEAT,
         "asOf": iso_utc(stamp),
@@ -326,6 +367,72 @@ def build_snapshot(
         "inbox": inbox,
         "idle": idle,
     }
+    if config is not None:
+        snapshot["config"] = dict(config)
+    return snapshot
+
+
+def _carries_secret(value: str, secrets: "Sequence[str]") -> bool:
+    return any(secret in value for secret in secrets)
+
+
+def config_block(
+    config: Config,
+    *,
+    gh_login: "str | None",
+    environ: "Mapping[str, str] | None" = None,
+) -> dict:
+    """The seat's own word on what it derived (issue #159): four fields,
+    each from the config the daemon is RUNNING on, never from the raw env.
+
+    * `feedOwnerActorId` -- the bodies-of-work authority under
+      `repos_source: bows` (the token's own actor, resolved at boot, unless
+      `bow_owners` names one). Null in static mode (no feed is read) and when
+      several owners are trusted (there is no single answer to quote).
+    * `repos` -- the effective allowlist, sorted: under bows the derived
+      union the last refresh bound, in static mode the configured list
+      (empty there means "every repo that requests me").
+    * `reviewersRequested` -- always empty: the reviewer seat requests no
+      reviewer, it IS the one requested. The key is kept so every seat's
+      block has one shape.
+    * `ghLogin` -- the reviewer identity the gh credential resolves to (the
+      login round counting and every posted review are held to); null when
+      unknown.
+
+    `environ` (default: the process env) supplies the secrets to scan for:
+    a value carrying one is blanked -- a list entry dropped, a scalar
+    nulled -- and named in a WARNING by field only."""
+    env = os.environ if environ is None else environ
+    names = SECRET_ENV + (
+        (config.reviewer_token_env,) if config.reviewer_token_env else ()
+    )
+    secrets = [
+        v for k in names if len(v := (env.get(k) or "").strip()) >= SECRET_MIN
+    ]
+    owners = config.bow_owners if config.repos_source == REPOS_BOWS else ()
+    block: dict = {
+        "feedOwnerActorId": owners[0] if len(owners) == 1 else None,
+        "repos": sorted(config.repos, key=str.casefold),
+        "reviewersRequested": [],
+        "ghLogin": gh_login or None,
+    }
+    for key in CONFIG_KEYS:
+        value = block[key]
+        if isinstance(value, list):
+            kept = [v for v in value if not _carries_secret(v, secrets)]
+            blanked = len(kept) != len(value)
+            block[key] = kept
+        else:
+            blanked = value is not None and _carries_secret(value, secrets)
+            if blanked:
+                block[key] = None
+        if blanked:
+            log.warning(
+                "fleet-vitals: the config block's %s carried a credential "
+                "this process holds — blanked before sending; check the "
+                "variable it is derived from", key,
+            )
+    return block
 
 
 def body_bytes(snapshot: dict) -> int:
@@ -384,6 +491,7 @@ class FleetVitalsPusher:
         client: AlissaClient,
         *,
         clock: Callable[[], float] = time.time,
+        config_reader: "Callable[[], Mapping | None] | None" = None,
     ):
         self.config = config
         self._sources = sources
@@ -394,9 +502,12 @@ class FleetVitalsPusher:
         # every later refusal is a DEBUG line. The push itself is still
         # attempted every pass -- the pass after activation lands on its own.
         self._not_activated_warned = False
-        # Until when the `idle` block is left out (Studio refused it as an
-        # unknown key); 0 = offer it.
-        self._idle_refused_until = 0.0
+        # The `config` block's source (the daemon's `_vitals_config`), or
+        # None -- the console's pusher -- to leave the block out.
+        self._config_reader = config_reader
+        # Per optional block: until when it is left out (Studio refused it
+        # as an unknown key). Absent = offer it.
+        self._refused_until: "dict[str, float]" = {}
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
@@ -407,7 +518,23 @@ class FleetVitalsPusher:
             queue_depth=queue_depth,
             repos=self.config.repos,
             now=self._clock(),
+            config=self._config(),
         ))
+
+    def _config(self) -> "Mapping | None":
+        """The `config` block, or None. A reader that fails costs the block,
+        never the snapshot: the rest of the vitals still go out."""
+        if self._config_reader is None:
+            return None
+        try:
+            return self._config_reader()
+        except Exception as exc:
+            log.warning(
+                "fleet-vitals: could not derive the config block (%s: %s) — "
+                "pushing the snapshot without it",
+                type(exc).__name__, exc,
+            )
+            return None
 
     def push_once(
         self, *, heartbeat_at: "int | float", queue_depth: "int | None" = None
@@ -431,8 +558,10 @@ class FleetVitalsPusher:
                 type(exc).__name__, exc,
             )
             return VITALS_FAILED
-        if self._clock() < self._idle_refused_until:
-            snapshot.pop("idle", None)
+        now = self._clock()
+        for key, until in self._refused_until.items():
+            if now < until:
+                snapshot.pop(key, None)
         if self.config.dry_run:
             log.info("[dry-run] would push fleet vitals (%s)", describe(snapshot))
             return VITALS_SKIPPED
@@ -450,10 +579,18 @@ class FleetVitalsPusher:
         return self.push_once(heartbeat_at=heartbeat, queue_depth=None)
 
     @staticmethod
-    def _refuses_idle(exc: AlissaError) -> bool:
-        """A 400 that names the `idle` key: a Studio whose strict schema
-        predates seat parking (the design's lane L3 adds the field)."""
-        return exc.status == 400 and "idle" in str(exc.detail)
+    def _refused_blocks(exc: AlissaError, snapshot: dict) -> "list[str]":
+        """The optional blocks of `snapshot` a 400 names: a Studio whose
+        strict schema predates them (seat parking's lane L3 adds `idle`, the
+        provisioner's lane L5 adds `config`). A word match, so `config` is
+        not read into an unrelated message that merely contains it."""
+        if exc.status != 400:
+            return []
+        detail = str(exc.detail)
+        return [
+            key for key in OPTIONAL_BLOCKS
+            if key in snapshot and re.search(rf"\b{key}\b", detail)
+        ]
 
     def _post(self, snapshot: dict) -> str:
         try:
@@ -465,16 +602,21 @@ class FleetVitalsPusher:
             self._warn_failed(exc)
             return VITALS_FAILED
         except AlissaError as exc:
-            if "idle" in snapshot and self._refuses_idle(exc):
-                self._idle_refused_until = self._clock() + IDLE_REPROBE_S
+            refused = self._refused_blocks(exc, snapshot)
+            if refused:
+                until = self._clock() + BLOCK_REPROBE_S
+                for key in refused:
+                    self._refused_until[key] = until
                 log.warning(
-                    "fleet-vitals: Studio refused the seat-parking `idle` "
-                    "block (status %s: %s) — its schema predates it; "
-                    "resending without it, and leaving it out for %d min",
-                    exc.status, exc.detail, int(IDLE_REPROBE_S // 60),
+                    "fleet-vitals: Studio refused the %s block(s) (status "
+                    "%s: %s) — its schema predates them; resending without "
+                    "them, and leaving them out for %d min",
+                    ", ".join(f"`{k}`" for k in refused), exc.status,
+                    exc.detail, int(BLOCK_REPROBE_S // 60),
                 )
-                trimmed = dict(snapshot)
-                trimmed.pop("idle")
+                trimmed = {
+                    k: v for k, v in snapshot.items() if k not in refused
+                }
                 return self._post(trimmed)
             self._warn_failed(exc)
             return VITALS_FAILED
@@ -545,6 +687,7 @@ def build_pusher(
     *,
     github: object = None,
     endpoint: "str | None" = None,
+    config_reader: "Callable[[], Mapping | None] | None" = None,
 ) -> FleetVitalsPusher:
     """The pusher the watcher wires in when `fleet_vitals_enabled` is on.
 
@@ -555,7 +698,9 @@ def build_pusher(
     own `ALISSA_API_TOKEN`); its absence surfaces as the pusher's WARN, never
     at construction, because a daemon must boot and poll whether or not
     vitals can authenticate. The import is local because `sources` imports
-    `loop`, which imports this module.
+    `loop`, which imports this module. `config_reader` is the daemon's
+    `config` block source (issue #159); the console builds its own pusher
+    without one.
     """
     from .version import version
     from .webui.sources import Sources
@@ -565,4 +710,7 @@ def build_pusher(
         running_version=version.value,
         run=_console_runner(github),
     )
-    return FleetVitalsPusher(config, sources, AlissaClient(base=endpoint))
+    return FleetVitalsPusher(
+        config, sources, AlissaClient(base=endpoint),
+        config_reader=config_reader,
+    )
