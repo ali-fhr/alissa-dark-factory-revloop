@@ -55,6 +55,10 @@ from alissa.tools.github.revloop.state import State
 
 REPO = "acme/widgets"
 HEAD = "a" * 40
+# The six data keys every `round.verdict` carries (issue #155 c1).
+ROUND_VERDICT_KEYS = (
+    "verdict", "headSha", "readiness", "readinessClass", "contractVersion", "taskRef",
+)
 
 
 @pytest.fixture
@@ -153,13 +157,19 @@ def test_a_held_round_reports_checks_held_ms(ledger, clock):
     assert event["data"]["checksHeldMs"] == 30_000
 
 
-def test_a_legacy_row_with_no_stored_verdict_omits_the_field(ledger, clock):
+def test_a_legacy_row_with_no_stored_verdict_carries_it_null(ledger, clock):
+    """Never invented: a row that predates the verdict column (and the
+    `round-verdict:` row) says null for what it does not know -- the six
+    keys are always present (issue #155 c1)."""
     clock()
     ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
     ledger.record_verdict_post(REPO, 7, 1, "url")  # pre-#112 caller shape
     (event,) = derive_events(ledger)
     assert event["kind"] == "round.verdict"
-    assert "verdict" not in event["data"]
+    assert {k: event["data"][k] for k in ROUND_VERDICT_KEYS} == {
+        "verdict": None, "headSha": HEAD, "readiness": None,
+        "readinessClass": None, "contractVersion": None, "taskRef": None,
+    }
 
 
 def test_an_abandoned_round_emits_round_abandoned_with_the_reason(
@@ -1094,3 +1104,120 @@ def test_non_round_events_are_never_marked(ledger, clock):
     (event,) = derive_events(ledger)
     assert event["kind"] == "stalled"
     assert "data" not in event
+
+
+# -- round.verdict on every verdict of record (issue #155) ------------------
+
+
+def _verdict_ping(ledger, round_, head=HEAD, verdict="approve", readiness="auto",
+                  klass=None, contract=None, task="TASK-500", number=7):
+    ledger.record_ping(REPO, number, loop_events.round_verdict_kind(
+        round_, head, verdict, readiness, klass, contract, task,
+    ))
+
+
+def test_a_session_round_verdict_derives_from_its_ping(ledger, clock):
+    clock()
+    _verdict_ping(ledger, 2, readiness="operator", klass="security", contract=3)
+    (event,) = derive_events(ledger)
+    assert event["kind"] == "round.verdict"
+    assert event["dedupeKey"] == f"revloop:round.verdict:{REPO}:7:2:{HEAD}"
+    assert event["at"] == clock.now() * 1000
+    assert (event["repo"], event["prNumber"], event["round"]) == (REPO, 7, 2)
+    assert event["data"] == {
+        "verdict": "approve", "headSha": HEAD, "readiness": "operator",
+        "readinessClass": "security", "contractVersion": 3, "taskRef": "TASK-500",
+    }
+
+
+def test_an_operator_ping_with_no_class_carries_the_unclassed_marker(ledger, clock):
+    clock()
+    _verdict_ping(ledger, 1, readiness="operator", klass=None)
+    (event,) = derive_events(ledger)
+    assert event["data"]["readinessClass"] == loop_events.ROUND_VERDICT_UNCLASSED == "unclassed"
+
+
+def test_auto_never_carries_a_class(ledger, clock):
+    clock()
+    _verdict_ping(ledger, 1, readiness="auto", klass="security")
+    (event,) = derive_events(ledger)
+    assert event["data"]["readinessClass"] is None
+
+
+def test_a_native_post_and_its_ping_derive_one_event_not_two(ledger, clock):
+    """c1: one event per (repo, pr, round, head). The fallback row is the
+    event; the ping is folded into it."""
+    clock()
+    ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
+    clock()
+    ledger.record_verdict_post(REPO, 7, 1, "url", verdict="approve")
+    _verdict_ping(ledger, 1, readiness="operator", klass=None, contract=2)
+    (event,) = derive_events(ledger)
+    assert event["at"] == clock.now() * 1000
+    assert {k: event["data"][k] for k in ROUND_VERDICT_KEYS} == {
+        "verdict": "approve", "headSha": HEAD, "readiness": "operator",
+        "readinessClass": "unclassed", "contractVersion": 2, "taskRef": "TASK-500",
+    }
+    assert event["data"]["reviewUrl"] == "url"
+
+
+def test_an_abandoned_rounds_ping_derives_no_verdict(ledger, clock):
+    clock()
+    ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
+    ledger.record_verdict_post_abandoned(REPO, 7, 1, "gone")
+    _verdict_ping(ledger, 1)
+    assert [e["kind"] for e in derive_events(ledger)] == ["round.abandoned"]
+
+
+def test_an_open_obligation_does_not_hide_the_sessions_ping(ledger, clock):
+    clock()
+    ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
+    _verdict_ping(ledger, 1)
+    (event,) = derive_events(ledger)
+    assert event["kind"] == "round.verdict"
+
+
+def test_every_round_verdict_carries_the_six_keys(ledger, clock):
+    clock()
+    _verdict_ping(ledger, 1, verdict="request_changes", readiness=None, task=None)
+    ledger.note_verdict_post_owed(REPO, 8, 1, HEAD)
+    ledger.record_verdict_post(REPO, 8, 1, "url", verdict="approve")
+    events = by_kind(derive_events(ledger), "round.verdict")
+    assert len(events) == 2
+    for event in events:
+        assert set(ROUND_VERDICT_KEYS) <= set(event["data"])
+
+
+def test_round_verdict_derivation_is_deterministic(ledger, clock):
+    clock()
+    _verdict_ping(ledger, 1)
+    assert derive_events(ledger) == derive_events(ledger)
+
+
+def test_the_round_verdict_kind_round_trips_and_refuses_foreign_characters():
+    kind = loop_events.round_verdict_kind(
+        3, "abc:def", "approve", "operator", "Not-A-Class", 7, "TASK-1 x",
+    )
+    assert kind.startswith(loop_events.round_verdict_prefix(3))
+    match = loop_events._ROUND_VERDICT_RE.match(kind)
+    assert match is not None
+    assert match.group("head") == "" and match.group("klass") == ""
+    assert match.group("task") == "" and match.group("contract") == "7"
+
+
+def test_round_verdict_prefix_is_distinct_from_every_other_ping_family():
+    others = (
+        loop_events.STALLED_PREFIX, loop_events.STABILITY_PREFIX,
+        loop_events.CHECKS_UNSETTLED_PREFIX, loop_events.PROMPT_PREFIX,
+        loop_events.PROMPT_PAGE_PREFIX, loop_events.AUTH_REJECTED_PREFIX,
+        loop_events.PLAN_ROUND_PREFIX,
+    )
+    for other in others:
+        assert not other.startswith(loop_events.ROUND_VERDICT_PREFIX)
+        assert not loop_events.ROUND_VERDICT_PREFIX.startswith(other)
+    assert not loop_events.round_verdict_prefix(1).startswith(
+        loop_events.round_verdict_prefix(11)
+    )
+    assert not loop_events.round_verdict_prefix(11).startswith(
+        loop_events.round_verdict_prefix(1)
+    )

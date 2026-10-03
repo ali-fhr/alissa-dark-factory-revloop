@@ -4,6 +4,53 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.10
+
+- **`round.verdict` is posted for every verdict of record** (issue #155;
+  origin TASK-934123099, implementation TASK-1627052337) — lane L10 of the
+  Studio design `docs/design/loop-operator-surface.md` (§1.3, §6.4). Until
+  now the kind derived only from `verdict_posts`, the native-fallback
+  obligation record, so a fleet whose sessions post their own reviews
+  emitted none. Every `round.verdict` now carries the six data keys
+  `verdict`, `headSha`, `readiness`, `readinessClass`, `contractVersion`
+  and `taskRef` (null where unknown) and is keyed on
+  `(repo, pr, round, head)`.
+  - **The ledger row** is one `round-verdict:` ping per (PR, round)
+    (`loop_events.round_verdict_kind`), written by the native post at post
+    time and, for a round the SESSION closed, on the first pass that sees
+    the envelope and the session's review together. First record wins; a
+    dry run writes none. A native post's `verdict_posts` row and its ping
+    derive ONE event.
+  - **Session-closed rounds are found off the spawn ledger**, not only
+    through the review-requested search: a session's own review consumes the
+    request, so its PR leaves the search as the round closes, and a terminal
+    round (the final approve, an un-re-requested `request_changes`) would
+    never be seen. `sweep_round_verdicts` runs every poll after the evaluate
+    loop over the newest spawn row per PR within 24 h that has no
+    `round-verdict:` row and that the search did not return. It reads the
+    review task by the ledger's ref (a validated task is still readable), and
+    fetches the PR and its reviews only once the round's envelope has landed.
+    Telemetry only: never fatal to the pass.
+  - **The head** of a session-closed round is the review the round count
+    reaches (`countable_rounds`), not the newest review — which is the next
+    round's while its session has reviewed but not yet written its envelope.
+  - **`verdict` is what GitHub holds**: a native approve the CI gate
+    downgraded reports `request_changes` or `comment`, not `approve`.
+  - **Readiness** is what the approve carries: the native post's trailer
+    read back with the trailer grammar, or the session envelope mapped
+    through the same fail-closed rule — so an approve whose envelope names
+    no readiness is `operator` with `readinessClass: "unclassed"`. A
+    `request_changes` (or an approve the CI gate downgraded) carries null.
+    A plan PR reads its `Commit-Readiness`.
+  - **`contractVersion`** is the envelope's `Contract: v<n>` line — the `v`
+    required, so prose like `Contract 3 criteria` sets nothing
+    (`alissa.parse_contract_version`, on `VerdictEnvelope.contract_version`);
+    null until reviewers record it (design lane L11). `TaskDetail` now carries
+    the newest envelope whole, so the session path costs no extra task read.
+  - `taskRef` is the review task, as on `round.spawned`.
+  - A `verdict_posts` row that predates the verdict column now carries
+    `data.verdict: null` instead of omitting the key.
+
 ## 0.31.9
 
 - **Every reviewer spawn is stamped with the origin task and the repo**

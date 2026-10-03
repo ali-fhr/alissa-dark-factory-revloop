@@ -527,6 +527,32 @@ def parse_commit_readiness(blob: object) -> "tuple[str | None, str, str | None]"
     return _commit_classed(match.group(1), match.group(2))
 
 
+# The contract version the reviewer judged against (issue #155; Studio
+# design `loop-operator-surface.md` §6.4, lanes L10/L11): the reviewer reads
+# the task at round start and records `**Contract:** v<n>` under the reviewed
+# head. The same markdown tolerance as the readiness lines -- an optional
+# bullet, optional bold around the label with the colon inside or outside --
+# but the `v` is REQUIRED: L11 has not shipped the line yet, and without it any
+# prose that opens with `Contract` and a number (`Contract 3 criteria
+# re-checked`) would set the version (PR #156 round 1). Absent (every
+# envelope written before L11 ships) reads as None, never as v1: the event's
+# key is then null, the design's "absent" case, rather than a version nobody
+# recorded.
+_CONTRACT_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*Contract[ \t]*:?[ \t]*(?:\*\*)?"
+    r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*v(\d{1,9})\b",
+    re.MULTILINE,
+)
+
+
+def parse_contract_version(blob: object) -> "int | None":
+    """The `Contract: v<n>` an envelope records, as an int, or None."""
+    if not isinstance(blob, str):
+        return None
+    match = _CONTRACT_RE.search(blob)
+    return None if match is None else int(match.group(1))
+
+
 @dataclass(frozen=True)
 class Task:
     ref: str  # TASK-<taskNumber>
@@ -829,6 +855,9 @@ class VerdictEnvelope:
     envelope's `Commit-Readiness` line (issue #148), read off the same
     evidence item; only a PLAN PR's native post reads them, and a code PR's
     envelope simply has none.
+
+    `contract_version` is the envelope's `Contract: v<n>` (issue #155), or
+    None when it records none -- read for the `round.verdict` event only.
     """
 
     verdict: str
@@ -836,6 +865,7 @@ class VerdictEnvelope:
     readiness_reason: str = ""
     commit_readiness: "str | None" = None
     commit_readiness_reason: str = ""
+    contract_version: "int | None" = None
 
 
 @dataclass(frozen=True)
@@ -854,11 +884,16 @@ class TaskDetail:
     `verdict` is None when no envelope on the task parses -- the normal round-1
     case, indistinguishable here from "no verdict of record yet", which is what
     the caller wants it to mean anyway.
+
+    `envelope` is that same newest envelope whole (issue #155): the
+    `round.verdict` event of a session-closed round reads its readiness and
+    contract version off the read that already knew the verdict word.
     """
 
     task: Task
     verdicts: int
     verdict: "str | None"
+    envelope: "VerdictEnvelope | None" = None
 
 
 class Alissa:
@@ -1182,10 +1217,12 @@ class Alissa:
             task = _task_from_row(data)
             if task is None:
                 return None
+            envelope = self._newest_envelope(data)
             return TaskDetail(
                 task=task,
                 verdicts=self._count_verdicts(data),
-                verdict=self._newest_verdict(data),
+                verdict=None if envelope is None else envelope.verdict,
+                envelope=envelope,
             )
         except Exception:  # pragma: no cover - defence in depth
             log.exception("could not parse task payload for %s", ref)
@@ -1348,6 +1385,9 @@ class Alissa:
                     commit, commit_reason, _ = parse_commit_readiness(content)
                     if commit is None:
                         commit, commit_reason, _ = parse_commit_readiness(title)
+                    contract = parse_contract_version(content)
+                    if contract is None:
+                        contract = parse_contract_version(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
@@ -1357,6 +1397,7 @@ class Alissa:
                              readiness_reason=reason,
                              commit_readiness=commit,
                              commit_readiness_reason=commit_reason,
+                             contract_version=contract,
                          ))
                     )
                     break
