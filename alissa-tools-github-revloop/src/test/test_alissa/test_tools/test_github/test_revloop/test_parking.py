@@ -779,11 +779,11 @@ def test_a_studio_that_refuses_idle_gets_the_snapshot_without_it(tmp_path, caplo
         assert pusher.push_once(heartbeat_at=time.time()) == VITALS_PUSHED
 
     assert "idle" in client.posts[0] and "idle" not in client.posts[1]
-    assert "predates it" in caplog.text
+    assert "predates them" in caplog.text and "`idle`" in caplog.text
     # ...and leaves it out for the reprobe window, then offers it again.
     pusher.push_once(heartbeat_at=time.time())
     assert "idle" not in client.posts[2]
-    pusher._idle_refused_until = time.time() - 1
+    pusher._refused_until["idle"] = time.time() - 1
     pusher.push_once(heartbeat_at=time.time())
     assert "idle" in client.posts[3]
     assert IDLE_REPROBE_S == 3600.0

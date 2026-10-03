@@ -119,7 +119,7 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c
 # script the entrypoint starts. Naming the two apart keeps the next release a
 # one-line edit. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
 # (capability-probed, not version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.31.11
+ARG REVLOOP_VERSION=0.31.12
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.
