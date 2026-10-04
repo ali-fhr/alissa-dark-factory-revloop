@@ -325,3 +325,22 @@ jobs:
             exit 1
           fi
           echo "::notice::${DOCKERFILE} pins ${VERSION_ARG}=${pins}, equal to ${VERSION_FILE}."
+      # The docker CLI reads DOCKER_* variables (DOCKER_CONTEXT, DOCKER_HOST,
+      # DOCKER_CONFIG, …) from the environment, so any such key in
+      # image-publish.yaml's env blocks silently re-points every docker
+      # command of the publish job. Nothing else runs that workflow before a
+      # merge, so catch the name here: `DOCKER_CONTEXT: docker/claude` failed
+      # every publish from this repo at its first `docker version` (issue #161;
+      # ported from ali-fhr/alissa-dark-factory-orcloop PR #130).
+      - name: image-publish.yaml declares no DOCKER_* env key
+        env:
+          PUBLISH_WORKFLOW: .github/workflows/image-publish.yaml
+        run: |
+          set -euo pipefail
+          hits="$(grep -nE '^[[:space:]]*DOCKER_[A-Za-z0-9_]*[[:space:]]*:' "${PUBLISH_WORKFLOW}" || true)"
+          if [ -n "${hits}" ]; then
+            printf '%s\n' "${hits}"
+            echo "::error file=${PUBLISH_WORKFLOW}::env keys starting with DOCKER_ are read by the docker CLI itself and break the publish job; rename them (e.g. BUILD_CONTEXT)."
+            exit 1
+          fi
+          echo "::notice::${PUBLISH_WORKFLOW} declares no DOCKER_* env key."
