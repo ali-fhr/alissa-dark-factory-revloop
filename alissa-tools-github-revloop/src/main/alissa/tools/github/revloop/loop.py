@@ -94,6 +94,7 @@ from .fleet_vitals import (
     VITALS_SKIPPED,
     FleetVitalsPusher,
     build_pusher,
+    config_block as fleet_vitals_config_block,
 )
 from .loop_events import (
     LoopEventsEmitter,
@@ -2494,7 +2495,8 @@ class ReviewWatcher:
         # console sidecar need not be running.
         self._fleet_vitals: FleetVitalsPusher | None = (
             build_pusher(
-                config, github=self.github, endpoint=config.alissa_endpoint
+                config, github=self.github, endpoint=config.alissa_endpoint,
+                config_reader=self._vitals_config,
             )
             if config.fleet_vitals_enabled
             else None
@@ -7753,6 +7755,19 @@ class ReviewWatcher:
                 type(exc).__name__, exc,
             )
             return VITALS_FAILED
+
+    def _vitals_config(self) -> dict:
+        """The snapshot's `config` block (issue #159), read off what this
+        watcher RUNS on: `self.config` is re-bound by every allowlist
+        refresh (`_apply_repos`) and carries the feed authority
+        `resolve_feed_authority` settled at boot, so the block reports the
+        derived answer, not the configured one -- the pusher itself was built
+        with the boot config. The login is the reviewer identity's (memoised
+        after the first read; a failed read fails the block, never the
+        push)."""
+        return fleet_vitals_config_block(
+            self.config, gh_login=self.github.login
+        )
 
     def _note_ledger_unwritable(self) -> None:
         """Report a pass refused because the ledger cannot record it.
