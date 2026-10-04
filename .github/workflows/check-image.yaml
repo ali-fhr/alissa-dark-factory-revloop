@@ -108,3 +108,151 @@ jobs:
           REVLOOP_VERSION: ${{ steps.daemon.outputs.revloop_version }}
         run: |
           bash docker/claude/tests-image-contract.sh
+
+  # The publish job's two text parsers, exercised on CAPTURED output on every
+  # pull request (issue #161). image-publish.yaml only runs on a merge, so a
+  # parser that misreads real output — like the `--format
+  # '{{.Manifest.Digest}}'` read that compared two human-readable inspect
+  # blocks and failed orcloop run 36891689729 after a good push — is otherwise
+  # first caught by a failed release. The helpers are lifted VERBATIM from
+  # image-publish.yaml (between its `# >>> publish-helper: <name>` / `# <<<
+  # publish-helper: <name>` markers), so what is checked here is what runs
+  # there; the fixtures are that run's own log lines. No docker needed.
+  publish-helpers:
+    name: Publish helpers parse captured registry and build output
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+
+      - name: Exercise parse_registry_digest and is_index_lag
+        env:
+          PUBLISH_WORKFLOW: .github/workflows/image-publish.yaml
+        run: |
+          set -euo pipefail
+          load() {
+            local name="$1" body
+            body="$(sed -nE "/# >>> publish-helper: ${name}( |\$)/,/# <<< publish-helper: ${name}\$/p" "${PUBLISH_WORKFLOW}")"
+            if ! grep -qE "^[[:space:]]*${name}\(\)" <<<"${body}"; then
+              echo "::error file=${PUBLISH_WORKFLOW}::no '${name}()' between the '# >>> publish-helper: ${name}' and '# <<< publish-helper: ${name}' markers — this check cannot see the publish job's parser."
+              exit 1
+            fi
+            eval "${body}"
+          }
+          load parse_registry_digest
+          load is_index_lag
+          failures=0
+          pass() { echo "ok   - $1"; }
+          fail() { echo "::error::FAIL - $1"; failures=$(( failures + 1 )); }
+          fx="${RUNNER_TEMP}/publish-helpers"
+          mkdir -p "${fx}"
+
+          # ---- parse_registry_digest ----------------------------------------
+          d8="sha256:8adb4b393252747fe87c65e9b0f46fc2546df66cd79f59c177f5fe5a9d62d297"
+          # Captured: orcloop run 36891689729, `imagetools inspect` of :0.18
+          # and :0.18.7 right after `docker push` (single-platform manifest).
+          cat > "${fx}/floating.txt" <<'EOF'
+          Name:      ghcr.io/ali-fhr/alissa-dark-factory-orcloop:0.18
+          MediaType: application/vnd.docker.distribution.manifest.v2+json
+          Digest:    sha256:8adb4b393252747fe87c65e9b0f46fc2546df66cd79f59c177f5fe5a9d62d297
+          EOF
+          cat > "${fx}/version.txt" <<'EOF'
+          Name:      ghcr.io/ali-fhr/alissa-dark-factory-orcloop:0.18.7
+          MediaType: application/vnd.docker.distribution.manifest.v2+json
+          Digest:    sha256:8adb4b393252747fe87c65e9b0f46fc2546df66cd79f59c177f5fe5a9d62d297
+          EOF
+          # The index shape (multi-platform or attested push): the child
+          # entries carry OTHER digests and must never be read as the tag's.
+          cat > "${fx}/index.txt" <<'EOF'
+          Name:      ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2
+          MediaType: application/vnd.oci.image.index.v1+json
+          Digest:    sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+          Manifests:
+            Name:        ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:2222222222222222222222222222222222222222222222222222222222222222
+            MediaType:   application/vnd.oci.image.manifest.v1+json
+            Platform:    linux/amd64
+
+            Name:        ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:3333333333333333333333333333333333333333333333333333333333333333
+            MediaType:   application/vnd.oci.image.manifest.v1+json
+            Platform:    unknown/unknown
+            Annotations:
+              vnd.docker.reference.digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+              vnd.docker.reference.type:   attestation-manifest
+          EOF
+          expect_digest() {  # <label> <want> < input
+            local got
+            if got="$(parse_registry_digest)" && [ "${got}" = "$2" ]; then
+              pass "$1 -> ${got}"
+            else
+              fail "$1: expected '$2', got '${got:-<nothing, exit 1>}'"
+            fi
+          }
+          expect_none() {  # <label> < input
+            local got
+            if got="$(parse_registry_digest)"; then
+              fail "$1: expected no digest, got '${got}'"
+            else
+              pass "$1 -> no digest (exit 1)"
+            fi
+          }
+          expect_digest "captured block for :0.18" "${d8}" < "${fx}/floating.txt"
+          expect_digest "captured block for :0.18.7" "${d8}" < "${fx}/version.txt"
+          expect_digest "index block reads the top-level digest, not a child's" \
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111" < "${fx}/index.txt"
+          expect_digest "bare digest line, trailing blanks and CRLF" "${d8}" < <(printf '%s  \r\n' "${d8}")
+          expect_none "empty answer" < /dev/null
+          expect_none "registry error text" < <(echo 'ERROR: ghcr.io/ali-fhr/x:0.1: not found')
+          expect_none "63-hex digest" < <(echo "Digest:    ${d8%?}")
+          expect_none "upper-case hex" < <(echo "Digest:    sha256:8ADB4B393252747FE87C65E9B0F46FC2546DF66CD79F59C177F5FE5A9D62D297")
+          expect_none "child Name@digest lines alone" < <(sed -n '/^Manifests:/,$p' "${fx}/index.txt")
+          # The comparison the push step makes: the two captured blocks that
+          # failed orcloop's publish compare EQUAL once read as digests.
+          if [ "$(parse_registry_digest < "${fx}/floating.txt")" = "$(parse_registry_digest < "${fx}/version.txt")" ]; then
+            pass ":0.18 and :0.18.7 (captured) read as one digest"
+          else
+            fail ":0.18 and :0.18.7 (captured) read as different digests"
+          fi
+          if [ "$(parse_registry_digest < "${fx}/floating.txt")" != "$(parse_registry_digest < "${fx}/index.txt")" ]; then
+            pass "truly different digests compare unequal"
+          else
+            fail "different digests compare equal"
+          fi
+
+          # ---- is_index_lag -------------------------------------------------
+          # Captured: orcloop run 36891689729 attempt 1, the build's pip a
+          # minute after the runner's pip had fetched the same release.
+          cat > "${fx}/lag.log" <<'EOF'
+          #9 [ 2/13] RUN pip install "alissa-tools-github-orcloop==0.18.7"
+          #9 1.262 ERROR: Could not find a version that satisfies the requirement alissa-tools-github-orcloop==0.18.7 (from versions: 0.18.5, 0.18.6)
+          #9 1.262 ERROR: No matching distribution found for alissa-tools-github-orcloop==0.18.7
+          #9 ERROR: process "/bin/sh -c pip install \"alissa-tools-github-orcloop==${ORCLOOP_VERSION}\"" did not complete successfully: exit code: 1
+          EOF
+          cat > "${fx}/other.log" <<'EOF'
+          #12 [ 5/13] COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+          #12 ERROR: failed to calculate checksum of ref 0c1d: "/entrypoint.sh": not found
+          ERROR: failed to solve: failed to compute cache key: "/entrypoint.sh": not found
+          EOF
+          expect_lag() {  # <label> <dist> <version> <log> <want: yes|no>
+            local got=no
+            if DIST_NAME="$2" VERSION="$3" is_index_lag "$4"; then got=yes; fi
+            if [ "${got}" = "$5" ]; then pass "$1 -> retry=${got}"; else fail "$1: expected retry=$5, got ${got}"; fi
+          }
+          expect_lag "captured index lag on the released version" alissa-tools-github-orcloop 0.18.7 "${fx}/lag.log" yes
+          expect_lag "same log, another version is being published" alissa-tools-github-orcloop 0.18.70 "${fx}/lag.log" no
+          expect_lag "same log, a prefix of the version" alissa-tools-github-orcloop 0.18 "${fx}/lag.log" no
+          expect_lag "same log, another distribution is being published" alissa-tools-github-revloop 0.18.7 "${fx}/lag.log" no
+          sed 's/orcloop==0\.18\.7/revloop==0.31.12/g' "${fx}/lag.log" > "${fx}/revloop.log"
+          expect_lag "revloop's own release lagging" alissa-tools-github-revloop 0.31.12 "${fx}/revloop.log" yes
+          expect_lag "revloop log, a prefix of the version" alissa-tools-github-revloop 0.31.1 "${fx}/revloop.log" no
+          expect_lag "'.' in the version is literal" alissa-tools-github-revloop 0x31x12 "${fx}/revloop.log" no
+          expect_lag "any other build failure" alissa-tools-github-revloop 0.31.12 "${fx}/other.log" no
+          : > "${fx}/empty.log"
+          expect_lag "empty log" alissa-tools-github-revloop 0.31.12 "${fx}/empty.log" no
+
+          if [ "${failures}" -ne 0 ]; then
+            echo "::error file=${PUBLISH_WORKFLOW}::${failures} publish-helper check(s) failed — the publish job would misread real registry or build output (issue #161)."
+            exit 1
+          fi
+          echo "::notice::the publish job's digest parser and index-lag classifier read the captured output correctly."

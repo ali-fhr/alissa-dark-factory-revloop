@@ -66,8 +66,13 @@ env:
   # The version of record (the same file check-version-bump.yaml keys on).
   VERSION_FILE: alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version
   # Build context (holds the Dockerfile) and the contract check run against
-  # the built image before anything is pushed.
-  DOCKER_CONTEXT: docker/claude
+  # the built image before anything is pushed. Never name a key here DOCKER_*:
+  # the docker CLI reads DOCKER_CONTEXT, DOCKER_HOST, DOCKER_CONFIG, … from
+  # the environment, and `DOCKER_CONTEXT: docker/claude` made the very first
+  # `docker version` of every publish fail with `context "docker/claude":
+  # context not found` — no image was ever published until the rename
+  # (issue #161; check-version-bump.yaml's dockerfile-pin-sync job guards it).
+  BUILD_CONTEXT: docker/claude
   CONTRACT_SCRIPT: docker/claude/tests-image-contract.sh
   # The base image publishes linux/amd64 only (docker/claude/README.md,
   # "Platform: amd64 only"); no multi-arch.
@@ -79,6 +84,11 @@ env:
   PYPI_API_BASE: https://pypi.org/pypi
   PYPI_WAIT_SECONDS: '900'
   PYPI_POLL_SECONDS: '20'
+  # The build's own pip can still miss the release the `release` job saw: the
+  # CDN edge the builder reaches may lag the runner's (issue #161). The build
+  # is retried this many times, this far apart, ONLY on that failure.
+  BUILD_ATTEMPTS: '6'
+  BUILD_RETRY_SECONDS: '30'
 # -----------------------------------------------------------------------------
 
 jobs:
@@ -259,17 +269,51 @@ jobs:
 
       - name: Build the image at the released version
         if: steps.exists.outputs.exists == 'false'
+        # RETRIED ON INDEX LAG ONLY (issue #161). The `release` job's pip saw
+        # the release, yet the build's pip can still get "No matching
+        # distribution found" for it: the simple index is CDN-served, and the
+        # edge the builder reaches may lag the runner's (orcloop run
+        # 36891689729, first attempt). That one failure — for exactly
+        # ${DIST_NAME}==${VERSION}, never for another requirement — is retried
+        # up to BUILD_ATTEMPTS builds, BUILD_RETRY_SECONDS apart, saying so in
+        # the log; every other build failure fails at once.
         run: |
           set -euo pipefail
-          docker build --platform "${PLATFORM}" \
-            --build-arg "${VERSION_ARG}=${VERSION}" \
-            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-            --label "org.opencontainers.image.version=${VERSION}" \
-            --label "org.opencontainers.image.revision=${REVISION}" \
-            --label "org.opencontainers.image.title=${IMAGE_TITLE}" \
-            --label "org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
-            --label "org.opencontainers.image.licenses=Apache-2.0" \
-            -t "${IMAGE}:${VERSION}" "${DOCKER_CONTEXT}"
+          # >>> publish-helper: is_index_lag (exercised by check-image.yaml)
+          # True when the build log $1 shows pip could not find the release
+          # being published — the index lag, the only retryable failure.
+          is_index_lag() {
+            grep -qE -- "No matching distribution found for ${DIST_NAME}==${VERSION//./\\.}([^0-9A-Za-z.+]|\$)" "$1"
+          }
+          # <<< publish-helper: is_index_lag
+          log="${RUNNER_TEMP}/docker-build.log"
+          attempt=0
+          while :; do
+            attempt=$(( attempt + 1 ))
+            rc=0
+            docker build --progress=plain --platform "${PLATFORM}" \
+              --build-arg "${VERSION_ARG}=${VERSION}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.version=${VERSION}" \
+              --label "org.opencontainers.image.revision=${REVISION}" \
+              --label "org.opencontainers.image.title=${IMAGE_TITLE}" \
+              --label "org.opencontainers.image.description=${IMAGE_DESCRIPTION}" \
+              --label "org.opencontainers.image.licenses=Apache-2.0" \
+              -t "${IMAGE}:${VERSION}" "${BUILD_CONTEXT}" 2>&1 | tee "${log}" || rc=$?
+            # tee's own status is 0, so under pipefail a non-zero rc here is
+            # docker build's.
+            [ "${rc}" -eq 0 ] && break
+            if ! is_index_lag "${log}"; then
+              echo "::error::docker build failed (exit ${rc}) for a reason other than PyPI's index lag on ${DIST_NAME}==${VERSION} — not retrying. Nothing was pushed."
+              exit "${rc}"
+            fi
+            if [ "${attempt}" -ge "${BUILD_ATTEMPTS}" ]; then
+              echo "::error::the build's pip still found no ${DIST_NAME}==${VERSION} on PyPI's simple index after ${attempt} attempts ${BUILD_RETRY_SECONDS}s apart. Nothing was pushed; re-run this workflow (Actions -> Re-run jobs) once the index serves it."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}/${BUILD_ATTEMPTS}: the build's pip cannot see ${DIST_NAME}==${VERSION} yet — waiting on PyPI's simple index (its CDN edge lags the release); rebuilding in ${BUILD_RETRY_SECONDS}s"
+            sleep "${BUILD_RETRY_SECONDS}"
+          done
           # The labels are this workflow's, not the Dockerfile's, so assert
           # them here rather than in the contract script.
           for pair in "source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" "version=${VERSION}" "revision=${REVISION}"; do
@@ -314,11 +358,50 @@ jobs:
           done
           # Read the digest BACK from the registry — what it serves, not what
           # the local store thinks — and check the three tags agree.
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}')"
+          #
+          # HOW THE DIGEST IS READ (issue #161). Not with `--format
+          # '{{.Manifest.Digest}}'`: on the ubuntu-24.04 runners' buildx that
+          # prints the whole default inspect block (Name: / MediaType: /
+          # Digest:) for an image pushed by `docker push`, exit 0, and a
+          # comparison of those blocks failed a publish whose push had
+          # succeeded (orcloop run 36891689729). The PLAIN default output is
+          # read instead, and only its top-level, column-0 `Digest:` line is
+          # taken (a bare `sha256:…` line is accepted too, should a buildx ever
+          # print one); an index's indented child `Manifests:` entries are
+          # never mistaken for it. Anything else is "unreadable" — retried a
+          # few times (the registry can trail a push by a moment), then a
+          # clear failure — and a mismatch is reported only between two bare
+          # sha256 digests that truly differ.
+          # >>> publish-helper: parse_registry_digest (exercised by check-image.yaml)
+          # stdin: `docker buildx imagetools inspect <ref>` output. stdout: the
+          # bare `sha256:<64 hex>` digest; exit 1 when there is none.
+          parse_registry_digest() {
+            awk '{ sub(/\r$/, "") }
+                 d == "" && /^(Digest:|sha256:)/ \
+                   && ((NF == 2 && $1 == "Digest:") || NF == 1) \
+                   && $NF ~ /^sha256:[0-9a-f]+$/ && length($NF) == 71 { d = $NF }
+                 END { if (d == "") exit 1; print d }'
+          }
+          # <<< publish-helper: parse_registry_digest
+          registry_digest() {
+            local raw="" d try
+            for try in 1 2 3; do
+              if raw="$(docker buildx imagetools inspect "$1" 2>&1)" \
+                 && d="$(printf '%s\n' "${raw}" | parse_registry_digest)"; then
+                printf '%s\n' "${d}"
+                return 0
+              fi
+              echo "attempt ${try}: could not read a sha256 digest for $1 from the registry yet" >&2
+              sleep 5
+            done
+            echo "::error::could not read a sha256 digest for $1 from the registry after 3 attempts; its last answer was: ${raw}" >&2
+            return 1
+          }
+          digest="$(registry_digest "${IMAGE}:${VERSION}")"
           for tag in "${major_minor}" "${major}"; do
-            other="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}}')"
+            other="$(registry_digest "${IMAGE}:${tag}")"
             if [ "${other}" != "${digest}" ]; then
-              echo "::error::${IMAGE}:${tag} resolves to ${other}, not ${digest}"
+              echo "::error::${IMAGE}:${tag} resolves to ${other}, but ${IMAGE}:${VERSION} (pushed by this run) resolves to ${digest} — the floating tag does not point at this release."
               exit 1
             fi
           done
