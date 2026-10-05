@@ -561,6 +561,17 @@ done
 UI_ENABLED=0
 if is_truthy "${ALISSA_UI_ENABLED:-0}"; then UI_ENABLED=1; fi
 UI_PORT="${PORT:-8080}"
+# Bind address: dual-stack `::` by default (issue #163) — Railway's private
+# network resolves `<service>.railway.internal` to IPv6 only, so an IPv4-only
+# 0.0.0.0 bind refuses orcloop's flow watchdog and seat parking. The console
+# clears IPV6_V6ONLY on `::`, so IPv4 clients still connect (as v4-mapped
+# peers). ALISSA_UI_HOST overrides it at runtime (0.0.0.0 restores the old
+# IPv4-only bind); UI_BIND is the host:port form the logs print.
+UI_HOST="${ALISSA_UI_HOST:-::}"
+case "${UI_HOST}" in
+  *:*) UI_BIND="[${UI_HOST}]:${UI_PORT}" ;;
+  *)   UI_BIND="${UI_HOST}:${UI_PORT}" ;;
+esac
 if [ "${CONTAINER_ROLE}" = "executor" ]; then
   [ "${UI_ENABLED}" = "1" ] \
     && log "WARN: ALISSA_UI_ENABLED is set on an EXECUTOR service — the reviewer console is a review-loop surface and is NOT started here; no listener." \
@@ -569,7 +580,7 @@ if [ "${CONTAINER_ROLE}" = "executor" ]; then
 elif [ "${UI_ENABLED}" = "1" ]; then
   [ -n "${ALISSA_UI_PASSCODE:-}" ] \
     || die "ALISSA_UI_ENABLED is set but ALISSA_UI_PASSCODE is empty — the console is fail-closed on the passcode (it is the ONLY gate, and it rides the public URL once you enable networking). Set ALISSA_UI_PASSCODE, or unset ALISSA_UI_ENABLED."
-  log "reviewer console ENABLED (ALISSA_UI_ENABLED) — will serve on 0.0.0.0:${UI_PORT} (passcode required)"
+  log "reviewer console ENABLED (ALISSA_UI_ENABLED) — will serve on ${UI_BIND} (passcode required)"
 else
   log "reviewer console disabled (ALISSA_UI_ENABLED unset/off) — no listener"
 fi
@@ -1605,10 +1616,11 @@ log "alissa worker is running"
 #
 # Opt-in via ALISSA_UI_ENABLED (resolved + passcode-preflighted at 2d). It runs
 # as a backgrounded child of this entrypoint, so tini (PID 1) reaps it with the
-# rest of the tmux/node/claude fan-out. It binds 0.0.0.0:${PORT:-8080} — not the
+# rest of the tmux/node/claude fan-out. It binds ${UI_BIND} (dual-stack
+# [::]:${PORT:-8080} unless ALISSA_UI_HOST says otherwise, see 2d) — not the
 # sidecar's own 127.0.0.1:8788 default — so a platform (Railway) can route its
-# public URL to the container; the passcode is the ONLY gate (see the README
-# warning). ALISSA_UI_PASSCODE is read straight from the inherited env (already
+# public URL and its IPv6 private network to the container; the passcode is the
+# ONLY gate (see the README warning). ALISSA_UI_PASSCODE is read straight from the inherited env (already
 # validated present), and it watches the same WORKSPACE_ROOT the daemon does —
 # the state.db written below it and the review-* sessions — so its panels are
 # truthful. It is started AFTER the worker so the process list it renders is the
@@ -1623,8 +1635,8 @@ log "alissa worker is running"
 UI_PID=""
 UI_MONITOR_PID=""
 if [ "${UI_ENABLED}" = "1" ]; then
-  log "starting reviewer console (alissa-revloop-ui) on 0.0.0.0:${UI_PORT}"
-  alissa-revloop-ui --host 0.0.0.0 --port "${UI_PORT}" \
+  log "starting reviewer console (alissa-revloop-ui) on ${UI_BIND}"
+  alissa-revloop-ui --host "${UI_HOST}" --port "${UI_PORT}" \
     --workspace-root "${WORKSPACE_ROOT}" &
   UI_PID=$!
   (

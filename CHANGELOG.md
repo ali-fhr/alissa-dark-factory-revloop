@@ -4,6 +4,26 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.13
+
+- **The console binds dual-stack** (issue #163; origin TASK-386369234,
+  implementation TASK-264038985). Railway's private network resolves
+  `<service>.railway.internal` to IPv6 only, and the container's console
+  listened on `0.0.0.0` (IPv4), so orcloop's flow watchdog and seat parking
+  got `Connection refused` while the public URL kept working.
+  - **`make_server` takes an IPv6 literal**: a host containing `:` gets an
+    `AF_INET6` socket, with `IPV6_V6ONLY` cleared so `::` also accepts IPv4
+    clients (as v4-mapped peers) whatever the host's
+    `net.ipv6.bindv6only`. An IPv4 address or hostname keeps the stdlib
+    `AF_INET` default, so `0.0.0.0` behaves exactly as before.
+  - **The entrypoint binds `::` by default**, overridable at runtime with
+    `ALISSA_UI_HOST` (`0.0.0.0` restores the IPv4-only bind). Both its log
+    lines and the sidecar's `serving on` line print the real bind, IPv6
+    literals bracketed (`[::]:8080`).
+  - An image pinned below 0.31.13 must set `ALISSA_UI_HOST=0.0.0.0`: the
+    older sidecar cannot bind `::` and exits at start (logged by the
+    entrypoint's monitor).
+
 ## 0.31.12
 
 - **The `config` block on the fleet-vitals snapshot** (issue #159; origin

@@ -117,9 +117,12 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c
 # The FLOOR is separate from the current pin and moves far less often: never
 # below 0.15.0, the first version shipping the `alissa-revloop-ui` console
 # script the entrypoint starts. Naming the two apart keeps the next release a
-# one-line edit. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
+# one-line edit. The console's dual-stack default (`--host ::`, issue #163)
+# needs >= 0.31.13: an older sidecar cannot bind an IPv6 literal and exits at
+# start (the entrypoint's monitor logs it), so a pin below that sets
+# ALISSA_UI_HOST=0.0.0.0 — it does not move the floor. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
 # (capability-probed, not version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.31.12
+ARG REVLOOP_VERSION=0.31.13
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.

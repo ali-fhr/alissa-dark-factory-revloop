@@ -226,7 +226,7 @@ lane** in Studio instead of editing `ALISSA_REVIEW_REPOS` and redeploying — se
 must NOT be baked in.
 
 The **reviewer console** knobs (`ALISSA_UI_ENABLED`, `ALISSA_UI_PASSCODE`,
-`PORT`, `ALISSA_UI_SECURE_COOKIE`) are deliberately **not** ARGs — they are
+`PORT`, `ALISSA_UI_HOST`, `ALISSA_UI_SECURE_COOKIE`) are deliberately **not** ARGs — they are
 runtime-only service variables. See
 [Reviewer console](#reviewer-console-runtime-env-only--alissa_ui_enabled-alissa_ui_passcode-port)
 and [The console on Railway](#the-console-on-railway).
@@ -976,11 +976,17 @@ knobs are **runtime-only** (not build `ARG`s), for the reasons in each row:
 | --- | --- | --- |
 | `ALISSA_UI_ENABLED` | *(unset ⇒ off)* | `1`/`true`/`yes`/`on` starts the console sidecar; anything else (incl. unset) leaves **no listener**. Runtime-only so it pairs with the two below; the entrypoint already defaults it off, so no ARG default is needed |
 | `ALISSA_UI_PASSCODE` | *(none)* | **the console's only gate** — a secret, so never a build ARG (an ARG leaks into `docker history`, like the tokens). With `ALISSA_UI_ENABLED` set, an **empty passcode dies at boot** (fail-closed, consistent with the identity gates) |
-| `PORT` | `8080` | bind port for the console. Platform-injected at runtime (Railway sets it); the entrypoint binds `0.0.0.0:${PORT:-8080}` so the platform can route a public URL to it. `EXPOSE 8080` in the Dockerfile documents the default |
+| `PORT` | `8080` | bind port for the console. Platform-injected at runtime (Railway sets it); the entrypoint binds `[::]:${PORT:-8080}` so the platform can route a public URL to it. `EXPOSE 8080` in the Dockerfile documents the default |
+| `ALISSA_UI_HOST` | `::` | bind address for the console. The default `::` is **dual-stack** — IPv6 and IPv4 clients both connect (the console clears `IPV6_V6ONLY` on it, so this holds whatever the host's `net.ipv6.bindv6only`). Runtime-only, like `PORT`: it is a property of the network the service lands on, not of the image. `0.0.0.0` restores the pre-0.31.13 IPv4-only bind; an IPv6 literal binds that address only. The boot log prints the real bind (`[::]:8080`, `0.0.0.0:8080`). Needs `REVLOOP_VERSION >= 0.31.13` for the `::` default: an older sidecar cannot bind an IPv6 literal and exits at start (the monitor logs it), so set `ALISSA_UI_HOST=0.0.0.0` on an older pin |
 | `ALISSA_UI_SECURE_COOKIE` | *(unset ⇒ off)* | `1` adds `Secure` to the session cookie — set it whenever the console rides a TLS-terminated public URL |
 
-When enabled the console binds **`0.0.0.0`** (not the sidecar's own
-`127.0.0.1:8788` default) so the platform's router can reach it, and exposes an
+When enabled the console binds **`::`** — every IPv6 *and* IPv4 address, not
+the sidecar's own `127.0.0.1:8788` default — so the platform's router can reach
+it. Dual-stack matters on Railway: its private network resolves
+`<service>.railway.internal` to **IPv6 only**, so an IPv4-only `0.0.0.0` bind
+refuses orcloop's flow watchdog and seat parking (`ALISSA_ORC_SEAT_CONSOLES_JSON`
+→ `http://<service>.railway.internal:8080`) with `Connection refused` while the
+public URL still works. It also exposes an
 unauthenticated **`/healthz`** liveness endpoint (`{"ok": true, "version": …}`) —
 use it as the deployment healthcheck. The console is a **sidecar**: if it exits
 the daemon and worker keep running, but the entrypoint logs the exit loudly (the
@@ -1006,8 +1012,9 @@ docker run -d --name alissa-review \
 ```
 
 The wiring has its own suite — [`tests-entrypoint-ui.sh`](./tests-entrypoint-ui.sh)
-boots this entrypoint with the console off, enabled-without-a-passcode, enabled,
-and with the sidecar killed under it (CLIs stubbed, sidecar real, no docker
+boots this entrypoint with the console off, enabled-without-a-passcode, enabled
+(dual-stack: answers on `127.0.0.1` and `[::1]`), with the sidecar killed under
+it, and with `ALISSA_UI_HOST=0.0.0.0` (IPv6 refused) (CLIs stubbed, sidecar real, no docker
 required); it runs in CI beside the config-renderer suite.
 
 > ⚠️ Enabling the console and turning on the service's public networking puts the
@@ -1025,7 +1032,9 @@ required); it runs in CI beside the config-renderer suite.
    boot** with a clear message, before the worker or daemon start.
 2. Under the service's **Settings → Networking**, enable a public domain (or a
    TCP proxy). Railway injects `PORT` and routes the public URL to it; the
-   entrypoint already binds `0.0.0.0:${PORT:-8080}`.
+   entrypoint already binds `[::]:${PORT:-8080}`, which also answers the IPv6
+   private network (`<service>.railway.internal:${PORT}`) — leave
+   `ALISSA_UI_HOST` unset.
 3. Set the **Healthcheck Path** to **`/healthz`** — the console's unauthenticated
    liveness endpoint (`{"ok": true, "version": …}`). It reports up without
    exposing any data or needing the passcode. (Leave the healthcheck unset while
@@ -1498,7 +1507,8 @@ volumes:
 4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
 4b. When `ALISSA_UI_ENABLED` is set, start the reviewer console
-   (`alissa-revloop-ui`) backgrounded on `0.0.0.0:${PORT:-8080}` — a sidecar,
+   (`alissa-revloop-ui`) backgrounded on `[::]:${PORT:-8080}` (dual-stack;
+   `ALISSA_UI_HOST` overrides the address) — a sidecar,
    not the primary function, so a monitor logs loudly if it exits but does not
    tear the container down.
 5. Run `alissa-revloop` in the foreground; stop the worker (and the console

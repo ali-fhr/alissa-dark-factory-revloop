@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import sqlite3
 import sys
 import time
@@ -576,8 +577,34 @@ _REDIRECT_HOME = (
 )
 
 
+class _IPv6Server(ThreadingHTTPServer):
+    """The console on an IPv6 address (issue #163). `::` is the container
+    default because Railway's private network (`*.railway.internal`) resolves
+    to IPv6 only, and an AF_INET socket refuses those peers outright.
+    IPV6_V6ONLY is cleared explicitly rather than inherited from
+    net.ipv6.bindv6only, so `::` also takes IPv4 (as v4-mapped peers) on any
+    host; on a specific address like `::1` the option is moot."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass  # no dual-stack on this platform: `::` serves IPv6 only
+        super().server_bind()
+
+
+def bind_url(host: str, port: int) -> str:
+    """The URL a bind serves, brackets around an IPv6 literal."""
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
 def make_server(app: App, host: str, port: int) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((host, port), Handler)
+    # An IPv6 literal (anything with a ':') needs an AF_INET6 socket; an IPv4
+    # address or a hostname keeps the stdlib's AF_INET default.
+    cls = _IPv6Server if ":" in host else ThreadingHTTPServer
+    server = cls((host, port), Handler)
     server.daemon_threads = True
     server.app = app  # type: ignore[attr-defined]
     return server
