@@ -1645,7 +1645,8 @@ devloop console's 8787: the two daemons routinely run on one machine.
 
 **In the container.** The reviewer image wires the sidecar in: set
 `ALISSA_UI_ENABLED=1` **and** `ALISSA_UI_PASSCODE`, and the entrypoint starts the
-console alongside the worker and daemon on `0.0.0.0:${PORT:-8080}` (off by
+console alongside the worker and daemon on dual-stack `[::]:${PORT:-8080}`
+(`ALISSA_UI_HOST` overrides the address; off by
 default; enabled-without-a-passcode dies at boot; `/healthz` is the platform
 healthcheck path). Enabling it behind a public URL puts the dashboard — kill and
 retry-now included — on the internet behind that one passcode. See

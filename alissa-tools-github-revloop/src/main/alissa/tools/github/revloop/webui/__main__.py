@@ -20,7 +20,7 @@ from ..config import Config, load_config_file, resolve_config_path
 from ..fleet_vitals import FleetVitalsPusher
 from ..version import version
 from .auth import Auth, PasscodeUnset, require_passcode
-from .server import App, make_server
+from .server import App, bind_url, make_server
 from .sources import Sources
 
 # The default bind port. Deliberately NOT the devloop console's 8787: the two
@@ -52,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {version.value}")
     p.add_argument("--host", default="127.0.0.1", metavar="ADDR",
-                   help="bind address (default: 127.0.0.1 -- localhost only)")
+                   help="bind address (default: 127.0.0.1 -- localhost only); "
+                   "an IPv6 literal binds IPv6, and `::` takes IPv4 too")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, metavar="PORT",
                    help=f"bind port (default: {DEFAULT_PORT})")
     p.add_argument("--workspace-root", type=Path, default=None, metavar="PATH",
@@ -131,7 +132,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
     print(
         f"alissa-revloop-ui {version.value} -- serving on "
-        f"http://{args.host}:{args.port} (passcode required); "
+        f"{bind_url(args.host, args.port)} (passcode required); "
         f"watching {config.workspace_root}",
         flush=True,
     )

@@ -12,12 +12,14 @@
 #   1. console OFF (ALISSA_UI_ENABLED unset) -> boots, NO listener on ${PORT}
 #      (and the pass-through-when-unset config contract still holds end to end)
 #   2. console ON, no passcode               -> dies at boot, BEFORE the worker
-#   3. console ON with a passcode            -> serves 0.0.0.0:${PORT}:
-#      /healthz 200 unauthenticated, /api/state 401 without a session, wrong
+#   3. console ON with a passcode            -> serves dual-stack [::]:${PORT}
+#      (IPv4 AND IPv6 clients, issue #163): /healthz 200 unauthenticated, /api/state 401 without a session, wrong
 #      passcode refused, right passcode -> session -> /api/state 200; orderly
 #      SIGTERM takes the sidecar down without tripping its "EXITED" alarm.
 #   4. console ON, sidecar killed under it -> the monitor logs the death LOUDLY
 #      and the daemon + worker keep running (fail-visible, not fail-fatal)
+#   5. ALISSA_UI_HOST=0.0.0.0 -> the old IPv4-only bind: IPv4 answers, IPv6
+#      is refused
 #
 # Usage: bash docker/claude/tests-entrypoint-ui.sh
 # Needs: curl, jq, python3, and `alissa-revloop-ui` available (installed, or
@@ -119,6 +121,13 @@ else
 fi
 chmod 0755 "${BIN}/gh" "${BIN}/alissa" "${BIN}/alissa-revloop"
 [ -L "${BIN}/alissa-revloop-ui" ] || chmod 0755 "${BIN}/alissa-revloop-ui"
+
+# Whether this host has an IPv6 loopback to probe the dual-stack bind over.
+HAS_V6="$(python3 -c 'import socket
+try:
+    s = socket.socket(socket.AF_INET6); s.bind(("::1", 0)); s.close(); print(1)
+except Exception:
+    print(0)')"
 
 PORT_FREE="$(python3 -c 'import socket
 s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
@@ -224,7 +233,7 @@ fi
 
 # -----------------------------------------------------------------------------
 info ""
-info "3. console ENABLED with a passcode -> serves on 0.0.0.0:\${PORT}"
+info "3. console ENABLED with a passcode -> serves dual-stack on [::]:\${PORT}"
 # -----------------------------------------------------------------------------
 LOG3="${TMPROOT}/on.log"
 JAR="${TMPROOT}/cookies.txt"
@@ -234,7 +243,9 @@ run_entrypoint "${LOG3}" ALISSA_UI_ENABLED=true ALISSA_UI_PASSCODE="${PASSCODE}"
 wait_for_log "${LOG3}" "starting reviewer console" 30 \
   || bad "entrypoint never started the console (see ${LOG3})"
 assert_contains "${LOG3}" "reviewer console ENABLED" "logs the console as enabled"
-assert_contains "${LOG3}" "0.0.0.0:${PORT_FREE}" "binds the platform \${PORT} on 0.0.0.0"
+assert_contains "${LOG3}" "starting reviewer console (alissa-revloop-ui) on [::]:${PORT_FREE}" \
+  "binds the platform \${PORT} on dual-stack :: by default (no ALISSA_UI_HOST)"
+assert_contains "${LOG3}" "serving on http://[::]:${PORT_FREE}" "the sidecar reports the real bind"
 
 up=0
 for _ in $(seq 1 30); do
@@ -264,7 +275,16 @@ if [ "${up}" = "1" ]; then
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -b "${JAR}" \
     "http://127.0.0.1:${PORT_FREE}/api/state")" "200" "GET /api/state with the session -> 200"
 
-  # 0.0.0.0, not 127.0.0.1: reachable on a non-loopback address (that is what
+  # Dual-stack: the IPv4 checks above rode 127.0.0.1 as v4-mapped peers; an
+  # IPv6 client (what *.railway.internal resolves to) must answer too.
+  if [ "${HAS_V6}" = "1" ]; then
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      "http://[::1]:${PORT_FREE}/healthz")" "200" "reachable over IPv6 ([::1]) -> dual-stack bind"
+  else
+    info "  skip IPv6 reachability (no IPv6 loopback on this host)"
+  fi
+
+  # A wildcard, not 127.0.0.1: reachable on a non-loopback address (that is what
   # lets a platform router reach it). Skipped when the host has none.
   hostip="$(python3 -c 'import socket
 try:
@@ -274,7 +294,7 @@ except Exception:
     print("")')"
   if [ -n "${hostip}" ] && [ "${hostip}" != "127.0.0.1" ]; then
     assert_eq "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-      "http://${hostip}:${PORT_FREE}/healthz")" "200" "reachable off-loopback (${hostip}) -> 0.0.0.0 bind"
+      "http://${hostip}:${PORT_FREE}/healthz")" "200" "reachable off-loopback (${hostip}) -> wildcard bind"
   else
     info "  skip non-loopback reachability (no routable address on this host)"
   fi
@@ -320,7 +340,7 @@ if wait_for_log "${LOG4}" "starting reviewer console" 30; then
     # Match on the argv the entrypoint passes, not the program name: the
     # sidecar may be the installed console script or (in a source checkout) a
     # python -m invocation of the same module.
-    ui_pid="$(pgrep -f -- "--host 0.0.0.0 --port ${PORT_FREE}" | head -1 || true)"
+    ui_pid="$(pgrep -f -- "--host :: --port ${PORT_FREE}" | head -1 || true)"
     [ -n "${ui_pid}" ] && break
     sleep 1
   done
@@ -346,6 +366,33 @@ else
   bad "entrypoint never started the console (see ${LOG4})"
 fi
 stop_entrypoint "${PID4}"
+
+# -----------------------------------------------------------------------------
+info ""
+info "5. ALISSA_UI_HOST=0.0.0.0 -> the old IPv4-only bind"
+# -----------------------------------------------------------------------------
+LOG5="${TMPROOT}/v4only.log"
+rm -f "${MARKERS}"/*
+run_entrypoint "${LOG5}" ALISSA_UI_ENABLED=1 ALISSA_UI_PASSCODE="${PASSCODE}" \
+  ALISSA_UI_HOST=0.0.0.0; PID5="${EP_PID}"
+wait_for_log "${LOG5}" "starting reviewer console" 30 \
+  || bad "entrypoint never started the console (see ${LOG5})"
+assert_contains "${LOG5}" "starting reviewer console (alissa-revloop-ui) on 0.0.0.0:${PORT_FREE}" \
+  "ALISSA_UI_HOST overrides the bind (logged as 0.0.0.0:\${PORT})"
+up=0
+for _ in $(seq 1 30); do
+  curl -fsS --max-time 3 "http://127.0.0.1:${PORT_FREE}/healthz" >/dev/null 2>&1 && { up=1; break; }
+  sleep 1
+done
+[ "${up}" = "1" ] && pass "IPv4 client answers on 0.0.0.0" || bad "console never came up on 0.0.0.0"
+if [ "${up}" = "1" ] && [ "${HAS_V6}" = "1" ]; then
+  if curl -fsS --max-time 3 "http://[::1]:${PORT_FREE}/healthz" >/dev/null 2>&1; then
+    bad "IPv6 client answered on an IPv4-only bind"
+  else
+    pass "IPv6 client refused on the IPv4-only bind"
+  fi
+fi
+stop_entrypoint "${PID5}"
 
 info ""
 if [ "${fail}" = "0" ]; then

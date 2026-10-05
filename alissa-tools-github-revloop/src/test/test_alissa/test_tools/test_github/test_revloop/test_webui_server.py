@@ -7,6 +7,7 @@ import http.cookies
 import io
 import json
 import re
+import socket
 import threading
 import types
 import urllib.error
@@ -20,7 +21,9 @@ from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
 from alissa.tools.github.revloop.webui import __main__ as ui_main
 from alissa.tools.github.revloop.webui.auth import SESSION_COOKIE, Auth
-from alissa.tools.github.revloop.webui.server import App, Handler, _MAX_BODY, make_server
+from alissa.tools.github.revloop.webui.server import (
+    App, Handler, _MAX_BODY, bind_url, make_server,
+)
 from alissa.tools.github.revloop.webui.sources import Sources
 
 SESSION = "review-widgets-pr16-r1-ab12cd"
@@ -424,6 +427,85 @@ def test_login_cookie_secure_when_configured(tmp_path):
         thread.join(timeout=2)
 
 
+# -- the bind address family (issue #163) -----------------------------------
+
+def _has_ipv6_loopback():
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+needs_ipv6 = pytest.mark.skipif(not _has_ipv6_loopback(),
+                                reason="no IPv6 loopback on this host")
+
+
+def _serve(tmp_path, host):
+    """A real console on <host>:<ephemeral>; returns (server, port, stop)."""
+    config = Config.build(tmp_path, {"repos": ["acme/widgets"]}, {})
+    src = Sources(config=config, running_version="0.14.0",
+                  run=lambda a, **k: "[]", http_get=lambda u, t: None,
+                  wall_clock=lambda: 5000.0)
+    app = App(auth=Auth("letmein", boot_nonce="fixed"), sources=src,
+              version="0.14.0", run=lambda a, **k: "", audit=lambda a, d: None)
+    server = make_server(app, host, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def stop():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    return server, server.server_address[1], stop
+
+
+@needs_ipv6
+def test_server_binds_ipv6_loopback_and_answers(tmp_path):
+    server, port, stop = _serve(tmp_path, "::1")
+    try:
+        assert server.socket.family == socket.AF_INET6
+        status, body, _ = _req(f"http://[::1]:{port}", "/healthz")
+        assert status == 200 and json.loads(body)["ok"] is True
+    finally:
+        stop()
+
+
+@needs_ipv6
+def test_server_on_wildcard_v6_is_dual_stack(tmp_path):
+    """`::` -- the container default -- answers IPv6 AND IPv4 clients, the
+    latter as v4-mapped peers, whatever net.ipv6.bindv6only says."""
+    server, port, stop = _serve(tmp_path, "::")
+    try:
+        assert server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0
+        assert _req(f"http://[::1]:{port}", "/healthz")[0] == 200
+        assert _req(f"http://127.0.0.1:{port}", "/healthz")[0] == 200
+    finally:
+        stop()
+
+
+@needs_ipv6
+def test_server_on_ipv4_wildcard_stays_ipv4_only(tmp_path):
+    """ALISSA_UI_HOST=0.0.0.0 keeps the pre-#163 bind: AF_INET, so an IPv6
+    client is refused."""
+    server, port, stop = _serve(tmp_path, "0.0.0.0")
+    try:
+        assert server.socket.family == socket.AF_INET
+        assert _req(f"http://127.0.0.1:{port}", "/healthz")[0] == 200
+        with pytest.raises(urllib.error.URLError):
+            _req(f"http://[::1]:{port}", "/healthz")
+    finally:
+        stop()
+
+
+def test_bind_url_brackets_ipv6_literals():
+    assert bind_url("::", 8080) == "http://[::]:8080"
+    assert bind_url("fd12::1", 80) == "http://[fd12::1]:80"
+    assert bind_url("0.0.0.0", 8080) == "http://0.0.0.0:8080"
+    assert bind_url("localhost", 8788) == "http://localhost:8788"
+
+
 # -- fail-closed CLI boot --------------------------------------------------
 
 def test_main_refuses_without_passcode(monkeypatch, capsys):
@@ -534,7 +616,30 @@ def test_main_happy_path_wires_and_serves(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert ("make", "0.0.0.0", 9999) in events
     assert events[-2:] == ["shutdown", "close"]
-    assert "serving on" in capsys.readouterr().out
+    assert "serving on http://0.0.0.0:9999 " in capsys.readouterr().out
+
+
+def test_main_reports_an_ipv6_bind_bracketed(tmp_path, monkeypatch, capsys):
+    """The container default `--host ::` logs a URL an operator can paste."""
+    monkeypatch.setenv("ALISSA_UI_PASSCODE", "letmein")
+
+    class FakeServer:
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    seen = []
+    monkeypatch.setattr(ui_main, "make_server",
+                        lambda app, host, port: seen.append(host) or FakeServer())
+    assert ui_main.main(["--workspace-root", str(tmp_path),
+                         "--host", "::", "--port", "8080"]) == 0
+    assert seen == ["::"]
+    assert "serving on http://[::]:8080 " in capsys.readouterr().out
 
 
 def test_default_port_does_not_collide_with_the_devloop_console(tmp_path, monkeypatch):
