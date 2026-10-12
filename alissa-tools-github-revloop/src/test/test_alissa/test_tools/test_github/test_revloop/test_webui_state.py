@@ -32,7 +32,7 @@ def test_read_spawns_shape_and_order(ledger):
     rows = ledger.read_spawns()
     assert len(rows) == 2
     assert set(rows[0]) == {"repo", "number", "round", "head_sha", "session",
-                            "task_ref", "spawned_at"}
+                            "task_ref", "spawned_at", "issue_number", "task_number"}
     # newest first: PR 17 (last inserted) leads on the tie-broken order
     assert rows[0]["number"] == 17
 

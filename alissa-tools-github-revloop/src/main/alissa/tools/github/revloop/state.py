@@ -64,7 +64,9 @@ CREATE TABLE IF NOT EXISTS spawns (
     head_sha   TEXT    NOT NULL,
     session    TEXT    NOT NULL PRIMARY KEY,
     task_ref   TEXT,
-    spawned_at INTEGER NOT NULL
+    spawned_at INTEGER NOT NULL,
+    issue_number INTEGER,
+    task_number  INTEGER
 )"""
 
 SCHEMA = f"""
@@ -404,6 +406,14 @@ _ADDED_COLUMNS = {
     ),
     "verdicts": (
         ("readiness", "TEXT"),
+    ),
+    # What the PR serves, read off its body at spawn (issue #165): the
+    # same-repo issue it closes and the origin task it names. NULL is "the
+    # body named none" -- and is the true value for every historical row,
+    # whose PR body was never read for it.
+    "spawns": (
+        ("issue_number", "INTEGER"),
+        ("task_number", "INTEGER"),
     ),
 }
 
@@ -755,12 +765,20 @@ class State:
         head_sha: str,
         session: str,
         task_ref: str | None,
+        issue_number: int | None = None,
+        task_number: int | None = None,
     ) -> None:
+        """`issue_number` / `task_number` are what the PR serves (issue
+        #165): the same-repo issue its body closes and the origin task it
+        names, None when it names none. The loop-event emitter stamps them
+        on every round event of the PR."""
         self._db.execute(
             "INSERT OR REPLACE INTO spawns "
-            "(repo, number, round, head_sha, session, task_ref, spawned_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (repo, number, round_, head_sha, session, task_ref, int(time.time())),
+            "(repo, number, round, head_sha, session, task_ref, spawned_at, "
+            "issue_number, task_number) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (repo, number, round_, head_sha, session, task_ref, int(time.time()),
+             issue_number, task_number),
         )
         self._db.commit()
 
@@ -1937,7 +1955,8 @@ class State:
         at any row age. An empty collection reads nothing.
         """
         sql = (
-            "SELECT repo, number, round, head_sha, session, task_ref, spawned_at "
+            "SELECT repo, number, round, head_sha, session, task_ref, spawned_at, "
+            "issue_number, task_number "
             "FROM spawns"
         )
         params: tuple = ()

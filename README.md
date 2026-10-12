@@ -1488,6 +1488,20 @@ plan-lint gate first sees round `<n>` of a plan PR it records one
 round) carries `data.kind: "plan"`. A code round carries no `kind`, so its
 payloads and dedupe keys are unchanged.
 
+**What the PR serves** (issue #165): the same five round kinds also carry
+the top-level correlates `issueNumber` and `taskNumber`, so Studio can link
+a review to its issue and task. When the daemon spawns a round it reads the
+PR body once onto that round's `spawns` row: `issueNumber` is the issue the
+body **closes** in the PR's own repo — a closing keyword before `#<n>`,
+`<owner>/<repo>#<n>` or the issue's URL; a bare mention, a close in another
+repo, or two different same-repo closes yield none — and `taskNumber` is the
+origin task the body names (`Origin task: TASK-<n>`, the line devloop
+writes; an `Alissa-Task:` trailer is read first, as for the spawn's
+`--task`). An event takes both from its own round's spawn row, else from the
+PR's newest one (a pre-spawn `checks.held`). Each is **omitted** when
+unknown, never null, so a PR whose body names neither — and every round
+spawned before 0.31.14 — keeps its payload byte for byte.
+
 **Best-effort, never fatal, no retry queue.** A failed push is one WARN and the
 pass completes. The emitter keeps an in-memory watermark of the newest ledger
 stamp it sent: a failure leaves it put, so the next pass re-derives and

@@ -1158,6 +1158,26 @@ def test_with_no_review_task_the_origin_comes_from_the_pr_body(config):
     assert w.state.get_spawn(SLUG, NUMBER, 1)["task_ref"] is None
 
 
+def test_the_spawn_row_keeps_what_the_pr_serves(config):
+    """Issue #165: the body is read at spawn onto the round's ledger row --
+    the same-repo issue it closes and its origin task -- for the round
+    events; a mention or a cross-repo close is not a link."""
+    body = "Closes #6\nSee #9, fixes other/repo#3\n\n- Origin task: TASK-1405236963\n"
+    w, _, _ = watcher(config, make_pr(body=body), [], task=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    row = w.state.get_spawn(SLUG, NUMBER, 1)
+    assert (row["issue_number"], row["task_number"]) == (6, 1405236963)
+
+
+def test_a_spawn_whose_body_links_nothing_records_null(config):
+    w, _, _ = watcher(config, make_pr(body="See #6."), [], task=None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    row = w.state.get_spawn(SLUG, NUMBER, 1)
+    assert (row["issue_number"], row["task_number"]) == (None, None)
+
+
 def test_with_no_origin_anywhere_only_the_repo_is_stamped(config):
     body = "- Implementation task: TASK-4243\n"
     w, _, al = watcher(config, make_pr(body=body), [], task=None)

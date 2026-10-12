@@ -91,6 +91,17 @@ the envelope's `Contract: v<n>` and the review task's ref. Every
 the ledger does not know one, and is keyed on `(repo, pr, round, head)`, so a
 native post's `verdict_posts` row and its ping derive ONE event (the row's,
 with the ping folded in), never two.
+
+Every ROUND event (`ROUND_EVENT_KINDS`) also says what the PR serves (issue
+#165), so Studio can link a review to its task: `issueNumber` when the PR
+body CLOSES one issue of the PR's own repo (`pr_closing_issue` -- a mention,
+a cross-repo close or two different closes is no field, never a guess) and
+`taskNumber` when it names its origin task (`Origin task: TASK-<n>`, read by
+loop's `pr_origin_task_ref`). Both are read once, at spawn, onto the round's
+`spawns` row; an event takes them from its own round's row, else from the
+PR's newest spawn row (a pre-spawn `checks.held`, a `round.capped` no spawn
+explains). Each field is omitted when unknown -- never null -- so a PR whose
+body names neither emits the same payload as before, byte for byte.
 """
 
 from __future__ import annotations
@@ -147,6 +158,16 @@ ROUND_EVENT_KINDS = frozenset({
     "round.spawned", "round.verdict", "round.abandoned", "round.capped",
     "checks.held",
 })
+
+# A GitHub closing claim (issue #165): one of the nine keywords, an optional
+# colon, then `#<n>`, `<owner>/<repo>#<n>` or an issue URL. The repo parts
+# are matched so a cross-repo close can be told apart -- and refused.
+_CLOSING_REF_RE = re.compile(
+    r"(?<![\w-])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*:\s*|\s+)"
+    r"(?:https?://github\.com/(?P<url_repo>[\w.-]+/[\w.-]+)/issues/(?P<url_n>\d+)"
+    r"|(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<n>\d+))(?![\w-])",
+    re.IGNORECASE,
+)
 
 # The verdict-of-record row (issue #155): one per (PR, round),
 # `round-verdict:<round>@<head>:<verdict>:<readiness>:<class>:<contract>:<taskRef>`.
@@ -338,6 +359,30 @@ def _verdict_data(
         "contractVersion": int(contract) if contract else None,
         "taskRef": fields.get("task") or None,
     }
+
+
+def pr_closing_issue(body: str, repo: str) -> "int | None":
+    """The issue number a PR body CLOSES in the PR's own `repo`, or None.
+
+    Only a closing claim counts (`Closes #6`, `fixes: owner/repo#6`, a
+    closing keyword before the issue's URL); a bare mention (`see #6`) is not
+    one. A claim on another repo's issue is dropped, and two DIFFERENT
+    same-repo issues are ambiguous -- the event carries one `issueNumber`,
+    and picking between them would be a guess -- so they read as None too.
+    """
+    found: "set[int]" = set()
+    for match in _CLOSING_REF_RE.finditer(body or ""):
+        target = match.group("url_repo") or match.group("repo")
+        if target is not None and target.lower() != repo.lower():
+            continue
+        found.add(int(match.group("url_n") or match.group("n")))
+    return found.pop() if len(found) == 1 else None
+
+
+def task_number_of(ref: "str | None") -> "int | None":
+    """`TASK-<n>` as the integer `taskNumber` the ingest takes, or None."""
+    match = re.fullmatch(r"TASK-(\d+)", ref or "", re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _ms(seconds: "int | float") -> int:
@@ -748,6 +793,39 @@ def _mark_plan_rounds(
             event["data"] = {**event.get("data", {}), "kind": ROUND_KIND_PLAN}
 
 
+def _mark_links(
+    stamped: "list[tuple[int, dict]]", spawns: "list[dict]"
+) -> None:
+    """Stamp `issueNumber` / `taskNumber` on round events, in place (issue
+    #165). The event's own round's spawn row wins; an event whose round has
+    no spawn row (or no round at all) reads the PR's newest one. A field the
+    row does not know is left off, so a PR with neither keeps its payload."""
+    by_round: "dict[tuple[str, int, int], dict]" = {}
+    by_pr: "dict[tuple[str, int], dict]" = {}
+    # Oldest first, so the newest spawn of a round / PR is the one kept --
+    # what the body said LAST, even when that is nothing. `read_spawns` is
+    # newest first, so reversing it first keeps a same-second tie in order.
+    for spawn in sorted(reversed(spawns), key=lambda r: int(r["spawned_at"])):
+        repo, number = spawn["repo"], int(spawn["number"])
+        by_round[(repo, number, int(spawn["round"]))] = spawn
+        by_pr[(repo, number)] = spawn
+    for _, event in stamped:
+        if event["kind"] not in ROUND_EVENT_KINDS or "prNumber" not in event:
+            continue
+        repo, number = str(event.get("repo") or ""), int(event["prNumber"])
+        row: "dict | None" = None
+        if "round" in event:
+            row = by_round.get((repo, number, int(event["round"])))
+        if row is None:
+            row = by_pr.get((repo, number))
+        if row is None:
+            continue
+        if row.get("issue_number") is not None:
+            event["issueNumber"] = int(row["issue_number"])
+        if row.get("task_number") is not None:
+            event["taskNumber"] = int(row["task_number"])
+
+
 def derive_events(state: State, *, since: int = 0) -> "list[dict]":
     """Every loop event the ledger implies whose stamp is >= `since`,
     oldest first.
@@ -772,6 +850,7 @@ def derive_events(state: State, *, since: int = 0) -> "list[dict]":
     stamped += _grant_events(state.read_grants())
     stamped += _reap_events(state.read_reaps())
     _mark_plan_rounds(stamped, _plan_rounds(pings))
+    _mark_links(stamped, spawns)
 
     stamped = [(at, event) for at, event in stamped if at >= since]
     stamped.sort(key=lambda pair: pair[0])
