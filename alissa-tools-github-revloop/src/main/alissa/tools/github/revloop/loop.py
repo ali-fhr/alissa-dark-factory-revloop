@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from . import janitor as janitor_mod
 from . import parking as parking_mod
 from . import prompts as prompts_mod
 from .alissa import (
@@ -1120,7 +1121,13 @@ _SHELL_RULE = (
 # The reviewer's own line beside it (issue #138): the seat is read-only (CR6),
 # so the "worktree" the shell rule names is the throwaway REVIEW-<task>
 # checkout the review skill lets a reviewer make, and nothing a reviewer
-# writes there needs deleting -- the workspace prune reclaims it.
+# writes there needs deleting. The daemon's workspace janitor (janitor.py,
+# issue #167) reclaims it: every `janitor_interval_minutes` it removes each
+# hub's `main/.review-scratch-*` and `REVIEW-*` folders older than
+# `janitor_grace_minutes` that no live session or open round holds, then
+# prunes `.source`'s worktree records. The rule's text does not name the
+# janitor: the reviewer needs only to know it must not delete, and the plan
+# directives that embed this rule are pinned by digest.
 _REVIEWER_RULE = (
     "You never push and never delete: a reviewer that needs scratch files "
     "writes them under its own checkout and leaves them. "
@@ -2564,6 +2571,9 @@ class ReviewWatcher:
         # has listed this pass (the preflight refresh, or a sweep whose list
         # failed), and the refresh lists for itself.
         self._pass_roster: list[ManagedSession] | None = None
+        # When the workspace janitor last swept (monotonic), or None before the
+        # first sweep -- which therefore runs at the end of the first pass.
+        self._janitor_last: "float | None" = None
         # The (repo, number, round) whose alive session the stale-round probe
         # just killed as `wedged:first-run-dialog` (issue #136), so the
         # respawn site logs its re-enqueue at INFO instead of a second
@@ -7697,6 +7707,9 @@ class ReviewWatcher:
         # heartbeat is the completion time of a pass whose exhaust is already
         # written and whose events are already on their way.
         vitals = self._push_fleet_vitals(completed_at=time.time())
+        # The workspace janitor (issue #167), last: it is the one part of the
+        # pass that is pure housekeeping, and it never raises.
+        self._run_janitor()
         log.info(
             "poll summary: %d candidate(s), %d reaped, %d parked on a prompt, "
             "%d answered%s, %d ms, vitals: %s",
@@ -7760,6 +7773,129 @@ class ReviewWatcher:
                 type(exc).__name__, exc,
             )
             return VITALS_FAILED
+
+    def _run_janitor(self, now: "float | None" = None) -> "janitor_mod.SweepResult | None":
+        """Sweep the workspace when the janitor is on and its interval has
+        elapsed (issue #167). Returns the sweep's result, or None when no
+        sweep ran. Never raises: a sweep that fails is one WARNING and the
+        next interval tries again.
+
+        One INFO line per sweep (folders removed and bytes freed, or what a
+        dry run WOULD remove), and one WARNING when the workspace volume is
+        at or above `janitor_warn_pct`. The disk read runs even when the
+        roster cannot be listed and the removal half is skipped: a full
+        volume is worth saying whatever else went wrong."""
+        if not self.config.janitor_enabled:
+            return None
+        mono = time.monotonic()
+        interval = self.config.janitor_interval_minutes * 60
+        if self._janitor_last is not None and mono - self._janitor_last < interval:
+            return None
+        self._janitor_last = mono
+        stamp = time.time() if now is None else now
+        try:
+            result = self._sweep_workspace(stamp)
+        except Exception as exc:
+            log.warning(
+                "janitor: sweep failed unexpectedly (%s: %s) — nothing more is "
+                "removed this interval; the pass completes",
+                type(exc).__name__, exc, exc_info=True,
+            )
+            result = None
+        self._warn_disk()
+        return result
+
+    def _sweep_workspace(self, now: float) -> "janitor_mod.SweepResult | None":
+        guard = self._janitor_guard(now)
+        if guard is None:
+            log.warning(
+                "janitor: could not list reviewer sessions — skipping this "
+                "sweep, since a live session's folders cannot be told apart"
+            )
+            return None
+        hubs = janitor_mod.discover_hubs(self.config.workspace_root)
+        result = janitor_mod.sweep(
+            hubs, guard,
+            grace_seconds=self.config.janitor_grace_minutes * 60,
+            now=now,
+            dry_run=self.config.dry_run,
+        )
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
+                "hub(s); %d held by a live round, %d inside the grace",
+                len(result.would_remove),
+                janitor_mod.human(sum(size for _, size in result.would_remove)),
+                result.hubs, len(result.held), result.fresh,
+            )
+        else:
+            log.info(
+                "janitor: removed %d folder(s), freed %s across %d hub(s); "
+                "%d held by a live round, %d inside the grace, %d failed",
+                len(result.removed), janitor_mod.human(result.freed),
+                result.hubs, len(result.held), result.fresh, len(result.failed),
+            )
+        return result
+
+    def _janitor_guard(self, now: float) -> "janitor_mod.Guard | None":
+        """What the janitor must not touch: every PR (and its review task's
+        REVIEW- checkout) with a live reviewer session or an open ledger
+        round, or None when the roster cannot be listed -- a sweep that
+        cannot see the live sessions holds nothing, so it must not run.
+
+        Open rounds are the ledger's own definition (`in_flight_repos`): a
+        spawn younger than the stale-round window whose session was not
+        reaped, and a verdict post still owed. The roster is the pass's
+        post-reap listing when the sweep produced one."""
+        sessions = self._pass_roster
+        if sessions is None:
+            try:
+                sessions = self.alissa.list_review_sessions()
+            except CommandError as exc:
+                log.debug("janitor: roster listing failed (%s)", exc)
+                return None
+        guard = janitor_mod.Guard()
+        for ses in sessions:
+            ref = ses.ref
+            if ref is None:
+                continue
+            row = self.state.find_spawn_by_session(ses.name)
+            if row is not None:
+                guard.hold(str(row["repo"]), int(row["number"]), row["task_ref"])
+            else:
+                # No ledger row (a skill-shaped `review-pr-<n>`): the name is
+                # the only evidence, and a name without a repo holds its PR
+                # number in every hub.
+                guard.hold(ref.repo, ref.number)
+        for spawn_row in self.state.read_spawns(since=now - STALE_ROUND_SECONDS):
+            if not self.state.is_reaped(str(spawn_row["session"])):
+                guard.hold(
+                    str(spawn_row["repo"]), int(spawn_row["number"]),
+                    spawn_row["task_ref"],
+                )
+        for post in self.state.read_verdict_posts():
+            if post["posted_at"] is None and post["abandoned_at"] is None:
+                spawn = self.state.get_spawn(
+                    str(post["repo"]), int(post["number"]), int(post["round"])
+                )
+                guard.hold(
+                    str(post["repo"]), int(post["number"]),
+                    spawn["task_ref"] if spawn is not None else None,
+                )
+        return guard
+
+    def _warn_disk(self) -> None:
+        """One WARNING when the workspace volume is at or above
+        `janitor_warn_pct` (0 = never)."""
+        threshold = self.config.janitor_warn_pct
+        if not threshold:
+            return
+        pct = janitor_mod.disk_used_pct(self.config.workspace_root)
+        if pct is not None and pct >= threshold:
+            log.warning(
+                "janitor: workspace volume %s is %.1f%% used (warn at %d%%)",
+                self.config.workspace_root, pct, threshold,
+            )
 
     def _vitals_config(self) -> dict:
         """The snapshot's `config` block (issue #159), read off what this

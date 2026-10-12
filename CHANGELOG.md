@@ -4,6 +4,41 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.15
+
+- **The workspace janitor** (issue #167; origin TASK-1483369441,
+  implementation TASK-1683832168). Reviewers write scratch under their own
+  checkout and never delete it, and nothing else did either: on 2026-10-12
+  the Alissa fleet's shared volume was 76% full with 169
+  `main/.review-scratch-pr<N>-r<round>/` folders (27 GB) and ~5 GB of
+  `REVIEW-*` checkouts.
+  - **`janitor.py`, on by default**, runs at the end of a pass every
+    `janitor_interval_minutes` (10; `0` = every pass). Under each hub (a
+    workspace child holding `.source`) it removes `main/.review-scratch-*`
+    and `REVIEW-*` directories — direct children, never symlinks, nothing
+    else — whose newest mtime (folder or a direct child) is older than
+    `janitor_grace_minutes` (1440), then runs `git worktree prune` in
+    `.source`.
+  - **Never a live round's folders**: a PR with a live reviewer session or an
+    open ledger round (unreaped spawn inside the stale-round window, or an
+    owed verdict post) keeps its scratch folders and its review task's
+    `REVIEW-<task>` checkout; a held round with no known review task keeps
+    every `REVIEW-*` in its hub; an unlistable roster skips the sweep.
+  - **One INFO line per sweep** (count and bytes freed) and **one WARNING**
+    when the workspace volume is at or above `janitor_warn_pct` (80; `0` =
+    never). `dry_run` removes and prunes nothing and logs each would-be
+    removal.
+  - **Config**: `janitor_enabled`, `janitor_grace_minutes`,
+    `janitor_interval_minutes`, `janitor_warn_pct` — file, CLI
+    (`--janitor`/`--no-janitor`, `--janitor-grace-minutes`,
+    `--janitor-interval-minutes`, `--janitor-warn-pct`) and environment
+    (`ALISSA_REVIEW_JANITOR_*`, which wins; blank falls through).
+  - **Fleet vitals carry `diskUsedPct`** (the workspace volume's used
+    percent, `null` when unreadable); a Studio whose schema predates it is
+    resent the snapshot without it, like `idle` and `config`.
+  - The comment above `_REVIEWER_RULE` now describes the janitor instead of a
+    prune that did not exist; the rule's text is unchanged.
+
 ## 0.31.14
 
 - **Round events carry the PR's closing issue and origin task** (issue #165;

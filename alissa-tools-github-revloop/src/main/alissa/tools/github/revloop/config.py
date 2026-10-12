@@ -206,6 +206,10 @@ CONFIG_KEYS = (
     "prompt_kill_minutes",
     "prompt_max_answers",
     "waiting_dir",
+    "janitor_enabled",
+    "janitor_grace_minutes",
+    "janitor_interval_minutes",
+    "janitor_warn_pct",
     "alissa_endpoint",
     "dry_run",
 )
@@ -232,6 +236,14 @@ FLEET_VITALS_ENV = "ALISSA_REV_FLEET_VITALS_ENABLED"
 REPOS_SOURCE_ENV = "ALISSA_REVIEW_REPOS_SOURCE"
 BOWS_REFRESH_POLLS_ENV = "ALISSA_REVIEW_BOWS_REFRESH_POLLS"
 BOW_OWNERS_ENV = "ALISSA_REVIEW_BOW_OWNERS"
+
+# The workspace janitor's four rails (issue #167). Same precedence and the
+# same blank-falls-through rule as the bows rails, so a container can tune
+# (or switch off) the janitor without a file edit on its volume.
+JANITOR_ENABLED_ENV = "ALISSA_REVIEW_JANITOR_ENABLED"
+JANITOR_GRACE_MINUTES_ENV = "ALISSA_REVIEW_JANITOR_GRACE_MINUTES"
+JANITOR_INTERVAL_MINUTES_ENV = "ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES"
+JANITOR_WARN_PCT_ENV = "ALISSA_REVIEW_JANITOR_WARN_PCT"
 
 # The plan directive's two allowlists (issue #148; genloop design §6.1, D12).
 # A PR gets the PLAN directive only when all four signals hold, and two of
@@ -406,6 +418,36 @@ def env_bows_refresh_polls(
             f"{BOWS_REFRESH_POLLS_ENV} must be an integer number of poll "
             f"passes, got {raw!r}"
         ) from None
+
+
+def _env_int(name: str, what: str, environ: "Mapping[str, str] | None") -> "int | None":
+    """One integer env rail, or None when unset/blank. A non-integer raises,
+    naming the variable -- the startup phase turns that into `config error`."""
+    raw = _env_text(name, environ)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer {what}, got {raw!r}") from None
+
+
+def env_janitor(environ: "Mapping[str, str] | None" = None) -> "dict[str, Any]":
+    """The janitor keys the environment sets (issue #167), as config-key ->
+    value; a key whose variable is unset or blank is absent."""
+    out: "dict[str, Any]" = {}
+    enabled = _env_bool(JANITOR_ENABLED_ENV, environ)
+    if enabled is not None:
+        out["janitor_enabled"] = enabled
+    for key, name, what in (
+        ("janitor_grace_minutes", JANITOR_GRACE_MINUTES_ENV, "number of minutes"),
+        ("janitor_interval_minutes", JANITOR_INTERVAL_MINUTES_ENV, "number of minutes"),
+        ("janitor_warn_pct", JANITOR_WARN_PCT_ENV, "percentage"),
+    ):
+        value = _env_int(name, what, environ)
+        if value is not None:
+            out[key] = value
+    return out
 
 
 def env_bow_owners(environ: "Mapping[str, str] | None" = None) -> "str | None":
@@ -661,6 +703,23 @@ DEFAULT_VERDICT_COOLDOWN_SECONDS = 120
 # There is no "off" value: the floor is 1 (suppress one poll), because 0 would
 # not disable a cache, it would write rows nothing ever reads.
 DEFAULT_REVIEW_TASK_MISS_TTL_POLLS = 10
+
+
+# -- the workspace janitor (issue #167) ---------------------------------------
+#
+# How old a `.review-scratch-*` or `REVIEW-*` folder must be (by mtime) before
+# the janitor may remove it. A day: far past any round's life (the stale-round
+# window is 90 minutes), so the janitor only ever takes what every round that
+# could want it has long finished with -- and the live-session / open-round
+# guard holds anything a slow round is still using regardless.
+DEFAULT_JANITOR_GRACE_MINUTES = 24 * 60
+
+# How often the janitor sweeps, at the end of a pass. 0 = every pass.
+DEFAULT_JANITOR_INTERVAL_MINUTES = 10
+
+# The workspace volume's used percentage at or above which a sweep logs one
+# WARNING. Devloop's threshold; 0 = never warn.
+DEFAULT_JANITOR_WARN_PCT = 80
 
 
 # -- the product-stability guard (issue #105) ---------------------------------
@@ -978,6 +1037,18 @@ class Config:
     # writes the same value here so the daemon looks where the hooks wrote.
     waiting_dir: str = DEFAULT_WAITING_DIR
 
+    # The workspace janitor (issue #167; janitor.py): every
+    # `janitor_interval_minutes` (0 = every pass), at the end of a pass, remove
+    # each hub's `main/.review-scratch-*` and `REVIEW-*` folders older than
+    # `janitor_grace_minutes` that no live session or open ledger round holds,
+    # prune `.source`'s worktree records, and WARN once when the workspace
+    # volume is at or above `janitor_warn_pct` (0 = never). ON by default: the
+    # disk it reclaims fills a shared volume within weeks without it.
+    janitor_enabled: bool = True
+    janitor_grace_minutes: int = DEFAULT_JANITOR_GRACE_MINUTES
+    janitor_interval_minutes: int = DEFAULT_JANITOR_INTERVAL_MINUTES
+    janitor_warn_pct: int = DEFAULT_JANITOR_WARN_PCT
+
     dry_run: bool = False
 
     def __post_init__(self) -> None:
@@ -1112,7 +1183,7 @@ class Config:
 
         `environ` is the fourth layer and applies to the env-backed keys
         (`task_list_bow_id`, `loop_events_enabled`, `fleet_vitals_enabled`,
-        `repos_source`, `bows_refresh_polls`, `bow_owners`); it wins over both of the others
+        `repos_source`, `bows_refresh_polls`, `bow_owners`, the `janitor_*` keys); it wins over both of the others
         (see the module docstring). Defaults to the real environment, so
         callers that do not care pass nothing.
         """
@@ -1187,6 +1258,8 @@ class Config:
         env_owners = env_bow_owners(environ)
         if env_owners is not None:
             raw["bow_owners"] = env_owners
+        # The janitor's rails (issue #167), same layer, same reason.
+        raw.update(env_janitor(environ))
         # The plan allowlists (issue #148), same rail, same reason.
         env_plan_repos = env_plan_list(PLAN_REPOS_ENV, environ)
         if env_plan_repos is not None:
@@ -1439,6 +1512,31 @@ class Config:
         if not waiting_dir:
             raise ValueError("waiting_dir must be a non-empty path")
 
+        janitor_grace = int(
+            raw.get("janitor_grace_minutes", cls.janitor_grace_minutes)
+        )
+        if janitor_grace < 1:
+            # No 0-means-off here: `janitor_enabled` is the off switch, and a
+            # zero grace would make a scratch folder removable the minute a
+            # guard misses it.
+            raise ValueError(
+                f"janitor_grace_minutes must be >= 1, got {janitor_grace}"
+            )
+        janitor_interval = int(
+            raw.get("janitor_interval_minutes", cls.janitor_interval_minutes)
+        )
+        if janitor_interval < 0:
+            raise ValueError(
+                f"janitor_interval_minutes must be >= 0 (0 = every pass), "
+                f"got {janitor_interval}"
+            )
+        janitor_warn = int(raw.get("janitor_warn_pct", cls.janitor_warn_pct))
+        if not 0 <= janitor_warn <= 100:
+            raise ValueError(
+                f"janitor_warn_pct must be between 0 and 100 (0 = never warn), "
+                f"got {janitor_warn}"
+            )
+
         state_path = raw.get("state_path")
         return cls(
             workspace_root=Path(workspace_root),
@@ -1477,6 +1575,10 @@ class Config:
             prompt_kill_minutes=prompt_kill,
             prompt_max_answers=prompt_answers,
             waiting_dir=waiting_dir,
+            janitor_enabled=bool(raw.get("janitor_enabled", cls.janitor_enabled)),
+            janitor_grace_minutes=janitor_grace,
+            janitor_interval_minutes=janitor_interval,
+            janitor_warn_pct=janitor_warn,
             alissa_endpoint=endpoint,
             dry_run=bool(raw.get("dry_run", False)),
         )
