@@ -4,6 +4,26 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.14
+
+- **Round events carry the PR's closing issue and origin task** (issue #165;
+  origin TASK-1605699690, implementation TASK-1038246216). Studio's fleet
+  smoke links loop events to the canary through `issueNumber` /
+  `taskNumber`, and revloop's round events carried only `prNumber`, so a
+  reviewer giving up on the canary (`round.capped`, `round.abandoned`) was
+  invisible to SM8 until its 2-hour timeout.
+  - **Read once, at spawn, onto the `spawns` row** (two new nullable
+    columns, `issue_number` and `task_number`, ALTERed into an existing
+    ledger on open): the same-repo issue the PR body closes, and the origin
+    task its `Origin task: TASK-<n>` line names. A mention, a cross-repo
+    close or two different closes is no issue — never a guess.
+  - **Stamped on `round.spawned`, `round.verdict`, `round.abandoned`,
+    `round.capped` and `checks.held`** as top-level `issueNumber` /
+    `taskNumber` (the loop-ingest API's own correlates), from the event's
+    round's spawn row or else the PR's newest. Omitted when unknown, so a PR
+    naming neither emits the same payload as before; dedupe keys are
+    unchanged, so a backfill lands as duplicates.
+
 ## 0.31.13
 
 - **The console binds dual-stack** (issue #163; origin TASK-386369234,

@@ -1221,3 +1221,157 @@ def test_round_verdict_prefix_is_distinct_from_every_other_ping_family():
     assert not loop_events.round_verdict_prefix(11).startswith(
         loop_events.round_verdict_prefix(1)
     )
+
+
+# -- round events carry issueNumber / taskNumber (issue #165) ----------------
+
+CANARY_BODY = (
+    "Closes #6\n\n"
+    "- Origin task: TASK-1405236963\n"
+    "- Implementation task: TASK-1405236999\n"
+)
+
+
+def _spawn_from_body(ledger, body, *, number=7, round_=1, session="s1"):
+    """Record a spawn the way the watcher does: the PR body is read once, at
+    spawn, by the same two readers loop.py calls."""
+    ledger.record_spawn(
+        repo=REPO, number=number, round_=round_, head_sha=HEAD,
+        session=session, task_ref=None,
+        issue_number=loop_events.pr_closing_issue(body, REPO),
+        task_number=loop_events.task_number_of(loop_module.pr_origin_task_ref(body)),
+    )
+
+
+def test_spawned_and_capped_carry_the_closing_issue_and_the_origin_task(
+    ledger, clock
+):
+    clock()
+    _spawn_from_body(ledger, CANARY_BODY)
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)
+    events = derive_events(ledger)
+    for kind in ("round.spawned", "round.capped"):
+        (event,) = by_kind(events, kind)
+        assert event["issueNumber"] == 6, event
+        assert event["taskNumber"] == 1405236963, event
+    # The fields are top-level correlates, not data, and are ints.
+    assert all("issueNumber" not in e.get("data", {}) for e in events)
+
+
+def test_every_round_event_kind_carries_the_links(ledger, clock):
+    clock()
+    ledger.note_spawn_checks_hold(REPO, 7, 1, HEAD)  # pre-spawn: no row yet
+    _spawn_from_body(ledger, CANARY_BODY)
+    ledger.note_verdict_post_owed(REPO, 7, 1, HEAD)
+    ledger.record_ping(REPO, 7, loop_module.checks_unsettled_kind(1, HEAD))
+    clock()
+    ledger.record_verdict_post(REPO, 7, 1, "url", verdict="request_changes")
+    _spawn_from_body(ledger, CANARY_BODY, round_=2, session="s2")
+    ledger.note_verdict_post_owed(REPO, 7, 2, HEAD)
+    clock()
+    ledger.record_verdict_post_abandoned(REPO, 7, 2, "head force-pushed away")
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)
+    ledger.record_grant(REPO, 7, 1, "operator", 1)
+    ledger.record_reap("s1")
+
+    events = derive_events(ledger)
+    round_events = [e for e in events if e["kind"] in loop_events.ROUND_EVENT_KINDS]
+    assert {e["kind"] for e in round_events} == set(loop_events.ROUND_EVENT_KINDS)
+    for event in round_events:
+        assert (event["issueNumber"], event["taskNumber"]) == (6, 1405236963), event
+    # Only round events: a grant or a reap is not about a round.
+    for event in events:
+        if event["kind"] not in loop_events.ROUND_EVENT_KINDS:
+            assert "issueNumber" not in event and "taskNumber" not in event
+
+
+@pytest.mark.parametrize("body", [
+    "see #6\n- Origin task: TASK-1405236963\n",
+    "Related to #6, closing nothing.\n- Origin task: TASK-1405236963\n",
+    "Closes other/repo#6\n- Origin task: TASK-1405236963\n",
+    "Fixes https://github.com/other/repo/issues/6\n- Origin task: TASK-1405236963\n",
+    "Closes #6\nCloses #7\n- Origin task: TASK-1405236963\n",
+])
+def test_a_mention_a_cross_repo_close_or_two_closes_emit_no_issue(
+    ledger, clock, body
+):
+    clock()
+    _spawn_from_body(ledger, body)
+    (event,) = derive_events(ledger)
+    assert "issueNumber" not in event
+    assert event["taskNumber"] == 1405236963
+
+
+def test_a_pr_with_neither_line_emits_the_same_payload_as_before(ledger, clock):
+    clock()
+    _spawn_from_body(ledger, "Adds a widget cache.\n\nSee #6 for context.\n")
+    clock()
+    ledger.record_escalation(REPO, 7, HEAD)
+    linked = derive_events(ledger)
+    assert all("issueNumber" not in e and "taskNumber" not in e for e in linked)
+    spawned, capped = by_kind(linked, "round.spawned")[0], by_kind(linked, "round.capped")[0]
+    # The pre-#165 payloads, key order included -- what the wire carried.
+    assert json.dumps(spawned) == json.dumps({
+        "seat": "revloop", "kind": "round.spawned", "at": (clock.now() - 1) * 1000,
+        "dedupeKey": f"revloop:round.spawned:{REPO}:7:1:{HEAD}",
+        "repo": REPO, "prNumber": 7, "round": 1, "session": "s1",
+        "data": {"headSha": HEAD},
+    })
+    assert json.dumps(capped) == json.dumps({
+        "seat": "revloop", "kind": "round.capped", "at": clock.now() * 1000,
+        "dedupeKey": f"revloop:round.capped:{REPO}:7:{HEAD}:{clock.now()}",
+        "repo": REPO, "prNumber": 7, "round": 1,
+        "data": {"headSha": HEAD},
+    })
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("Closes #6", 6),
+    ("closes: #6", 6),
+    ("FIXED #6.", 6),
+    ("Resolves acme/widgets#6", 6),
+    ("Resolves ACME/Widgets#6", 6),
+    ("fixes https://github.com/acme/widgets/issues/6", 6),
+    ("Closes #6\nAnd again: closes #6", 6),
+    ("Closes #6 and see other/repo#9", 6),
+    ("Closes other/repo#9\nCloses #6", 6),
+    ("see #6", None),
+    ("Fixed-width #6", None),
+    ("unclosed #6", None),
+    ("Closes #6x", None),
+    ("Closes https://github.com/acme/widgets/pull/6", None),
+    ("Closes #6, fixes #7", None),
+    ("", None),
+])
+def test_pr_closing_issue_reads_only_a_same_repo_closing_claim(body, expected):
+    assert loop_events.pr_closing_issue(body, REPO) == expected
+
+
+@pytest.mark.parametrize("ref, expected", [
+    ("TASK-1405236963", 1405236963), ("task-7", 7), (None, None), ("TASK-", None),
+    ("TASK-7 x", None),
+])
+def test_task_number_of(ref, expected):
+    assert loop_events.task_number_of(ref) == expected
+
+
+def test_the_link_columns_are_migrated_into_an_old_database(tmp_path):
+    """A `spawns` table that predates issue #165 gains both columns on open;
+    its historical rows read NULL, and their events carry no link."""
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st._db.execute("ALTER TABLE spawns DROP COLUMN issue_number")
+        st._db.execute("ALTER TABLE spawns DROP COLUMN task_number")
+        st._db.execute(
+            "INSERT INTO spawns (repo, number, round, head_sha, session, "
+            "task_ref, spawned_at) VALUES (?,?,?,?,?,?,?)",
+            (REPO, 7, 1, HEAD, "old", None, 1),
+        )
+        st._db.commit()
+    with State(path) as st:
+        _spawn_from_body(st, CANARY_BODY, round_=2, session="new")
+        events = {e["session"]: e for e in derive_events(st)}
+        assert "issueNumber" not in events["old"]
+        assert events["new"]["issueNumber"] == 6

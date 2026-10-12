@@ -102,10 +102,12 @@ from .loop_events import (
     auth_rejected_prefix,
     build_emitter,
     credential_identity,
+    pr_closing_issue,
     recorded_round_verdicts,
     round_verdict_kind,
     round_verdict_prefix,
     ROUND_VERDICT_PREFIX,
+    task_number_of,
 )
 from .proc import CommandError
 from .state import State
@@ -6319,6 +6321,9 @@ class ReviewWatcher:
                 head_sha=pr.head_sha,
                 session=name,
                 task_ref=task.ref if task else None,
+                # What the PR serves (issue #165), for the round events.
+                issue_number=pr_closing_issue(pr.body, pr.full_name),
+                task_number=task_number_of(pr_origin_task_ref(pr.body)),
             )
             # Recorded only once the round is actually enqueued, and beside
             # the spawn row for the same reason: a notice the reviewer never
