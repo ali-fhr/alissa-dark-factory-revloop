@@ -16,6 +16,10 @@ from .config import (
     FLEET_VITALS_ENV,
     HUB_ADD,
     HUB_SKIP,
+    JANITOR_ENABLED_ENV,
+    JANITOR_GRACE_MINUTES_ENV,
+    JANITOR_INTERVAL_MINUTES_ENV,
+    JANITOR_WARN_PCT_ENV,
     LOOP_EVENTS_ENV,
     ON_MISSING_CREATE,
     ON_MISSING_SKIP,
@@ -280,6 +284,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="do not push fleet vitals even if the config enables it",
     )
+    janitor = over.add_mutually_exclusive_group()
+    janitor.add_argument(
+        "--janitor",
+        dest="janitor_enabled",
+        action="store_true",
+        default=None,
+        help="remove each hub's stale main/.review-scratch-* and REVIEW-* "
+        "folders that no live session or open round holds, prune the "
+        "worktree records, and warn on a full volume (the default). "
+        f"Overridden by ${JANITOR_ENABLED_ENV}",
+    )
+    janitor.add_argument(
+        "--no-janitor",
+        dest="janitor_enabled",
+        action="store_false",
+        help="never sweep the workspace, even if the config enables it",
+    )
+    over.add_argument(
+        "--janitor-grace-minutes",
+        type=int,
+        metavar="MINUTES",
+        help="how old (by mtime) a scratch folder or REVIEW- checkout must be "
+        "before the janitor may remove it (default: 1440). "
+        f"Overridden by ${JANITOR_GRACE_MINUTES_ENV}",
+    )
+    over.add_argument(
+        "--janitor-interval-minutes",
+        type=int,
+        metavar="MINUTES",
+        help="how often the janitor sweeps, at the end of a pass; 0 = every "
+        f"pass (default: 10). Overridden by ${JANITOR_INTERVAL_MINUTES_ENV}",
+    )
+    over.add_argument(
+        "--janitor-warn-pct",
+        type=int,
+        metavar="PERCENT",
+        help="workspace volume usage at or above which a sweep logs a "
+        f"WARNING; 0 = never (default: 80). Overridden by ${JANITOR_WARN_PCT_ENV}",
+    )
     over.add_argument(
         "--alissa-endpoint",
         dest="alissa_endpoint",
@@ -336,6 +379,10 @@ def overrides_from(args: argparse.Namespace) -> dict:
         "task_list_bow_id": args.task_list_bow_id,
         "loop_events_enabled": args.loop_events_enabled,
         "fleet_vitals_enabled": args.fleet_vitals_enabled,
+        "janitor_enabled": args.janitor_enabled,
+        "janitor_grace_minutes": args.janitor_grace_minutes,
+        "janitor_interval_minutes": args.janitor_interval_minutes,
+        "janitor_warn_pct": args.janitor_warn_pct,
         "alissa_endpoint": args.alissa_endpoint,
         "dry_run": args.dry_run,
     }
@@ -422,6 +469,14 @@ def main(argv: list[str] | None = None) -> int:
         config = resolve_config(args)
         log.info("workspace: %s", config.workspace_root)
         log.info("repos_source: %s", config.repos_source)
+        log.info(
+            "janitor: %s (grace %d min, every %s, warn at %s)",
+            "on" if config.janitor_enabled else "off",
+            config.janitor_grace_minutes,
+            f"{config.janitor_interval_minutes} min"
+            if config.janitor_interval_minutes else "pass",
+            f"{config.janitor_warn_pct}%" if config.janitor_warn_pct else "never",
+        )
         config = resolve_feed_authority(config)
 
         watcher = ReviewWatcher(config)

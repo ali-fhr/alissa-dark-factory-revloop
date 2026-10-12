@@ -118,7 +118,7 @@ alissa-revloop --workspace-root ~/ws/beta  --repo org/beta-web &
 Every key below also exists as a CLI flag (`--poll-interval`, `--repo`, …), and
 the flag wins. `--repo` is repeatable and *replaces* the config list rather than
 extending it. `--dry-run` / `--no-dry-run` override the config in both directions.
-Eight keys have a third layer above both, the environment: `task_list_bow_id`
+Twelve keys have a third layer above both, the environment: `task_list_bow_id`
 (`ALISSA_REVIEW_TASK_BOW`; see *Naming the review BOW* for why),
 `loop_events_enabled` (`ALISSA_REV_LOOP_EVENTS_ENABLED`; see *Loop telemetry*),
 `fleet_vitals_enabled` (`ALISSA_REV_FLEET_VITALS_ENABLED`; see *Fleet vitals*),
@@ -128,10 +128,14 @@ and the three `repos_source: bows` keys — `repos_source`
 (`ALISSA_REVIEW_BOW_OWNERS`; see *Deriving the allowlist from feed Bodies of
 Work*), and the two plan-directive allowlists — `plan_repos`
 (`ALISSA_REVIEW_PLAN_REPOS`) and `plan_authors` (`ALISSA_REVIEW_PLAN_AUTHORS`;
-see *Plan PRs*). The environment wins over the file **and** the flags for all
-eight, but a
+see *Plan PRs*), and the four workspace-janitor keys — `janitor_enabled`
+(`ALISSA_REVIEW_JANITOR_ENABLED`), `janitor_grace_minutes`
+(`ALISSA_REVIEW_JANITOR_GRACE_MINUTES`), `janitor_interval_minutes`
+(`ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES`) and `janitor_warn_pct`
+(`ALISSA_REVIEW_JANITOR_WARN_PCT`; see *The workspace janitor*). The
+environment wins over the file **and** the flags for all twelve, but a
 **blank** value falls through — an unset platform variable reference renders as
-`""`, and that must not fail boot on a mode of `''`. The two boolean rails
+`""`, and that must not fail boot on a mode of `''`. The three boolean rails
 share one reader: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, anything
 else refused by name.
 
@@ -173,6 +177,10 @@ else refused by name.
 | `prompt_kill_minutes` | `10` | the unknown-dialog ladder's last rung: a dialog no signature knows is waited out one poll, dismissed with Escape on its second sighting, and after this many minutes still on screen the session is killed so the stale-round edge re-enters the **same** round. Floored at 1. Container: `ALISSA_PROMPT_KILL_MINUTES` |
 | `prompt_max_answers` | `5` | the per-session answer cap: after this many keystroke answers (sent, whether or not the pane moved) the session is killed and its round re-entered — a reviewer that keeps producing prompts is diverging, and the activity line says so. Floored at 1. Container: `ALISSA_PROMPT_MAX_ANSWERS` |
 | `waiting_dir` | `/workspace/.waiting` | where the container's `note-waiting.py` hook leaves the `<tmux session>.json` waiting markers; must be a non-empty path (a directory that does not exist means no markers, and the quiet-session net still applies). Container: `ALISSA_WAITING_DIR`, the same variable the hooks read |
+| `janitor_enabled` | `true` | the **workspace janitor**: at the end of a pass, every `janitor_interval_minutes`, remove each hub's stale `main/.review-scratch-*` and `REVIEW-*` folders that no live session or open round holds, `git worktree prune` the hub's `.source`, and warn on a full volume — see *The workspace janitor*. `--janitor` / `--no-janitor`; environment `ALISSA_REVIEW_JANITOR_ENABLED` |
+| `janitor_grace_minutes` | `1440` | how old (newest mtime of the folder and its direct children) a scratch folder or `REVIEW-` checkout must be before the janitor may remove it. `>= 1`. `--janitor-grace-minutes`; environment `ALISSA_REVIEW_JANITOR_GRACE_MINUTES` |
+| `janitor_interval_minutes` | `10` | how often the janitor sweeps; `0` = every pass. The first sweep runs at the end of the first pass. `--janitor-interval-minutes`; environment `ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES` |
+| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
 | `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
@@ -1201,6 +1209,51 @@ back inside the cap. Each idle agent session holds hundreds of MB forever; the 2
 incident was this drift, past 10 GB, with every review session idle and its PR
 long merged.
 
+### The workspace janitor
+
+A reviewer never deletes (CR6): it writes its scratch under its own checkout
+and leaves it. Two kinds of folder pile up under every hub that way — a
+round's `<hub>/main/.review-scratch-pr<N>-r<round>/` (the diff, the envelope,
+payload files and often a `wt/` worktree off `.source` with its own
+`node_modules`, 250–950 MB apiece) and the throwaway `<hub>/REVIEW-<task>`
+checkout the review skill lets a reviewer create. On 2026-10-12 the Alissa
+fleet's shared volume was 76% full with 169 scratch folders (27 GB) and ~5 GB
+of `REVIEW-*` checkouts.
+
+The janitor (`janitor.py`, on by default) runs at the end of a pass, every
+`janitor_interval_minutes` (default 10; `0` = every pass):
+
+- **Hubs** are the workspace root's direct children that hold a `.source`
+  directory — read off the disk, so a hub whose repo left the allowlist is
+  still swept.
+- **Candidates** are only `<hub>/main/.review-scratch-*` and `<hub>/REVIEW-*`
+  directories, direct children, never symlinks. Nothing else under a hub
+  (`main/`'s own files, `.source`, task worktrees, an operator's clone) is ever
+  considered.
+- **Removed** when the folder's age — the newest mtime of the folder and its
+  direct children — is past `janitor_grace_minutes` (default 1440, a day) and
+  nothing **holds** it. A PR is held by a live reviewer session (the roster;
+  the session's spawn row names its repo, PR and review task, and a
+  skill-shaped `review-pr-<n>` with no row holds PR `<n>` in every hub) or by
+  an open ledger round (an unreaped spawn younger than the 90-minute
+  stale-round window, or a verdict post still owed). A held PR keeps every one
+  of its scratch folders and its review task's `REVIEW-<task>` checkout; a held
+  round whose review task is unknown keeps every `REVIEW-*` in its hub. If the
+  roster cannot be listed the removal half is skipped that interval.
+- **Then** `git worktree prune` runs in each hub's `.source` as the daemon's
+  own user, dropping the records of the `wt/` worktrees and checkouts just
+  removed.
+- **One INFO line per sweep**: `janitor: removed N folder(s), freed X across H
+  hub(s); … held by a live round, … inside the grace, … failed`. When the
+  workspace volume is at or above `janitor_warn_pct` (default 80; `0` = never)
+  the sweep also logs **one WARNING** with the percentage.
+- **`--dry-run` removes and prunes nothing**: it logs each folder it would
+  remove (`[dry-run] janitor would remove <path> (<size>, <age>)`) and a
+  `[dry-run] janitor: would remove N folder(s)` summary.
+
+The volume's used percentage also rides on every fleet-vitals snapshot as
+`diskUsedPct` (see *Fleet vitals*).
+
 ### Spawn back-pressure: `max_concurrent_sessions`
 
 Nothing used to bound how many reviewer sessions ran at once. `round_cap` bounds
@@ -1544,6 +1597,7 @@ the console can never disagree, and the console sidecar need not be running:
 | `queueDepth` | owed rounds waiting on the spawn gate (`max_concurrent_sessions`) at the end of the pass |
 | `inbox` | the console's **live** inbox (cap-outs, stalled episodes, stability holds), newest first, ≤ 50: `{kind, subject, repo, number, isPr: true, ageS, url, lever}` |
 | `kpis` | `null` (orcloop-only) |
+| `diskUsedPct` | the workspace volume's used percent (one `statvfs` of the workspace root, to a tenth), or `null` when it cannot be read. A Studio whose strict schema predates it gets the `idle`/`config` treatment: resent without it, offered again after an hour |
 
 The API is **strict** (unknown keys are refused, lists cap at 50, the body at
 64 KB), so the builder emits only the contract's keys and trims `sessionList`

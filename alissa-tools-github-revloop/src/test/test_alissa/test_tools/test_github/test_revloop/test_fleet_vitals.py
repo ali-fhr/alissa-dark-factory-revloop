@@ -235,6 +235,8 @@ def test_console_fixtures_build_the_exact_contract_body(
              "url": f"https://github.com/{REPO}/pull/16",
              "lever": fleet_vitals.LEVER_STALLED},
         ],
+        # The workspace volume (issue #167): not passed, so null.
+        "diskUsedPct": None,
         # Seat parking (issue #157): the newest pass's in-flight round is
         # owed (a pre-#157 stage, so its stage's default), the capped PR is
         # settled; live / managed are the `sessions` reading.
@@ -250,7 +252,7 @@ def test_console_fixtures_build_the_exact_contract_body(
     assert set(snapshot) == {
         "schemaVersion", "seat", "asOf", "heartbeatAt", "pollIntervalS",
         "version", "drift", "pollDurationsMs", "sessions", "sessionList",
-        "rate", "memory", "queueDepth", "kpis", "inbox", "idle",
+        "rate", "memory", "queueDepth", "kpis", "inbox", "diskUsedPct", "idle",
     }
 
 

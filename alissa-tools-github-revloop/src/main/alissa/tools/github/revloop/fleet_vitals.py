@@ -86,6 +86,7 @@ from .alissa_client import (
     AlissaError,
 )
 from .config import REPOS_BOWS, Config
+from .janitor import disk_used_pct as volume_used_pct
 from .proc import CommandError, run as proc_run
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -117,7 +118,10 @@ VITALS_FAILED = "failed"
 # The blocks Studio's schema gained after the base contract, each in its own
 # lane: `idle` (seat parking L3) and `config` (provisioner L5). A strict 400
 # naming one of them is an old Studio, not a bad snapshot.
-OPTIONAL_BLOCKS = ("idle", "config")
+#
+# `diskUsedPct` (issue #167) joins them: the workspace volume's used percent,
+# which Studio's schema may not carry yet.
+OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct")
 
 # How long a snapshot leaves an optional block out after Studio refused it as
 # an unknown key, before it offers the block again. An hour: one extra POST
@@ -296,6 +300,7 @@ def build_snapshot(
     repos: "tuple[str, ...]" = (),
     now: "int | float | None" = None,
     config: "Mapping | None" = None,
+    disk_used_pct: "float | None" = None,
 ) -> dict:
     """The contract body for this pass, off the console's builders.
 
@@ -314,6 +319,9 @@ def build_snapshot(
 
     `config` is the seat's `config_block`, or None to leave the key out (the
     console's push, which has no derived answer to give).
+
+    `diskUsedPct` (issue #167) is the workspace volume's used percent, null
+    when it could not be read.
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -365,6 +373,7 @@ def build_snapshot(
         "queueDepth": _int_or_none(queue_depth),
         "kpis": None,
         "inbox": inbox,
+        "diskUsedPct": disk_used_pct,
         "idle": idle,
     }
     if config is not None:
@@ -519,6 +528,7 @@ class FleetVitalsPusher:
             repos=self.config.repos,
             now=self._clock(),
             config=self._config(),
+            disk_used_pct=volume_used_pct(self.config.workspace_root),
         ))
 
     def _config(self) -> "Mapping | None":

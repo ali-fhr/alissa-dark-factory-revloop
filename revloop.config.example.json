@@ -101,6 +101,18 @@
   "_waiting_dir": "Where the container's hooks leave the `<tmux session>.json` waiting markers (the container's ALISSA_WAITING_DIR; the renderer writes the same value here). Must be a non-empty path; a directory that does not exist simply means no markers, and the quiet-session net still applies.",
   "waiting_dir": "/workspace/.waiting",
 
+  "_janitor_enabled": "THE WORKSPACE JANITOR (issue #167). On by default. At the end of a pass, every janitor_interval_minutes, it removes each hub's `main/.review-scratch-*` and `REVIEW-*` folders (direct children only, never symlinks, nothing else under the hub) whose newest mtime is older than janitor_grace_minutes and that no live reviewer session or open ledger round holds, then runs `git worktree prune` in the hub's `.source`. One INFO line per sweep with the count and bytes freed; one WARNING when the workspace volume is at or above janitor_warn_pct. dry_run removes nothing and logs what it would remove. Environment: ALISSA_REVIEW_JANITOR_ENABLED (wins over this file AND --janitor/--no-janitor).",
+  "janitor_enabled": true,
+
+  "_janitor_grace_minutes": "How old (by the newest mtime of the folder and its direct children) a scratch folder or REVIEW- checkout must be before the janitor may remove it. >= 1. Environment: ALISSA_REVIEW_JANITOR_GRACE_MINUTES.",
+  "janitor_grace_minutes": 1440,
+
+  "_janitor_interval_minutes": "How often the janitor sweeps, at the end of a pass. 0 = every pass. Environment: ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES.",
+  "janitor_interval_minutes": 10,
+
+  "_janitor_warn_pct": "Workspace volume usage (percent) at or above which a sweep logs one WARNING. 0 = never; at most 100. Environment: ALISSA_REVIEW_JANITOR_WARN_PCT.",
+  "janitor_warn_pct": 80,
+
   "_alissa_endpoint": "The Alissa API base the loop-events and fleet-vitals client posts to, and (under repos_source 'bows') the feed listing is read from. Leave it at the default unless the deployment points at a staging API.",
   "alissa_endpoint": "https://api.alissa.app",
 

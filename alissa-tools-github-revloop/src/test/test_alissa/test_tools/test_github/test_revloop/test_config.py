@@ -16,6 +16,10 @@ from alissa.tools.github.revloop.config import (
     CONFIG_FILENAME,
     CONFIG_KEYS,
     DEFAULT_PLAN_REPOS,
+    JANITOR_ENABLED_ENV,
+    JANITOR_GRACE_MINUTES_ENV,
+    JANITOR_INTERVAL_MINUTES_ENV,
+    JANITOR_WARN_PCT_ENV,
     PLAN_AUTHORS_ENV,
     PLAN_REPOS_ENV,
     HUB_ADD,
@@ -368,3 +372,104 @@ def test_no_plans_repository_literal_survives_outside_config():
     config_text = Path(config_module.__file__).read_text(encoding="utf-8")
     assert "ali-fhr/alissa-dark-factory-plans" not in config_text
     assert "ali-fhr/alissa-plans" not in config_text
+
+
+# -- the workspace janitor (issue #167) -----------------------------------------
+
+JANITOR_ENVS = (
+    JANITOR_ENABLED_ENV, JANITOR_GRACE_MINUTES_ENV,
+    JANITOR_INTERVAL_MINUTES_ENV, JANITOR_WARN_PCT_ENV,
+)
+
+
+def test_the_janitor_keys_have_their_documented_defaults(tmp_path):
+    cfg = Config.build(tmp_path, {}, environ={})
+    assert cfg.janitor_enabled is True
+    assert cfg.janitor_grace_minutes == 1440
+    assert cfg.janitor_interval_minutes == 10
+    assert cfg.janitor_warn_pct == 80
+    for key in ("janitor_enabled", "janitor_grace_minutes",
+                "janitor_interval_minutes", "janitor_warn_pct"):
+        assert key in CONFIG_KEYS
+
+
+def test_the_janitor_keys_parse_from_the_file(tmp_path):
+    cfg = Config.build(tmp_path, {
+        "janitor_enabled": False, "janitor_grace_minutes": 120,
+        "janitor_interval_minutes": 0, "janitor_warn_pct": 90,
+    }, environ={})
+    assert (cfg.janitor_enabled, cfg.janitor_grace_minutes,
+            cfg.janitor_interval_minutes, cfg.janitor_warn_pct) == (False, 120, 0, 90)
+
+
+def test_the_janitor_flags_parse_from_the_cli(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in JANITOR_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    cfg = resolve_config(cli(
+        "--no-janitor", "--janitor-grace-minutes", "60",
+        "--janitor-interval-minutes", "5", "--janitor-warn-pct", "70",
+    ))
+    assert (cfg.janitor_enabled, cfg.janitor_grace_minutes,
+            cfg.janitor_interval_minutes, cfg.janitor_warn_pct) == (False, 60, 5, 70)
+    assert resolve_config(cli("--janitor")).janitor_enabled is True
+
+
+@pytest.mark.parametrize(
+    "key,env,file_value,cli_argv,env_value,expect_env",
+    [
+        ("janitor_enabled", JANITOR_ENABLED_ENV, True, ("--no-janitor",), "on", True),
+        ("janitor_grace_minutes", JANITOR_GRACE_MINUTES_ENV, 120,
+         ("--janitor-grace-minutes", "60"), "30", 30),
+        ("janitor_interval_minutes", JANITOR_INTERVAL_MINUTES_ENV, 15,
+         ("--janitor-interval-minutes", "5"), "0", 0),
+        ("janitor_warn_pct", JANITOR_WARN_PCT_ENV, 90,
+         ("--janitor-warn-pct", "70"), "85", 85),
+    ],
+)
+def test_janitor_env_wins_over_file_and_flag_and_blank_falls_through(
+    tmp_path, monkeypatch, key, env, file_value, cli_argv, env_value, expect_env
+):
+    """file < CLI < env, through the real entry point, like the bows rails."""
+    (tmp_path / CONFIG_FILENAME).write_text(json.dumps({key: file_value}))
+    monkeypatch.chdir(tmp_path)
+    for name in JANITOR_ENVS:
+        monkeypatch.delenv(name, raising=False)
+
+    assert getattr(resolve_config(cli()), key) == file_value
+    from_cli = getattr(resolve_config(cli(*cli_argv)), key)
+    assert from_cli != file_value
+
+    monkeypatch.setenv(env, " ")
+    assert getattr(resolve_config(cli(*cli_argv)), key) == from_cli, "blank falls through"
+
+    monkeypatch.setenv(env, env_value)
+    assert getattr(resolve_config(cli(*cli_argv)), key) == expect_env
+
+
+@pytest.mark.parametrize(
+    "data, message",
+    [
+        ({"janitor_grace_minutes": 0}, "janitor_grace_minutes must be >= 1"),
+        ({"janitor_interval_minutes": -1}, "janitor_interval_minutes must be >= 0"),
+        ({"janitor_warn_pct": 101}, "janitor_warn_pct must be between 0 and 100"),
+        ({"janitor_warn_pct": -1}, "janitor_warn_pct must be between 0 and 100"),
+    ],
+)
+def test_out_of_range_janitor_values_are_refused(tmp_path, data, message):
+    with pytest.raises(ValueError, match=message):
+        Config.build(tmp_path, data, environ={})
+
+
+@pytest.mark.parametrize(
+    "env, value",
+    [
+        (JANITOR_ENABLED_ENV, "maybe"),
+        (JANITOR_GRACE_MINUTES_ENV, "a day"),
+        (JANITOR_INTERVAL_MINUTES_ENV, "10m"),
+        (JANITOR_WARN_PCT_ENV, "80%"),
+    ],
+)
+def test_a_malformed_janitor_env_value_names_the_variable(tmp_path, env, value):
+    with pytest.raises(ValueError, match=env):
+        Config.build(tmp_path, {}, environ={env: value})
