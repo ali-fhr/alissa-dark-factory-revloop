@@ -93,6 +93,12 @@ COMPARE_COMMITS_PER_PAGE = 1
 # gone?" probe would answer yes on every large PR and abandon real verdicts.
 PR_COMMIT_CAP = 250
 
+# GitHub's OWN cap on the pull-request files endpoint: it "lists a maximum of
+# 3000 files" (30 pages of 100). Past it the listing is silently short, so a
+# PR at the cap cannot prove that EVERY changed path is under some prefix --
+# which is the one question `pull_request_files` is asked (issue #171).
+PR_FILES_CAP = 3000
+
 # Environment variables `gh` reads a token from. Both are cleared before an
 # explicitly-routed call, so an inherited implementer credential cannot win by
 # being the one variable we did not think to overwrite.
@@ -777,6 +783,58 @@ class GitHub:
                 )
                 raise TruncatedListing(
                     f"{owner}/{repo}#{number} reached GitHub's {PR_COMMIT_CAP}-commit "
+                    f"listing cap; absence cannot be proven from it"
+                )
+            if len(data) < PER_PAGE:
+                return out
+            page += 1
+
+    def pull_request_files(self, owner: str, repo: str, number: int) -> list[str]:
+        """Every path the PR changes, paged to the end.
+
+        Read on ONE path: the discovery skip (issue #171), which asks whether
+        EVERY changed path is under `knowledge-base/`. That is an absence
+        question again -- "nothing outside the prefix" -- so a listing at
+        GitHub's PR_FILES_CAP is REFUSED (`TruncatedListing`) rather than
+        answered short, and the caller reviews the PR instead of skipping it.
+
+        A RENAME contributes BOTH names, for the reason `compare_files` gives:
+        `src/x.py` moved to `knowledge-base/x.py` changed a path outside the
+        prefix, and reading only the destination would make it look confined.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        listed = 0
+        page = 1
+        while True:
+            data = (
+                self._api(
+                    "-X",
+                    "GET",
+                    f"repos/{owner}/{repo}/pulls/{number}/files",
+                    "-f",
+                    f"per_page={PER_PAGE}",
+                    "-f",
+                    f"page={page}",
+                )
+                or []
+            )
+            listed += len(data)
+            for entry in data:
+                for key in ("filename", "previous_filename"):
+                    name = str(entry.get(key) or "")
+                    if name and name not in seen:
+                        seen.add(name)
+                        out.append(name)
+            if listed >= PR_FILES_CAP:
+                log.warning(
+                    "%s/%s#%d reached GitHub's %d-file listing cap — the file "
+                    "list is not complete, so 'nothing outside the prefix' "
+                    "cannot be read from it",
+                    owner, repo, number, PR_FILES_CAP,
+                )
+                raise TruncatedListing(
+                    f"{owner}/{repo}#{number} reached GitHub's {PR_FILES_CAP}-file "
                     f"listing cap; absence cannot be proven from it"
                 )
             if len(data) < PER_PAGE:
