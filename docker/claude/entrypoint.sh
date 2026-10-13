@@ -1595,6 +1595,29 @@ fi
 # -----------------------------------------------------------------------------
 mkdir -p "${TMUX_TMPDIR:-/home/alissa/.tmux}"
 
+# Drop the worker's stale pidfile before starting (issue #169).
+#
+# `alissa worker start` refuses to start when ${XDG_STATE_HOME:-$HOME/.local/state}/
+# alissa/worker.pid names a live pid, and it decides "live" with a bare
+# kill(pid, 0). That file lives in the container filesystem, which a platform
+# RESTART keeps (only a redeploy replaces it), and the restarted container replays
+# the same deterministic boot in a fresh pid namespace — so the old worker's pid is
+# routinely held by some unrelated boot process. The CLI then prints "A worker is
+# already running (pid N)", the `|| die` below fires, and every restart dies the
+# same way: the crash loop devloop hit on 2026-10-13.
+#
+# Same argument as the executor's lockfile above: at this point no worker started
+# by this container can be alive, so the file is stale by construction and is
+# cleared unconditionally. Resolved exactly as the CLI resolves it (XDG_STATE_HOME,
+# else $HOME/.local/state). worker.root is the CLI's companion record of the dead
+# worker's queue root and goes with it. Never fatal.
+WORKER_STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/alissa"
+if [ -f "${WORKER_STATE_DIR}/worker.pid" ]; then
+  stale_worker_pid="$(tr -cd '0-9' < "${WORKER_STATE_DIR}/worker.pid" 2>/dev/null || true)"
+  log "cleared a stale worker pidfile (pid ${stale_worker_pid:-unreadable}) left by a previous run of this container"
+fi
+rm -f "${WORKER_STATE_DIR}/worker.pid" "${WORKER_STATE_DIR}/worker.root" 2>/dev/null || true
+
 log "starting alissa worker (detached)"
 alissa worker start --daemon --interval "${ALISSA_WORKER_INTERVAL:-2}" \
   || die "alissa worker failed to start"

@@ -8,10 +8,18 @@ inherited -- which is how a reviewer's verdict ended up on GitHub under the
 IMPLEMENTER's login (issue #51). Callers that must be sure which identity a
 `gh` call carries pass a fully-resolved environment here; everything else
 passes None and inherits, exactly as before.
+
+A child that cannot even be STARTED is a CommandError too (issue #169): the
+container's cgroup pids.max counts threads, so a busy fleet can make `fork`
+fail with EAGAIN, and an OSError escaping here reads as an unexplained crash
+class rather than "gh could not start". Folding it keeps one failure type for
+every caller (each already handles a CommandError the way it handles a
+timeout) and puts the errno name in the message the poll firewall logs.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -64,10 +72,22 @@ def run(
         )
     except subprocess.TimeoutExpired as exc:
         raise CommandError(argv, -1, f"timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise CommandError(argv, -1, f"could not start {argv[0]}: {_os_error_text(exc)}") from exc
 
     if check and proc.returncode != 0:
         raise CommandError(argv, proc.returncode, proc.stderr)
     return proc.stdout
+
+
+def _os_error_text(exc: OSError) -> str:
+    """`EAGAIN: Resource temporarily unavailable` -- the errno's symbolic name
+    first, since that is what an operator greps for; the bare message when the
+    error carries no errno."""
+    name = errno.errorcode.get(exc.errno) if exc.errno is not None else None
+    if name is None:
+        return str(exc)
+    return f"{name}: {exc.strerror or exc}"
 
 
 def run_json(

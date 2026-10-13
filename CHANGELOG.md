@@ -4,6 +4,27 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.16
+
+- **A container restart no longer crash-loops on the worker's pidfile, and a
+  failed fork is named** (issue #169; origin TASK-1697240747, implementation
+  TASK-440003550). Port of the devloop outage of 2026-10-13, where a poll's
+  `gh` fork hit the cgroup's `pids.max` (`BlockingIOError: [Errno 11]`) and
+  every restart then died on `✗ A worker is already running (pid 240)`.
+  - **Entrypoint step 4** removes `worker.pid` and `worker.root` under
+    `${XDG_STATE_HOME:-$HOME/.local/state}/alissa` before
+    `alissa worker start` (daemon role only), unconditionally and never
+    fatally, with one log line naming the pid the file held. A restart keeps
+    the container filesystem, and the old pid is often live again in the new
+    pid namespace. New `docker/claude/tests-entrypoint-worker.sh`, run by
+    `check-entrypoint`.
+  - **`proc.run` folds an `OSError` from `subprocess.run`** (a child that
+    could not be started: `EAGAIN`, `ENOENT`, …) into
+    `CommandError(argv, -1, "could not start <argv0>: <ERRNO>: <message>")`,
+    the original kept as `__cause__`. `run_forever` already survived it
+    (issue #62); now the poll-failure line and the firewall streak name it.
+  - **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.16.
+
 ## 0.31.15
 
 - **The workspace janitor** (issue #167; origin TASK-1483369441,
