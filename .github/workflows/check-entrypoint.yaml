@@ -22,7 +22,10 @@ on: [pull_request]
 #     docker/claude/tests-entrypoint-prune.sh;
 #   * the guarded boot-time chown (warm boot skips the volume walk, a root-owned
 #     probe result or ALISSA_FORCE_CHOWN=1 still runs it) —
-#     docker/claude/tests-entrypoint-chown.sh.
+#     docker/claude/tests-entrypoint-chown.sh;
+#   * the stale worker-pidfile sweep (a pidfile a restart left behind, naming a
+#     pid that is live again in the new namespace, never fails the boot) —
+#     docker/claude/tests-entrypoint-worker.sh.
 jobs:
   entrypoint-config-check:
     name: Entrypoint config renderer + console wiring
@@ -96,6 +99,14 @@ jobs:
         # claim; the last case runs against the real stat and the real tree.
         timeout-minutes: 4
         run: bash docker/claude/tests-entrypoint-chown.sh
+      - name: Execute Entrypoint Worker-Pidfile Tests
+        # Boots the entrypoint four times against an `alissa` stub that models
+        # the CLI's own pidfile check (a bare kill(pid, 0)), with the pidfile
+        # naming a LIVE unrelated process — the condition behind the 2026-10-13
+        # restart crash loop (issue #169). Plus one direct control call proving
+        # the stub refuses exactly as the CLI does.
+        timeout-minutes: 3
+        run: bash docker/claude/tests-entrypoint-worker.sh
       - name: Execute Entrypoint Workspace-Prune Tests
         # Boots the entrypoint six times against an `alissa` stub that records
         # every `code workspace prune` invocation with its argv AND its cwd —

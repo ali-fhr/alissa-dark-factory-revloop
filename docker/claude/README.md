@@ -1504,7 +1504,10 @@ volumes:
    start …`. `exec`, so the container's only process is the executor — steps 4
    and 5 below never run in this role, and the daemon role never reaches this
    step. Nothing after this point applies to an executor service.
-4. Start `alissa worker --daemon`, wait until it reports running (the daemon only
+4. Clear the worker's stale pidfile (`worker.pid` + `worker.root` under
+   `${XDG_STATE_HOME:-$HOME/.local/state}/alissa`, one log line naming the pid it
+   held — [why](#a-restart-never-trips-over-the-old-workers-pidfile)), then start
+   `alissa worker --daemon`, wait until it reports running (the daemon only
    *warns* if the worker is absent, so ordering matters).
 4b. When `ALISSA_UI_ENABLED` is set, start the reviewer console
    (`alissa-revloop-ui`) backgrounded on `[::]:${PORT:-8080}` (dual-stack;
@@ -1529,6 +1532,13 @@ container is not assumed to be well-behaved any more:
   the poll interval up to 15 minutes, and keeps polling. `Ctrl-C` and
   `SystemExit` still stop it, and a **startup** config error still exits `2`
   fast — a bad config file is not something retrying fixes.
+* **A command that cannot even start is one bad poll too** (issue #169). The
+  container's cgroup `pids.max` counts *threads*, so a busy fleet can make a
+  `gh`/`alissa` fork fail with `EAGAIN`. `proc.run` folds that `OSError` into
+  the same `CommandError` every caller already handles like a timeout, with the
+  errno named: `poll failed (CommandError: gh exited -1: could not start gh:
+  EAGAIN: Resource temporarily unavailable)`. One failed poll, a backoff, and the
+  next poll runs normally.
 * **A stuck daemon is loud, not silent.** If the *same* exception class fires on
   every poll for 30 minutes, the log level escalates to page-worthy `ERROR`
   ("the daemon is alive and still retrying… but this is no longer transient").
@@ -1552,6 +1562,22 @@ container is not assumed to be well-behaved any more:
   makes an unrecordable action visible; the gate is what stops it repeating.
   (`--dry-run` is exempt — it takes no action to protect — so it still answers
   "what would you do right now" during an incident.)
+
+### A restart never trips over the old worker's pidfile
+
+`alissa worker start` refuses to start while
+`${XDG_STATE_HOME:-$HOME/.local/state}/alissa/worker.pid` names a live pid, and
+"live" is a bare `kill(pid, 0)`. That file is in the **container filesystem**,
+not on the volume: a redeploy replaces it, but a platform **restart** keeps it,
+and the restarted container replays the same boot in a fresh pid namespace — so
+the dead worker's pid is routinely held by some unrelated boot process. Without
+the entrypoint's step 4 sweep that is `✗ A worker is already running (pid 240)`
+→ `FATAL: alissa worker failed to start` on every restart: the crash loop the
+devloop container hit on 2026-10-13. No worker started by this container can be
+alive when step 4 runs, so the sweep is unconditional and never fatal; it logs
+`cleared a stale worker pidfile (pid N) left by a previous run of this container`
+when it found one, and nothing on a clean boot. The executor role never reaches
+it (it has no worker; its own lockfile has the same sweep at step 3d).
 
 What this means operationally — three states, and the third is the one that
 needs a runbook line:

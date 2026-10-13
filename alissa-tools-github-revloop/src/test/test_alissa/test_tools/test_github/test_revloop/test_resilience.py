@@ -17,13 +17,16 @@ which is the one place the old behaviour was right.
 
 from __future__ import annotations
 
+import errno
 import logging
 import sqlite3
+import subprocess
 import time as real_time
 
 import pytest
 
 from alissa.tools.github.revloop import loop as loop_module
+from alissa.tools.github.revloop import proc as proc_module
 from alissa.tools.github.revloop import state as state_module
 from alissa.tools.github.revloop.__main__ import main
 from alissa.tools.github.revloop.config import Config
@@ -278,6 +281,81 @@ def test_keyboard_interrupt_and_system_exit_still_pass_through(config, clock):
 
     with pytest.raises(SystemExit):
         w.run_forever()
+
+
+def test_a_failed_fork_is_one_logged_poll_failure_naming_the_errno(config, clock, monkeypatch, caplog):
+    """Issue #169, the 2026-10-13 devloop outage: the container's pids.max
+    (which counts threads) was reached, a poll's `gh` fork raised
+    BlockingIOError, and the daemon died. Here the REAL `proc.run` is reached
+    and `subprocess.run` fails to fork once: that must be one failed poll --
+    logged with the errno named, backed off -- and the next poll runs
+    normally."""
+    caplog.set_level(logging.INFO)
+    forks = {"n": 0}
+
+    def fork(argv, **kwargs):
+        forks["n"] += 1
+        if forks["n"] == 1:
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+        return subprocess.CompletedProcess(argv, 0, stdout="alissa-app\n", stderr="")
+
+    monkeypatch.setattr(proc_module.subprocess, "run", fork)
+    w = ReviewWatcher(config, github=object(), alissa=object(), state=None)
+    passes = {"n": 0}
+
+    def poll_once():
+        passes["n"] += 1
+        if passes["n"] > 2:
+            raise KeyboardInterrupt
+        proc_module.run(["gh", "api", "user", "-q", ".login"])
+        return []
+
+    w.poll_once = poll_once  # type: ignore[method-assign]
+
+    w.run_forever()
+
+    # Poll 1 failed to fork, poll 2 forked and completed, then the stop signal.
+    assert passes["n"] == 3 and forks["n"] == 2
+    # Backed off once (doubling from the interval), then straight back to it.
+    assert clock.slept == [120, 60]
+    failed = [r for r in caplog.records if "poll failed" in r.getMessage()]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING
+    message = failed[0].getMessage()
+    assert "CommandError" in message
+    assert "could not start gh: EAGAIN: Resource temporarily unavailable" in message
+    # A CommandError carries its own diagnosis: no traceback for it.
+    assert not failed[0].exc_info
+    assert "poll recovered after 1 consecutive failure(s)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "raised, expected",
+    [
+        (BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
+         "could not start gh: EAGAIN: Resource temporarily unavailable"),
+        (FileNotFoundError(errno.ENOENT, "No such file or directory", "gh"),
+         "could not start gh: ENOENT: No such file or directory"),
+        (OSError("no errno at all"), "could not start gh: no errno at all"),
+    ],
+)
+def test_proc_run_folds_a_spawn_oserror_into_a_command_error(monkeypatch, raised, expected):
+    """The fold itself: argv kept, returncode -1 (the timeout's convention for
+    'no exit status'), the errno's symbolic name in the message, and the
+    OSError kept as the cause for anyone who needs it."""
+    def fork(argv, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(proc_module.subprocess, "run", fork)
+
+    with pytest.raises(CommandError) as info:
+        proc_module.run(["gh", "api", "user"])
+
+    assert info.value.argv == ["gh", "api", "user"]
+    assert info.value.returncode == -1
+    assert info.value.stderr == expected
+    assert str(info.value) == f"gh exited -1: {expected}"
+    assert info.value.__cause__ is raised
 
 
 def test_startup_config_errors_still_exit_two_fast(tmp_path, monkeypatch, capsys):
