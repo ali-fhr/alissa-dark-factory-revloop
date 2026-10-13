@@ -26,7 +26,9 @@ handshake):
   reads every null as a refusal.
 * **The drain.** A flag with a TTL in `state.db` (`State.set_drain`), cleared
   when the daemon boots. While it holds, the round spawn stands down before
-  its first side effect (`ReviewWatcher._drain_gated`).
+  its first side effect (`ReviewWatcher._drain_gated`), or, when the drain
+  lands while the hub is provisioned, after the hub add and before the
+  enqueue (the post-hub re-claim).
 """
 
 from __future__ import annotations

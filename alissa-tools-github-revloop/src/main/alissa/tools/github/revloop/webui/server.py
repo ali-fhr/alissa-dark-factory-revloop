@@ -332,7 +332,9 @@ class App:
             cleared = self.sources.clear_drain()
         except sqlite3.Error as exc:
             self._audit("undrain", {"ok": False, "error": str(exc)})
-            return 503, {"drained": True, "error": "state_unavailable"}
+            # The flag's state is unknown here, and unknown is never a value
+            # (D2): the 503 already says the undrain did not land.
+            return 503, {"drained": None, "error": "state_unavailable"}
         self._audit("undrain", {"ok": True, "cleared": cleared})
         return 200, {"drained": False, "cleared": cleared}
 

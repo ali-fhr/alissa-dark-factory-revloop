@@ -6302,20 +6302,49 @@ class ReviewWatcher:
         #157): claim the spawn of this round's session against the drain
         flag, run `spawn` under the claim, and drop the claim however it ends.
 
-        The gate sits ABOVE every side effect of the spawn -- the hub add,
-        the `alissa tmux queue add`, the census bump, the ledger row, the
-        activity line -- so a drained seat touches nothing, and the round
-        stays owed: a QUEUED `drained` decision writes no spawn row, burns no
-        round number and spends no attempt, exactly like the slot gate. The
-        claim and the flag are read and written in one immediate transaction
-        on each side (`State.claim_spawn` / `State.set_drain`): a drain that
+        The gate sits ABOVE every side effect of the spawn but one -- the
+        `alissa tmux queue add`, the census bump, the ledger row and the
+        activity line all come after it -- and a round it stands down stays
+        owed: a QUEUED `drained` decision writes no spawn row, burns no round
+        number and spends no attempt, exactly like the slot gate. The claim
+        and the flag are read and written in one immediate transaction on
+        each side (`State.claim_spawn` / `State.set_drain`): a drain that
         lands while this spawn is between its gate and its ledger write sees
-        the claim and refuses itself, so a park can never race a spawn. A
-        ledger that cannot answer stands the spawn down too -- a spawn that
-        cannot prove the seat is not drained does not happen.
+        the claim and refuses itself. A ledger that cannot answer stands the
+        spawn down too -- a spawn that cannot prove the seat is not drained
+        does not happen.
+
+        The claim only counts for `parking.SPAWN_CLAIM_TTL`, and the hub add
+        (`_ensure_hub`, a clone on a PR's first round) can outlast it. So
+        `_spawn_claimed` re-takes the claim (`_claim_spawn` again, issue
+        #173) between the hub add and the enqueue, which refreshes it and
+        re-reads the flag: a drain that held while the hub was provisioned
+        stands the round down there, the same QUEUED `drained` way. That late
+        re-check is the one stand-down that happens AFTER a side effect --
+        the hub is provisioned and stays -- which is harmless, because the
+        hub is a reusable cache the round's next spawn finds in place.
+        Together the two claims mean a park can never race a spawn, whatever
+        the drain's freshness rule allows.
 
         Dry-run READS the flag and claims nothing: it shares the production
         state path, and a dry pass must write no durable row."""
+        refused = self._claim_spawn(pr, round_, name)
+        if refused is not None:
+            return refused
+        try:
+            return spawn()
+        finally:
+            if not self.config.dry_run:
+                self.state.release_spawn(name)
+
+    def _claim_spawn(
+        self, pr: PullRequest, round_: int, name: str, *, late: bool = False,
+    ) -> "Decision | None":
+        """Claim (or, `late`, re-claim) the spawn of `name` against the drain
+        flag: None when the spawn may proceed, else the QUEUED `drained`
+        decision that stands the round down. Dry-run reads the flag and
+        claims nothing. See `_drain_gated`."""
+        where = " after its hub was provisioned" if late else ""
         try:
             if self.config.dry_run:
                 drain = self.state.drain()
@@ -6323,36 +6352,32 @@ class ReviewWatcher:
                 drain = self.state.claim_spawn(name)
         except sqlite3.Error as exc:
             log.warning(
-                "%s round %d: could not claim the spawn against the drain flag "
-                "(%s) — standing it down this pass", pr.slug, round_, exc,
+                "%s round %d: could not claim the spawn against the drain flag%s "
+                "(%s) — standing it down this pass", pr.slug, round_, where, exc,
             )
             return Decision(
                 Action.QUEUED,
-                f"round {round_} stood down — the state ledger could not prove "
-                f"the seat is not drained ({exc}); retrying next poll",
+                f"round {round_} stood down{where} — the state ledger could not "
+                f"prove the seat is not drained ({exc}); retrying next poll",
                 round_,
                 drained=True,
             )
-        if drain is not None:
-            since = parking_mod.iso(drain["drained_at"])
-            until = parking_mod.iso(drain["expires_at"])
-            log.info(
-                "%s round %d: not spawning — the seat is drained for parking "
-                "since %s (until %s)", pr.slug, round_, since, until,
-            )
-            return Decision(
-                Action.QUEUED,
-                f"round {round_} held — the seat is drained for parking since "
-                f"{since} (until {until}: {drain['reason'] or 'no reason given'}); "
-                f"retrying once it is undrained",
-                round_,
-                drained=True,
-            )
-        try:
-            return spawn()
-        finally:
-            if not self.config.dry_run:
-                self.state.release_spawn(name)
+        if drain is None:
+            return None
+        since = parking_mod.iso(drain["drained_at"])
+        until = parking_mod.iso(drain["expires_at"])
+        log.info(
+            "%s round %d: not spawning%s — the seat is drained for parking "
+            "since %s (until %s)", pr.slug, round_, where, since, until,
+        )
+        return Decision(
+            Action.QUEUED,
+            f"round {round_} held{where} — the seat is drained for parking since "
+            f"{since} (until {until}: {drain['reason'] or 'no reason given'}); "
+            f"retrying once it is undrained",
+            round_,
+            drained=True,
+        )
 
     def _spawn_claimed(
         self,
@@ -6426,6 +6451,14 @@ class ReviewWatcher:
             # Owed (issue #157): the round is owed and the hub could not be
             # provisioned -- unknown, never settled.
             return Decision(Action.SKIPPED, problem, round_, owed=True)
+
+        # The hub add can outlast the gate's claim (a clone on a PR's first
+        # round): re-take it, refreshing it and re-reading the drain flag, so
+        # a drain that landed meanwhile stands the round down here (issue
+        # #173). The claim is still released in `_drain_gated`'s finally.
+        refused = self._claim_spawn(pr, round_, name, late=True)
+        if refused is not None:
+            return refused
 
         self.alissa.enqueue_reviewer(
             session=name,

@@ -414,6 +414,106 @@ def test_a_ledger_that_cannot_prove_the_seat_undrained_stands_the_spawn_down(con
     assert al.enqueued == []
 
 
+def _slow_hub(w, st, config, *, drain):
+    """Make `_ensure_hub` a slow first clone: the gate's claim ages past
+    SPAWN_CLAIM_TTL while it runs, and (with `drain`) a drain lands in that
+    window from the console's own connection -- seeing no standing claim, so
+    it holds. Returns what the drain saw."""
+    real = w._ensure_hub
+    seen: dict = {}
+
+    def slow(pr, task_ref=None):
+        st._db.execute(
+            "UPDATE spawn_claims SET claimed_at = ?",
+            (int(time.time()) - parking.SPAWN_CLAIM_TTL - 60,),
+        )
+        st._db.commit()
+        if drain:
+            with State(config.state_db) as console:
+                seen["drain"], seen["claims"] = console.set_drain(300, "park")
+        return real(pr, task_ref=task_ref)
+
+    w._ensure_hub = slow
+    return seen
+
+
+def test_a_drain_landing_while_the_hub_is_provisioned_stands_the_round_down(config):
+    """Issue #173: the hub add outlasts the gate's claim, a drain lands in
+    that window and holds -- the post-hub re-claim sees it and enqueues
+    nothing."""
+    st = State(config.state_db)
+    w, gh, al = watcher(config, make_pr(), [], state=st)
+    seen = _slow_hub(w, st, config, drain=True)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert seen["drain"] is not None and seen["claims"] == [], (
+        "the aged claim no longer refuses the drain -- the race is real"
+    )
+    assert d.action is Action.QUEUED and d.drained
+    assert decision_owed(d)
+    assert "after its hub was provisioned" in d.reason and "park" in d.reason
+    assert al.enqueued == []
+    assert st.read_spawns() == [], "no spawn row: no round number is burned"
+    assert st._db.execute("SELECT COUNT(*) FROM spawn_claims").fetchone()[0] == 0
+
+    st.clear_drain()
+    w._ensure_hub = type(w)._ensure_hub.__get__(w)
+    d = w.evaluate(OWNER, REPO, NUMBER)
+    assert d.action is Action.SPAWNED and d.round == 1, "the round is still owed"
+
+
+def test_a_slow_hub_without_a_drain_still_spawns_once(config):
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    _slow_hub(w, st, config, drain=False)
+    claimed = []
+
+    def enqueue(**kw):
+        claimed.extend(
+            dict(r) for r in st._db.execute(
+                "SELECT session, claimed_at FROM spawn_claims").fetchall()
+        )
+        al.enqueued.append(kw)
+
+    al.enqueue_reviewer = enqueue
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 1
+    assert len(al.enqueued) == 1
+    [claim] = claimed
+    assert claim["session"] == al.enqueued[0]["session"]
+    assert claim["claimed_at"] > int(time.time()) - parking.SPAWN_CLAIM_TTL, (
+        "the re-claim refreshed the aged claim before the enqueue"
+    )
+    assert st._db.execute("SELECT COUNT(*) FROM spawn_claims").fetchone()[0] == 0, (
+        "the claim is released once the spawn lands"
+    )
+
+
+def test_a_ledger_error_on_the_post_hub_reclaim_stands_the_round_down(config):
+    st = State(config.state_db)
+    w, _, al = watcher(config, make_pr(), [], state=st)
+    real = st.claim_spawn
+    calls = []
+
+    def second_fails(session, now=None):
+        calls.append(session)
+        if len(calls) > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(session, now)
+
+    st.claim_spawn = second_fails
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert len(calls) == 2 and calls[0] == calls[1], "the same session, re-claimed"
+    assert d.action is Action.QUEUED and d.drained
+    assert "could not prove" in d.reason and "after its hub was provisioned" in d.reason
+    assert al.enqueued == []
+    assert st.read_spawns() == []
+    assert st._db.execute("SELECT COUNT(*) FROM spawn_claims").fetchone()[0] == 0
+
+
 def test_dry_run_reads_the_flag_and_writes_no_claim(config, tmp_path):
     import dataclasses
 
@@ -734,6 +834,40 @@ def test_undrain_lowers_the_flag_and_is_idempotent(tmp_path):
     with State(app.sources.config.state_db) as st:
         assert st.drain() is None
     assert [a for a, _ in audit] == ["drain", "undrain", "undrain"]
+
+
+def test_an_unreadable_undrain_answers_drained_null(tmp_path):
+    """Unknown is never a value (D2): a ledger that cannot be written leaves
+    the flag's state unknown, so the 503 says `drained: null`."""
+    app, _, audit = _console(tmp_path)
+
+    def broken():
+        raise sqlite3.OperationalError("database is locked")
+
+    app.sources.clear_drain = broken
+    status, body = app.undrain()
+
+    assert status == 503
+    assert body == {"drained": None, "error": "state_unavailable"}
+    assert json.loads(json.dumps(body))["drained"] is None
+    assert audit[-1][0] == "undrain" and audit[-1][1]["ok"] is False
+
+
+def test_the_spawn_claim_ttl_is_defined_once(tmp_path):
+    import inspect
+
+    from alissa.tools.github.revloop import state as state_mod
+
+    default = inspect.signature(State.set_drain).parameters["claim_ttl"].default
+    assert default == parking.SPAWN_CLAIM_TTL
+    assert not re.search(r"\b600\b", inspect.getsource(state_mod)), (
+        "state.py carries no claim-TTL literal"
+    )
+    st = State(tmp_path / "state.db")
+    st.claim_spawn("s-old", now=1_000)
+    st.claim_spawn("s-new", now=1_000 + parking.SPAWN_CLAIM_TTL)
+    _, claims = st.set_drain(300, "park", now=1_000 + parking.SPAWN_CLAIM_TTL + 1)
+    assert [c["session"] for c in claims] == ["s-new"]
 
 
 def test_with_the_push_off_the_drain_says_skipped(tmp_path):
