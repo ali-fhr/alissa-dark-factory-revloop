@@ -4,6 +4,24 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.18
+
+- **The round spawn re-claims after the hub add** (issue #173, the seat-parking
+  follow-ups from PR #158; origin TASK-810139812, implementation
+  TASK-1822716511). `_spawn_claimed` re-takes the spawn claim between
+  `_ensure_hub` and `enqueue_reviewer`, refreshing it and re-reading the drain
+  flag in one immediate transaction. A drain that landed while the hub was
+  provisioned (a first-round clone can outlast `SPAWN_CLAIM_TTL`) now stands
+  the round down there: a `QUEUED` `drained` decision, no ledger row, no round
+  number burnt, the round still owed. A `sqlite3.Error` on the re-claim stands
+  it down the same way. `_drain_gated`'s docstring now says the late re-check
+  can stand a round down after its hub is provisioned.
+- **`POST /action/undrain` answers `"drained": null` on its 503** when the
+  ledger raises `sqlite3.Error` (was `true`): the flag's state is unknown.
+- **One spawn-claim TTL.** `State.set_drain`'s `claim_ttl` defaults to
+  `parking.SPAWN_CLAIM_TTL`; `state.py` carries no copy of it.
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.18.
+
 ## 0.31.17
 
 - **Discovery PRs get no review round** (issue #171, lane DS-7b; origin

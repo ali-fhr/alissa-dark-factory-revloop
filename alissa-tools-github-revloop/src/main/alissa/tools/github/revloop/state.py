@@ -39,6 +39,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .parking import SPAWN_CLAIM_TTL
+
 log = logging.getLogger(__name__)
 
 # Poll-snapshot retention: the newest N rows are kept, older ones pruned on
@@ -2067,11 +2069,12 @@ class State:
 
     def set_drain(
         self, ttl: int, reason: str, now: "float | None" = None,
-        claim_ttl: int = 600,
+        claim_ttl: int = SPAWN_CLAIM_TTL,
     ) -> "tuple[dict, list[dict]]":
         """Raise the drain flag for `ttl` seconds and return it with the spawn
-        claims standing at that instant (younger than `claim_ttl` -- an older
-        one is a spawn whose process died mid-way, cleared at the next boot).
+        claims standing at that instant (younger than `claim_ttl`, by default
+        `parking.SPAWN_CLAIM_TTL` -- an older one is a spawn whose process
+        died mid-way, cleared at the next boot).
         ONE immediate transaction, so a spawn either claimed before this (and
         is in the list) or claims after it (and sees the flag). A drain that
         is already up is replaced: a re-drain restarts the TTL. Raises
