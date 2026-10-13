@@ -4,6 +4,29 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.17
+
+- **Discovery PRs get no review round** (issue #171, lane DS-7b; origin
+  TASK-1999507595, implementation TASK-864600647). A PR in a `plan_repos`
+  repository whose body carries `<!-- alissa-discovery v1 -->` on a line of
+  its own and whose every changed path is under `knowledge-base/` is a
+  `SKIPPED` decision: no reviewer session, so no review task. One
+  activity-comment line per head says why (ledger kind
+  `activity-discovery-skip:<head>`).
+  - The skip sits beside the `authors` filter in `evaluate`: below every
+    branch that finishes a started round, above every one that numbers or
+    starts one.
+  - A marked PR touching anything else, an empty diff, or a file list that
+    cannot be read in full (error, or GitHub's 3000-file cap) is reviewed
+    under the **code directive**, unchanged. Throttling still backs the poll
+    off.
+  - New `GitHub.pull_request_files` (paged, renames count both names,
+    `TruncatedListing` at the cap).
+  - New fleet flag `discovery_review` (`ALISSA_REVIEW_DISCOVERY_REVIEW`,
+    default off): on, every discovery PR is reviewed like any other.
+  - Code, plan and fix directives are byte-identical.
+  - **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.17.
+
 ## 0.31.16
 
 - **A container restart no longer crash-loops on the worker's pidfile, and a

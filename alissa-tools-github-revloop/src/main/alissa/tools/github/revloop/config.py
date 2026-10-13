@@ -183,6 +183,7 @@ CONFIG_KEYS = (
     "authors",
     "plan_repos",
     "plan_authors",
+    "discovery_review",
     "operators",
     "agent_profile",
     "reviewer_login",
@@ -268,6 +269,15 @@ JANITOR_WARN_PCT_ENV = "ALISSA_REVIEW_JANITOR_WARN_PCT"
 PLAN_REPOS_ENV = "ALISSA_REVIEW_PLAN_REPOS"
 PLAN_AUTHORS_ENV = "ALISSA_REVIEW_PLAN_AUTHORS"
 PLAN_REPO_OWNER_PLACEHOLDER = "<owner>"
+
+# The discovery fleet flag (issue #171; build-discovery design §3.3, DS-7).
+# OFF by default: a DISCOVERY PR -- a plans repository, the discovery marker,
+# every changed path under `knowledge-base/` (loop.discovery_skip_reason) --
+# gets no review round at all, because its defence is the knowledge-base lint
+# of record, staleness, the plan refuter and the user's acceptance. ON, every
+# discovery PR is reviewed under the code directive like any other PR. Same
+# env > file > default precedence and boolean spellings as the janitor's rail.
+DISCOVERY_REVIEW_ENV = "ALISSA_REVIEW_DISCOVERY_REVIEW"
 DEFAULT_PLAN_REPO_NAME = "alissa-dark-factory-plans"
 DEFAULT_PLAN_REPOS: "tuple[str, ...]" = (
     f"{PLAN_REPO_OWNER_PLACEHOLDER}/{DEFAULT_PLAN_REPO_NAME}",
@@ -896,6 +906,10 @@ class Config:
     plan_repos: tuple[str, ...] = DEFAULT_PLAN_REPOS
     plan_authors: tuple[str, ...] = ()
 
+    # Review discovery PRs after all (issue #171); see DISCOVERY_REVIEW_ENV.
+    # False -- the default -- skips them.
+    discovery_review: bool = False
+
     # GitHub logins whose re-entry ack may raise a capped PR's effective cap
     # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
     # honoured: the lever fails closed, because anyone who can comment on a PR
@@ -1267,6 +1281,16 @@ class Config:
         env_plan_authors = env_plan_list(PLAN_AUTHORS_ENV, environ)
         if env_plan_authors is not None:
             raw["plan_authors"] = env_plan_authors
+        # The discovery flag (issue #171), same layer, same reason.
+        env_discovery = _env_bool(DISCOVERY_REVIEW_ENV, environ)
+        if env_discovery is not None:
+            raw["discovery_review"] = env_discovery
+        discovery_review = raw.get("discovery_review", cls.discovery_review)
+        if not isinstance(discovery_review, bool):
+            # A JSON string "false" is truthy; refused rather than read as on.
+            raise ValueError(
+                f"discovery_review must be true or false, got {discovery_review!r}"
+            )
 
         source = raw.get("repos_source", cls.repos_source)
         if source not in _REPOS_SOURCES:
@@ -1552,6 +1576,7 @@ class Config:
             authors=authors,
             plan_repos=plan_repos,
             plan_authors=plan_authors,
+            discovery_review=discovery_review,
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),

@@ -1246,6 +1246,51 @@ def plan_id_of(pr: PullRequest) -> "str | None":
     return match.group(1) if match else None
 
 
+# -- the discovery skip (issue #171; build-discovery design §3.2, §3.3, DS-7) --
+#
+# A DISCOVERY PR is a discovery task's output: findings written into the
+# plans repository's `knowledge-base/`. Its defence is the knowledge-base lint
+# of record, staleness, the plan refuter and the user's acceptance (§3.3), so a
+# judgment review per discovery task would only double the subscription cost
+# -- revloop starts NO round on it, which is what leaves it without a review
+# task (the reviewer session is what creates one, CR2).
+#
+# All THREE signals, or it is not a discovery PR: the repository is in
+# `plan_repos`, the body carries the discovery marker on a line of its own,
+# and EVERY changed path is under `knowledge-base/` (the PR's files, paged).
+# A marked PR that touches anything else -- or whose files cannot be read in
+# full -- is reviewed under the CODE directive, unchanged: the safe reading.
+# The fleet flag `discovery_review` (config.DISCOVERY_REVIEW_ENV) turns the
+# skip off, and every discovery PR is then reviewed like any other.
+DISCOVERY_MARKER = "<!-- alissa-discovery v1 -->"
+DISCOVERY_PREFIX = "knowledge-base/"
+
+
+def discovery_marked(config: Config, pr: PullRequest) -> bool:
+    """The two signals readable without a GitHub call: the plans repository
+    and the marker on a line of its own (the plan marker's rule)."""
+    if not config.is_plan_repo(pr.full_name):
+        return False
+    body = pr.body.replace("\r\n", "\n")
+    return any(line.strip() == DISCOVERY_MARKER for line in body.split("\n"))
+
+
+def outside_discovery_prefix(paths: "list[str]") -> "list[str]":
+    """The changed paths NOT under `knowledge-base/`. An empty diff answers
+    with a placeholder rather than nothing: "every path is confined" must not
+    hold vacuously for a PR that changes no path at all."""
+    if not paths:
+        return ["(no changed files)"]
+    return [p for p in paths if not p.startswith(DISCOVERY_PREFIX)]
+
+
+def discovery_skip_kind(head_sha: str) -> str:
+    """The ping-ledger kind that dedupes the skip's activity line: one line
+    per head, since the review request stands and the skip is re-decided on
+    every poll."""
+    return f"activity-discovery-skip:{head_sha}"
+
+
 # The ORIGIN task a reviewer spawn is stamped with (`--task`, issue #153; the
 # Studio cost meter's lane L4). First from the review task's CR2 title --
 # `Review PR <org>/<repo>#<n> (TASK-<origin>)` -- then from the PR body, the
@@ -2640,6 +2685,12 @@ class ReviewWatcher:
         # hold a place forever.
         self._waiting: dict[tuple[str, int], Waiting] = {}
         self._wait_seq = 0
+        # The discovery skip's file reads (issue #171), keyed by (repo, PR,
+        # head): the changed paths outside `knowledge-base/` at that head. A
+        # skipped PR keeps its review request, so it is re-decided every poll,
+        # and a head's file list never changes -- one paged read per head, not
+        # one per poll. Only successful reads are kept; a failed one retries.
+        self._discovery_outside: "dict[tuple[str, int, str], list[str]]" = {}
         # Consecutive passes that deferred at least one round -- the summary
         # line's streak limiter, and ONLY that. It never escalates: a queue
         # that keeps draining is the gate working, and a wave permanently
@@ -3110,6 +3161,17 @@ class ReviewWatcher:
                 f"PR author {pr.author} is not in the authors allowlist",
             )
 
+        # THE DISCOVERY SKIP (issue #171) gates starting a round exactly as the
+        # authors filter does, and sits beside it for the same reasons: below
+        # every branch that FINISHES a round already started (a discovery PR
+        # reviewed while `discovery_review` was on still gets its verdict of
+        # record), above every one that numbers, records or starts one. Below
+        # the authors filter because it is the only one of the two that can
+        # cost a GitHub call.
+        skipped = self._discovery_skip(pr)
+        if skipped is not None:
+            return skipped
+
         # The effective cap is the configured one plus every re-entry an
         # operator has explicitly acked on THIS PR (issue #42). The sum is a
         # local read, so it costs nothing on the common path; the GitHub scan
@@ -3253,6 +3315,74 @@ class ReviewWatcher:
             checks=checks.clause,
             stability=stability.notice,
         )
+
+    # -- the discovery skip (issue #171) -----------------------------------
+
+    def _discovery_skip(self, pr: PullRequest) -> Decision | None:
+        """A SKIPPED decision for a discovery PR, or None to review it.
+
+        None -- review under the code directive, the safe reading -- whenever
+        any of the three signals fails, the files cannot be read in full, or
+        the fleet flag `discovery_review` is on. The two cheap signals are read
+        first, so a PR that is not marked never costs a files read.
+
+        A skip appends ONE activity line per head (ledger-deduped, recorded
+        only once the append lands, so a dry run records nothing) and logs at
+        INFO only then; the re-decisions on later polls are DEBUG.
+        """
+        if not discovery_marked(self.config, pr):
+            return None
+        if self.config.discovery_review:
+            log.debug(
+                "%s carries the discovery marker but discovery_review is on — "
+                "reviewing under the code directive",
+                pr.slug,
+            )
+            return None
+
+        key = (pr.full_name, pr.number, pr.head_sha)
+        outside = self._discovery_outside.get(key)
+        if outside is None:
+            try:
+                paths = self.github.pull_request_files(pr.owner, pr.repo, pr.number)
+            except RateLimited:
+                # Throttling is not a fact about the diff (the stability
+                # guard's rule): raised on, so the poll backs off.
+                raise
+            except (CommandError, TruncatedListing) as exc:
+                log.warning(
+                    "%s carries the discovery marker but its changed files "
+                    "cannot be read in full — reviewing under the code "
+                    "directive: %s",
+                    pr.slug, exc,
+                )
+                return None
+            outside = outside_discovery_prefix(paths)
+            self._discovery_outside[key] = outside
+
+        if outside:
+            log.info(
+                "%s carries the discovery marker but changes %d path(s) outside "
+                "%s (first: %s) — reviewing under the code directive",
+                pr.slug, len(outside), DISCOVERY_PREFIX, outside[0],
+            )
+            return None
+
+        reason = (
+            f"discovery PR — plans repository, `{DISCOVERY_MARKER}` marker, "
+            f"every changed path under `{DISCOVERY_PREFIX}`; no review round "
+            f"(discovery_review is off)"
+        )
+        kind = discovery_skip_kind(pr.head_sha)
+        if not self.state.pinged(pr.full_name, pr.number, kind):
+            log.info("%s at %s: skipping review — %s", pr.slug, pr.head_sha[:8], reason)
+            if self._append_activity(
+                pr, f"- {_now()} — skipped at `{pr.head_sha[:8]}` — {reason}"
+            ):
+                self.state.record_ping(pr.full_name, pr.number, kind)
+        else:
+            log.debug("%s: %s", pr.slug, reason)
+        return Decision(Action.SKIPPED, reason)
 
     # -- the spawn gate ----------------------------------------------------
 

@@ -128,7 +128,8 @@ and the three `repos_source: bows` keys — `repos_source`
 (`ALISSA_REVIEW_BOW_OWNERS`; see *Deriving the allowlist from feed Bodies of
 Work*), and the two plan-directive allowlists — `plan_repos`
 (`ALISSA_REVIEW_PLAN_REPOS`) and `plan_authors` (`ALISSA_REVIEW_PLAN_AUTHORS`;
-see *Plan PRs*), and the four workspace-janitor keys — `janitor_enabled`
+see *Plan PRs*), the discovery flag `discovery_review`
+(`ALISSA_REVIEW_DISCOVERY_REVIEW`; see *Discovery PRs*), and the four workspace-janitor keys — `janitor_enabled`
 (`ALISSA_REVIEW_JANITOR_ENABLED`), `janitor_grace_minutes`
 (`ALISSA_REVIEW_JANITOR_GRACE_MINUTES`), `janitor_interval_minutes`
 (`ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES`) and `janitor_warn_pct`
@@ -154,6 +155,7 @@ else refused by name.
 | `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
 | `plan_repos` | `["<owner>/alissa-dark-factory-plans"]` | the **plans repositories** — signal one of the four that make a PR a *plan PR* (see *Plan PRs*). `owner/repo`, or `<owner>/repo` for that repository name under **any** owner (the default names the repository by name only; a deployment names its own). Matched case-insensitively; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_REPOS` (`\|`/`,`-separated) wins over the file, blank falls through |
 | `plan_authors` | `[]` | the **plan generator's login(s)** — signal two of four. **Fail-closed, unlike `authors`: empty means NO PR is a plan PR**, so every PR is reviewed under the code directive until the generator's login is named. GitHub logins (`<app>[bot]` accepted), case-insensitive; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_AUTHORS` (`\|`/`,`-separated) wins over the file, blank falls through |
+| `discovery_review` | `false` | review **discovery PRs** after all (see *Discovery PRs*). Off: a PR in a `plan_repos` repository whose body carries `<!-- alissa-discovery v1 -->` on a line of its own and whose every changed path is under `knowledge-base/` gets no review round. On: every discovery PR is reviewed under the code directive like any other. A non-boolean is refused at load. No CLI flag; `ALISSA_REVIEW_DISCOVERY_REVIEW` (`1/0`, `true/false`, `yes/no`, `on/off`) wins over the file, blank falls through |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
@@ -632,6 +634,45 @@ and a session-posted approve on a plan PR is observed for the
 (see *Loop telemetry*). The plan directive is out of the code directives'
 way entirely: a code PR's directive, trailer and events are unchanged byte
 for byte.
+
+### Discovery PRs: no review round (issue #171)
+
+A **discovery PR** is a discovery task's output — findings written into the
+plans repository's `knowledge-base/` (build-discovery design §3.2). Its
+defence is the knowledge-base lint of record, staleness, the plan refuter and
+the user's acceptance (§3.3), so a judgment review per discovery task would
+only double the subscription cost. revloop therefore **starts no round** on
+it — no reviewer session, and so no review task — when all three signals hold:
+
+1. the repository is in `plan_repos` (`ALISSA_REVIEW_PLAN_REPOS`);
+2. the PR body carries `<!-- alissa-discovery v1 -->` on a line of its own;
+3. **every** changed path is under `knowledge-base/` — read from the PR's
+   files listing, paged to the end. A rename counts both names; an empty
+   diff is not "confined"; a listing at GitHub's 3000-file cap, or one that
+   cannot be read, is not proof either.
+
+Anything short of that is **reviewed under the code directive, unchanged** —
+the safe reading: a marked PR that touches anything outside
+`knowledge-base/`, or whose files cannot be read in full, is a code PR. The
+code, plan and fix directives are byte-identical to before.
+
+A skip is a `SKIPPED` decision, and it sits where the `authors` filter does:
+below every branch that finishes a round already started (a discovery PR
+reviewed while `discovery_review` was on still reaches its verdict of record)
+and above every branch that numbers, records or starts one — a skipped PR
+burns no round number and holds no slot. The review request stays on the PR,
+so the skip is re-decided every poll; the files are read once per head, and
+the activity comment gets **one line per head**:
+
+```
+- 2026-10-13 14:00:00 UTC — skipped at `abc12345` — discovery PR — plans repository, `<!-- alissa-discovery v1 -->` marker, every changed path under `knowledge-base/`; no review round (discovery_review is off)
+```
+
+(ledger kind `activity-discovery-skip:<head>`, recorded only once the line
+lands; a dry run logs it and records nothing). Set `discovery_review: true`
+(or `ALISSA_REVIEW_DISCOVERY_REVIEW=1`) to review every discovery PR under the
+code directive like any other PR. Merging discovery PRs is orcloop's lane
+(DS-6), and the devloop discovery directive is DS-7a's.
 
 ### Never approve a red head: the CI checks gate
 

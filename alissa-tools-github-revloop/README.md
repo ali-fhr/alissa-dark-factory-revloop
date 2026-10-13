@@ -24,6 +24,18 @@ The rule: a distribution owns a leaf package and declares only that subtree
 `__init__.py` at any namespace level would claim it for one distribution and
 shadow the others.
 
+## Discovery PRs are not reviewed
+
+A PR in a plans repository (`plan_repos`, `ALISSA_REVIEW_PLAN_REPOS`) whose
+body carries `<!-- alissa-discovery v1 -->` on a line of its own and whose
+every changed path is under `knowledge-base/` gets **no review round** — no
+reviewer session, no review task — and one activity-comment line per head
+saying why. A marked PR that touches anything else (or whose file list cannot
+be read in full) is reviewed under the code directive, unchanged. The fleet
+flag `discovery_review` (`ALISSA_REVIEW_DISCOVERY_REVIEW`, default off) turns
+the skip off: every discovery PR is then reviewed like any other. See
+*Discovery PRs* in the repository README.
+
 ## Install
 
 ```sh
