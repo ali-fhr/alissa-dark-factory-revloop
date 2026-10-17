@@ -35,6 +35,12 @@ Three properties everything here is written around:
 * **Nothing raises past its own concern.** A folder that vanishes mid-sweep,
   an unreadable hub, a failed removal: logged and skipped, because this runs
   at the end of a poll pass that must complete.
+
+Two more bound it (issue #175). The layout is fixed: hubs are found at
+`<root>/<repo>` with the session cwd at `<hub>/main`, so under any other
+`hub_template` (`layout_supported` says no) the caller sweeps nothing rather
+than mis-key the hold. And one sweep removes at most `MAX_REMOVALS` folders in
+`MAX_SWEEP_SECONDS`; the rest wait for the next interval (`deferred`).
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -69,6 +76,23 @@ SOURCE_DIR = ".source"
 
 KIND_SCRATCH = "scratch"
 KIND_REVIEW = "review-checkout"
+
+# One sweep's bound (issue #175): at most this many removals, and no removal
+# started past this many seconds into the sweep. It runs synchronously at the
+# end of a poll pass, so a large backlog is drained over several intervals
+# instead of stalling one pass for minutes.
+MAX_REMOVALS = 25
+MAX_SWEEP_SECONDS = 120.0
+
+# The one hub layout the janitor knows: `discover_hubs` reads the root's
+# direct children and `scan_hub` reads `<hub>/main`. Named in the caller's
+# refusal WARNING.
+SUPPORTED_TEMPLATE = "{root}/{repo}/main"
+
+# What `layout_supported` probes a template with: two owners that differ, so a
+# template that puts the owner in the path resolves to two different places.
+_PROBE_OWNERS = ("janitor-probe-owner-a", "janitor-probe-owner-b")
+_PROBE_REPO = "janitor-probe-repo"
 
 Runner = Callable[..., str]
 
@@ -158,10 +182,32 @@ class SweepResult:
     fresh: int = 0
     failed: "list[tuple[Path, str]]" = field(default_factory=list)
     pruned: int = 0
+    # Unheld stale candidates the per-sweep bound left for the next interval.
+    deferred: int = 0
 
     @property
     def freed(self) -> int:
         return sum(size for _, size in self.removed)
+
+
+def layout_supported(
+    hub_for: "Callable[[str, str], Path]", workspace_root: "Path | str"
+) -> bool:
+    """Whether `hub_for` (`Config.hub_for`) places every hub at
+    `<root>/<repo>` with the session cwd at `<hub>/main` -- the one layout
+    `discover_hubs` and `scan_hub` read, and the one in which a hub's
+    directory name is the repo slug the `Guard` keys on.
+
+    Probed with two distinct owners and one repo name: both must resolve to
+    `workspace_root / repo / "main"`. A template that cannot be formatted is
+    unsupported. Pure: nothing is read off the disk."""
+    expected = Path(os.fspath(workspace_root)).expanduser() / _PROBE_REPO / "main"
+    try:
+        return all(
+            Path(hub_for(owner, _PROBE_REPO)) == expected for owner in _PROBE_OWNERS
+        )
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def discover_hubs(workspace_root: "Path | str") -> "list[Path]":
@@ -323,13 +369,25 @@ def sweep(
     now: float,
     dry_run: bool = False,
     runner: Runner = run,
+    max_removals: int = MAX_REMOVALS,
+    max_seconds: float = MAX_SWEEP_SECONDS,
+    clock: "Callable[[], float]" = time.monotonic,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
     `guard` does not hold, then prune each hub's worktree records.
 
+    Bounded (issue #175): before each removal, a sweep that has already
+    removed `max_removals` folders, or has run `max_seconds` by `clock`,
+    stops removing. Every unheld stale candidate past that point is counted
+    in `deferred` and left for the next interval; every hub is still scanned
+    and pruned.
+
     Dry-run removes nothing and prunes nothing: it logs each folder it WOULD
-    remove (with its size) and reports them in `would_remove`."""
+    remove (with its size) and reports them in `would_remove`, under the
+    same bound -- so it reports what one live sweep would do."""
     result = SweepResult()
+    started = clock()
+    bounded = False
     for hub in hubs:
         result.hubs += 1
         for candidate in scan_hub(hub):
@@ -343,6 +401,12 @@ def sweep(
             if why is not None:
                 log.debug("janitor: keeping %s — %s", candidate.path, why)
                 result.held.append((candidate.path, why))
+                continue
+            if not bounded:
+                taken = len(result.would_remove if dry_run else result.removed)
+                bounded = taken >= max_removals or clock() - started >= max_seconds
+            if bounded:
+                result.deferred += 1
                 continue
             if not _contained(candidate):
                 result.failed.append((candidate.path, "not contained in its hub"))

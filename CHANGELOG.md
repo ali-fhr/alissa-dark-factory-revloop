@@ -4,6 +4,24 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.19
+
+- **The janitor sweeps only under the default `hub_template`** (issue #175, the
+  approving-round minors of PR #168; origin TASK-1584347043, implementation
+  TASK-2029470268). `janitor.layout_supported` probes `Config.hub_for` with two
+  owners and accepts only when both resolve to `<root>/<repo>/main`, the one
+  layout `discover_hubs` and `scan_hub` read and the one whose hub name is the
+  slug the `Guard` holds. Under any other template `_sweep_workspace` removes
+  and prunes nothing and logs one WARNING per process naming the template; the
+  disk-usage WARNING still fires.
+- **One sweep is bounded**: at most `janitor.MAX_REMOVALS` (25) removals and
+  `janitor.MAX_SWEEP_SECONDS` (120 s, by an injectable monotonic clock),
+  checked before each removal. The remaining unheld stale folders are counted
+  in the new `SweepResult.deferred` and left for the next interval; every
+  scanned hub is still pruned. A dry run applies the same bound to
+  `would_remove`. Both summary INFO lines state the deferred count.
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.19.
+
 ## 0.31.18
 
 - **The round spawn re-claims after the hub add** (issue #173, the seat-parking

@@ -2619,6 +2619,9 @@ class ReviewWatcher:
         # When the workspace janitor last swept (monotonic), or None before the
         # first sweep -- which therefore runs at the end of the first pass.
         self._janitor_last: "float | None" = None
+        # Whether the janitor has said, once for this process, that it will
+        # not sweep under this `hub_template` (issue #175).
+        self._janitor_layout_warned = False
         # The (repo, number, round) whose alive session the stale-round probe
         # just killed as `wedged:first-run-dialog` (issue #136), so the
         # respawn site logs its re-enqueue at INFO instead of a second
@@ -7946,8 +7949,9 @@ class ReviewWatcher:
         One INFO line per sweep (folders removed and bytes freed, or what a
         dry run WOULD remove), and one WARNING when the workspace volume is
         at or above `janitor_warn_pct`. The disk read runs even when the
-        roster cannot be listed and the removal half is skipped: a full
-        volume is worth saying whatever else went wrong."""
+        roster cannot be listed, or the hub layout is not the one the janitor
+        reads, and the removal half is skipped: a full volume is worth saying
+        whatever else went wrong."""
         if not self.config.janitor_enabled:
             return None
         mono = time.monotonic()
@@ -7969,6 +7973,22 @@ class ReviewWatcher:
         return result
 
     def _sweep_workspace(self, now: float) -> "janitor_mod.SweepResult | None":
+        if not janitor_mod.layout_supported(
+            self.config.hub_for, self.config.workspace_root
+        ):
+            # Fail closed (issue #175): under another layout the hubs on disk
+            # are not keyed by the slug the Guard holds (or are not found at
+            # all), so a sweep could remove a live round's folders. Nothing is
+            # removed or pruned; said once per process, not once per interval.
+            if not self._janitor_layout_warned:
+                self._janitor_layout_warned = True
+                log.warning(
+                    "janitor: hub_template %r is not supported — the janitor "
+                    "supports only %s, so it removes and prunes nothing in "
+                    "this process",
+                    self.config.hub_template, janitor_mod.SUPPORTED_TEMPLATE,
+                )
+            return None
         guard = self._janitor_guard(now)
         if guard is None:
             log.warning(
@@ -7986,17 +8006,20 @@ class ReviewWatcher:
         if self.config.dry_run:
             log.info(
                 "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
-                "hub(s); %d held by a live round, %d inside the grace",
+                "hub(s); %d held by a live round, %d inside the grace, %d "
+                "deferred to the next interval",
                 len(result.would_remove),
                 janitor_mod.human(sum(size for _, size in result.would_remove)),
-                result.hubs, len(result.held), result.fresh,
+                result.hubs, len(result.held), result.fresh, result.deferred,
             )
         else:
             log.info(
                 "janitor: removed %d folder(s), freed %s across %d hub(s); "
-                "%d held by a live round, %d inside the grace, %d failed",
+                "%d held by a live round, %d inside the grace, %d failed, %d "
+                "deferred to the next interval",
                 len(result.removed), janitor_mod.human(result.freed),
                 result.hubs, len(result.held), result.fresh, len(result.failed),
+                result.deferred,
             )
         return result
 

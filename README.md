@@ -1267,6 +1267,13 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
 - **Hubs** are the workspace root's direct children that hold a `.source`
   directory — read off the disk, so a hub whose repo left the allowlist is
   still swept.
+- **Only the default layout is swept.** The janitor reads hubs at
+  `<root>/<repo>` and the session cwd at `<hub>/main`, so under any
+  `hub_template` other than `{root}/{repo}/main` (e.g.
+  `{root}/{owner}-{repo}/main`, `{root}/{owner}/{repo}/main`) it removes and
+  prunes nothing — a hub named another way would not be held by its live
+  rounds — and logs **one WARNING per process** naming the template. The
+  disk-usage WARNING below still fires.
 - **Candidates** are only `<hub>/main/.review-scratch-*` and `<hub>/REVIEW-*`
   directories, direct children, never symlinks. Nothing else under a hub
   (`main/`'s own files, `.source`, task worktrees, an operator's clone) is ever
@@ -1281,16 +1288,22 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   of its scratch folders and its review task's `REVIEW-<task>` checkout; a held
   round whose review task is unknown keeps every `REVIEW-*` in its hub. If the
   roster cannot be listed the removal half is skipped that interval.
+- **One sweep is bounded** to 25 removals and 120 seconds, checked before
+  each removal. Unheld stale folders past the bound are **deferred** to the
+  next interval, so a large backlog drains over several sweeps instead of
+  stalling one pass; every hub scanned is still pruned.
 - **Then** `git worktree prune` runs in each hub's `.source` as the daemon's
   own user, dropping the records of the `wt/` worktrees and checkouts just
   removed.
 - **One INFO line per sweep**: `janitor: removed N folder(s), freed X across H
-  hub(s); … held by a live round, … inside the grace, … failed`. When the
+  hub(s); … held by a live round, … inside the grace, … failed, … deferred
+  to the next interval`. When the
   workspace volume is at or above `janitor_warn_pct` (default 80; `0` = never)
   the sweep also logs **one WARNING** with the percentage.
 - **`--dry-run` removes and prunes nothing**: it logs each folder it would
   remove (`[dry-run] janitor would remove <path> (<size>, <age>)`) and a
-  `[dry-run] janitor: would remove N folder(s)` summary.
+  `[dry-run] janitor: would remove N folder(s)` summary, under the same
+  per-sweep bound (and with the same deferred count).
 
 The volume's used percentage also rides on every fleet-vitals snapshot as
 `diskUsedPct` (see *Fleet vitals*).

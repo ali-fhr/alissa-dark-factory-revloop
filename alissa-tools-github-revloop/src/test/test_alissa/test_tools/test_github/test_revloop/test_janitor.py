@@ -542,3 +542,202 @@ def test_a_studio_refusing_disk_used_pct_gets_the_snapshot_without_it(tmp_path):
 
     assert client.calls == ["refused", "vitals"]
     assert "diskUsedPct" not in client.snapshots[0]
+
+
+# -- the hub layout: only {root}/{repo}/main is swept (issue #175) ------------
+
+
+def _with_template(w, template):
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      hub_template=template, state_path=w.config.state_db,
+                      janitor_interval_minutes=10)
+
+
+@pytest.mark.parametrize("template", [
+    "{root}/{owner}-{repo}/main",
+    "{root}/{owner}/{repo}/main",
+])
+def test_a_non_default_hub_template_sweeps_nothing_and_warns_once(
+    ws, caplog, monkeypatch, template
+):
+    w, _, hub = ws
+    _with_template(w, template)
+    pair = stale_pair(hub, 7, "TASK-70")
+    pruned = []
+    monkeypatch.setattr(janitor_mod, "prune_worktrees",
+                        lambda hub, runner=None: pruned.append(hub))
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        assert w._run_janitor() is None
+        w._janitor_last -= 10 * 60
+        assert w._run_janitor() is None
+
+    assert all(p.is_dir() for p in pair)
+    assert pruned == [], "no git worktree prune"
+    warned = [r for r in caplog.records
+              if r.levelno == logging.WARNING and "is not supported" in r.getMessage()]
+    assert len(warned) == 1
+    assert repr(template) in warned[0].getMessage()
+    assert "supports only {root}/{repo}/main" in warned[0].getMessage()
+    assert not [r for r in caplog.records if r.getMessage().startswith("janitor: removed")]
+
+
+def test_the_default_hub_template_is_accepted_and_sweeps_as_before(ws, caplog):
+    w, _, hub = ws
+    _with_template(w, "{root}/{repo}/main")
+    pair = stale_pair(hub, 7, "TASK-70")
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert result is not None and len(result.removed) == 2
+    assert not any(p.exists() for p in pair)
+    assert not [r for r in caplog.records if "is not supported" in r.getMessage()]
+
+
+def test_layout_supported_probes_hub_for(tmp_path):
+    def check(template, root=tmp_path):
+        config = Config(workspace_root=root, hub_template=template)
+        return janitor_mod.layout_supported(config.hub_for, root)
+
+    assert check("{root}/{repo}/main")
+    assert check("{root}//{repo}/main/")
+    assert not check("{root}/{owner}-{repo}/main")
+    assert not check("{root}/{owner}/{repo}/main")
+    assert not check("{root}/{repo}")
+    assert not check("{root}/hubs/{repo}/main")
+    assert not check("{root}/{repo}/{unknown}/main"), "an unformattable template"
+    assert not check(str(tmp_path / "elsewhere" / "{repo}" / "main"))
+
+
+def test_under_a_refused_template_the_disk_warning_still_fires(ws, caplog, monkeypatch):
+    w, _, _ = ws
+    _with_template(w, "{root}/{owner}-{repo}/main")
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 91.0)
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        assert w._run_janitor() is None
+
+    disk = [r for r in caplog.records if "workspace volume" in r.getMessage()]
+    assert len(disk) == 1 and "91.0% used (warn at 80%)" in disk[0].getMessage()
+
+
+# -- the per-sweep bound (issue #175) ------------------------------------------
+
+
+def thirty_stale(hub):
+    return [folder(hub / f"REVIEW-TASK-{n:02d}", age=GRACE + 60) for n in range(30)]
+
+
+def test_the_default_bound_removes_25_and_defers_5_to_the_next_sweep(tmp_path):
+    hub = make_hub(tmp_path)
+    folders = thirty_stale(hub)
+    runner = Runner()
+
+    first = run_sweep([hub], runner=runner)
+
+    assert len(first.removed) == janitor_mod.MAX_REMOVALS == 25
+    assert first.deferred == 5
+    assert sum(p.exists() for p in folders) == 5
+    assert len(runner.calls) == 1, "the scanned hub is still pruned"
+
+    second = run_sweep([hub])
+
+    assert len(second.removed) == 5 and second.deferred == 0
+    assert not any(p.exists() for p in folders)
+
+
+def test_the_time_budget_stops_the_sweep_after_one_removal(tmp_path):
+    hub = make_hub(tmp_path)
+    folders = thirty_stale(hub)
+    runner = Runner()
+
+    def clock():
+        # The budget is spent the moment the first folder is gone.
+        return 0.0 if all(p.exists() for p in folders) else janitor_mod.MAX_SWEEP_SECONDS
+
+    result = sweep([hub], Guard(), grace_seconds=GRACE, now=NOW,
+                   runner=runner, clock=clock)
+
+    assert len(result.removed) == 1 and result.deferred == 29
+    assert sum(p.exists() for p in folders) == 29
+    assert len(runner.calls) == 1
+
+
+def test_the_bound_spans_hubs_and_every_scanned_hub_is_pruned(tmp_path):
+    hubs = [make_hub(tmp_path, "alpha"), make_hub(tmp_path, "beta")]
+    for hub in hubs:
+        for n in range(3):
+            folder(hub / f"REVIEW-TASK-{n}", age=GRACE + 60)
+    runner = Runner()
+
+    result = sweep(hubs, Guard(), grace_seconds=GRACE, now=NOW,
+                   runner=runner, max_removals=4)
+
+    assert len(result.removed) == 4 and result.deferred == 2
+    assert len(runner.calls) == 2
+
+
+def test_held_and_fresh_folders_are_not_counted_as_deferred(tmp_path):
+    hub = make_hub(tmp_path)
+    folder(hub / "REVIEW-TASK-1", age=GRACE + 60)
+    folder(hub / "REVIEW-TASK-2", age=GRACE + 60)
+    folder(hub / "REVIEW-TASK-3", age=60)
+    guard = Guard()
+    guard.hold("acme/widgets", 9, "TASK-2")
+
+    result = sweep([hub], guard, grace_seconds=GRACE, now=NOW,
+                   runner=Runner(), max_removals=0)
+
+    assert result.removed == [] and result.deferred == 1
+    assert len(result.held) == 1 and result.fresh == 1
+
+
+def test_a_dry_run_applies_the_same_bound(tmp_path, caplog):
+    hub = make_hub(tmp_path)
+    folders = thirty_stale(hub)
+    runner = Runner()
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = run_sweep([hub], dry_run=True, runner=runner)
+
+    assert len(result.would_remove) == 25 and result.deferred == 5
+    assert result.removed == [] and all(p.is_dir() for p in folders)
+    assert runner.calls == []
+    assert len([r for r in caplog.records
+                if r.getMessage().startswith("[dry-run] janitor would remove")]) == 25
+
+
+def test_the_summary_lines_state_the_deferred_count(ws, caplog):
+    w, _, hub = ws
+    for n in range(30):
+        path = hub / f"REVIEW-TASK-{n:02d}"
+        path.mkdir()
+        old = time.time() - GRACE * 2
+        os.utime(path, (old, old))
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        live = w._run_janitor()
+
+    assert live is not None and live.deferred == 5
+    assert any(r.getMessage().startswith("janitor: removed 25 folder(s)")
+               and "5 deferred to the next interval" in r.getMessage()
+               for r in caplog.records)
+
+    caplog.clear()
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      state_path=w.config.state_db, dry_run=True)
+    w._janitor_last = None
+    for n in range(30, 60):
+        path = hub / f"REVIEW-TASK-{n:02d}"
+        path.mkdir()
+        old = time.time() - GRACE * 2
+        os.utime(path, (old, old))
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        dry = w._run_janitor()
+
+    assert dry is not None and len(dry.would_remove) == 25 and dry.deferred == 10
+    assert any(r.getMessage().startswith("[dry-run] janitor: would remove 25 folder(s)")
+               and "10 deferred to the next interval" in r.getMessage()
+               for r in caplog.records)
