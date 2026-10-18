@@ -286,10 +286,11 @@ EXPECTED_PLAN_RUBRIC = (
 # The whole templates, pinned by digest: every clause of both plan
 # directives is load-bearing, and a pin that only checked phrases would let
 # a clause be dropped silently. Re-pin deliberately, with the reason in the
-# commit, when a directive changes.
+# commit, when a directive changes. (Issue #177: the reviewer rule now says
+# where a checkout goes -- beside `main/`, never inside it.)
 PLAN_TEMPLATE_SHA256 = {
-    "round-1": "648cd997d8e408178f7fe096610bed987ecdda49faafbcbdda1c68aa4fd97d4a",
-    "round-k": "8d92834e0e9ecaca919e35ba1b8a1876c85e4a9276875747f6357f5e9fdded2c",
+    "round-1": "d785634a01449599bacd5577b47963243c0f20e4acc640886e813adf11b52cf8",
+    "round-k": "e5ad788d5aca1f3916e9a9489903d3eda05319386591c9ae8911e4b0d2c0c0ec",
 }
 
 

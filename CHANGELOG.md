@@ -4,6 +4,35 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.20
+
+- **The janitor also reaps `REVIEW-*` checkouts made INSIDE `<hub>/main`**
+  (issue #177; origin TASK-1577229494, implementation TASK-442322546). On
+  2026-10-18 121 of them filled the fleet's 46 GB volume to 100% while every
+  sweep looked only at `<hub>/REVIEW-*`. `scan_hub` now lists `REVIEW-*`
+  direct children of both the hub and `main/` (never deeper, never a
+  symlink); the containment check accepts either parent. A review checkout
+  that is a linked worktree is removed with `git worktree remove --force` in
+  the hub's `.source`, falling back to `rmtree` when git refuses. Candidates
+  are now taken oldest first across every hub, and every hub is pruned after
+  the removals.
+- **The grace shrinks under disk pressure**: at or above `janitor_warn_pct`
+  it drops to the new `janitor_pressure_grace_minutes` (default 120;
+  `ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES`), oldest first, re-reading
+  the volume before each removal only that grace allows and stopping once it
+  is back under the line. Held folders are never removed. `SweepResult`
+  gains `pressure`, `pressure_removed` and `left`.
+- **A pressure episode is a loop event**: the first sweep at or above the line
+  records one `volume-pressure:` ping (anchor `('', 0)`), derived into one
+  `janitor.volume_pressure` event (`usedPct`, `warnPct`, `freedBytes`,
+  `foldersLeft`), deduped on the episode's start; a reading back under the
+  line closes the episode. Dry-run records nothing.
+- **The reviewer rule says where the checkout goes**: `_REVIEWER_RULE` now
+  tells a reviewer to make it beside `main/` (`git worktree add
+  ../REVIEW-<review task ref> <the PR head>`). Both plan directives embed the
+  rule, so their digests in `test_directives.py` are re-pinned.
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.20.
+
 ## 0.31.19
 
 - **The janitor sweeps only under the default `hub_template`** (issue #175, the

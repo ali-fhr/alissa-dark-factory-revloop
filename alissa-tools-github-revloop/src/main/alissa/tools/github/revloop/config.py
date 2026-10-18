@@ -211,6 +211,7 @@ CONFIG_KEYS = (
     "janitor_grace_minutes",
     "janitor_interval_minutes",
     "janitor_warn_pct",
+    "janitor_pressure_grace_minutes",
     "alissa_endpoint",
     "dry_run",
 )
@@ -245,6 +246,8 @@ JANITOR_ENABLED_ENV = "ALISSA_REVIEW_JANITOR_ENABLED"
 JANITOR_GRACE_MINUTES_ENV = "ALISSA_REVIEW_JANITOR_GRACE_MINUTES"
 JANITOR_INTERVAL_MINUTES_ENV = "ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES"
 JANITOR_WARN_PCT_ENV = "ALISSA_REVIEW_JANITOR_WARN_PCT"
+# The fifth (issue #177): the grace under disk pressure.
+JANITOR_PRESSURE_GRACE_MINUTES_ENV = "ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES"
 
 # The plan directive's two allowlists (issue #148; genloop design §6.1, D12).
 # A PR gets the PLAN directive only when all four signals hold, and two of
@@ -453,6 +456,10 @@ def env_janitor(environ: "Mapping[str, str] | None" = None) -> "dict[str, Any]":
         ("janitor_grace_minutes", JANITOR_GRACE_MINUTES_ENV, "number of minutes"),
         ("janitor_interval_minutes", JANITOR_INTERVAL_MINUTES_ENV, "number of minutes"),
         ("janitor_warn_pct", JANITOR_WARN_PCT_ENV, "percentage"),
+        (
+            "janitor_pressure_grace_minutes", JANITOR_PRESSURE_GRACE_MINUTES_ENV,
+            "number of minutes",
+        ),
     ):
         value = _env_int(name, what, environ)
         if value is not None:
@@ -730,6 +737,14 @@ DEFAULT_JANITOR_INTERVAL_MINUTES = 10
 # The workspace volume's used percentage at or above which a sweep logs one
 # WARNING. Devloop's threshold; 0 = never warn.
 DEFAULT_JANITOR_WARN_PCT = 80
+
+# The grace UNDER PRESSURE (issue #177): while the volume is at or above
+# `janitor_warn_pct`, a folder older than this many minutes is removable too,
+# oldest first, until the volume is back under the line. Two hours: past the
+# stale-round window (90 minutes), so a round that could still want its
+# folder has ended -- and the live-session / open-round guard holds the rest.
+# On 2026-10-18 a day's grace kept 119 dead checkouts on a full volume.
+DEFAULT_JANITOR_PRESSURE_GRACE_MINUTES = 120
 
 
 # -- the product-stability guard (issue #105) ---------------------------------
@@ -1057,11 +1072,14 @@ class Config:
     # `janitor_grace_minutes` that no live session or open ledger round holds,
     # prune `.source`'s worktree records, and WARN once when the workspace
     # volume is at or above `janitor_warn_pct` (0 = never). ON by default: the
-    # disk it reclaims fills a shared volume within weeks without it.
+    # disk it reclaims fills a shared volume within weeks without it. At or
+    # above that line the grace drops to `janitor_pressure_grace_minutes`
+    # (issue #177), oldest first, until the volume is back under it.
     janitor_enabled: bool = True
     janitor_grace_minutes: int = DEFAULT_JANITOR_GRACE_MINUTES
     janitor_interval_minutes: int = DEFAULT_JANITOR_INTERVAL_MINUTES
     janitor_warn_pct: int = DEFAULT_JANITOR_WARN_PCT
+    janitor_pressure_grace_minutes: int = DEFAULT_JANITOR_PRESSURE_GRACE_MINUTES
 
     dry_run: bool = False
 
@@ -1560,6 +1578,15 @@ class Config:
                 f"janitor_warn_pct must be between 0 and 100 (0 = never warn), "
                 f"got {janitor_warn}"
             )
+        janitor_pressure_grace = int(raw.get(
+            "janitor_pressure_grace_minutes", cls.janitor_pressure_grace_minutes
+        ))
+        if janitor_pressure_grace < 1:
+            # Same floor as the normal grace, for the same reason.
+            raise ValueError(
+                f"janitor_pressure_grace_minutes must be >= 1, "
+                f"got {janitor_pressure_grace}"
+            )
 
         state_path = raw.get("state_path")
         return cls(
@@ -1604,6 +1631,7 @@ class Config:
             janitor_grace_minutes=janitor_grace,
             janitor_interval_minutes=janitor_interval,
             janitor_warn_pct=janitor_warn,
+            janitor_pressure_grace_minutes=janitor_pressure_grace,
             alissa_endpoint=endpoint,
             dry_run=bool(raw.get("dry_run", False)),
         )

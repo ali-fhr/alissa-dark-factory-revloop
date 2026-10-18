@@ -90,6 +90,7 @@ TRUST_KEY = "hasTrustDialogAccepted"
 # The throwaway worktree the alissa-code-review skill tells a reviewer to
 # create beside `main/` when it must run code: `REVIEW-TASK-<id>`. Listed by
 # prefix so a checkout already on disk is trusted whatever task it was for.
+# The janitor also reaps one made inside `main/` (issue #177).
 REVIEW_CHECKOUT_PREFIX = "REVIEW-"
 
 # What a pane PARKED on one of Claude Code's first-run gates shows -- and
@@ -195,7 +196,15 @@ def hub_root(cwd: "Path | str") -> Path:
 def review_checkout_name(task_ref: "str | None") -> "str | None":
     """The throwaway worktree the review skill creates for a round that must
     run code: `REVIEW-<task ref>` (`REVIEW-TASK-<id>`), or None without a
-    review task to name it after."""
+    review task to name it after.
+
+    Its place is BESIDE `main/` -- `<hub>/REVIEW-<task ref>`, which the
+    reviewer rule in loop.py tells the session to make with `git worktree
+    add ../REVIEW-<task ref>` from its `<hub>/main` start directory, and
+    where this module seeds trust. One made INSIDE `main/` by a bare
+    `git worktree add REVIEW-<task ref>` (issue #177: 121 of them on
+    2026-10-18) is not trusted or policed as the round's checkout, but the
+    janitor reaps it exactly like one beside `main/`."""
     ref = (task_ref or "").strip()
     return f"{REVIEW_CHECKOUT_PREFIX}{ref}" if ref else None
 
