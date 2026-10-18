@@ -102,6 +102,17 @@ loop's `pr_origin_task_ref`). Both are read once, at spawn, onto the round's
 PR's newest spawn row (a pre-spawn `checks.held`, a `round.capped` no spawn
 explains). Each field is omitted when unknown -- never null -- so a PR whose
 body names neither emits the same payload as before, byte for byte.
+
+``janitor.volume_pressure`` (issue #177) is the workspace volume at or above
+`janitor_warn_pct` -- until then a WARNING line nobody saw while 119 dead
+review checkouts filled a 46 GB volume. Again a ledger ROW: the watcher
+records ONE `volume-pressure:` ping per pressure EPISODE (the first sweep at
+or above the line opens it; the first reading back under the line closes it),
+under the anchor-less `('', 0)` an `auth-rejected:` row without a PR uses,
+with what that sweep saw folded into the kind: `data: { usedPct, warnPct,
+freedBytes, foldersLeft }` (`foldersLeft` null when the sweep did not run).
+Keyed on the episode's start second, so a backfill re-derives the same one
+event. No repo and no PR: the volume is the seat's, not a PR's.
 """
 
 from __future__ import annotations
@@ -204,6 +215,33 @@ _AUTH_REJECTED_RE = re.compile(
     r"^auth-rejected:(?P<session>[^#:@]+)#(?P<round>\d*):(?P<source>pane|exit):"
     r"(?P<matched>[a-z0-9_]+):(?P<env>[A-Z_]*):(?P<suffix>.{0,4})$"
 )
+
+# The `janitor.volume_pressure` row (issue #177): one per pressure EPISODE,
+# `volume-pressure:<started>:<usedPct>:<warnPct>:<freedBytes>:<foldersLeft>`.
+# `started` (epoch seconds) is the episode's identity and its dedupe key;
+# `foldersLeft` is empty when the sweep did not run (roster unlistable,
+# unsupported layout).
+VOLUME_PRESSURE_PREFIX = "volume-pressure:"
+VOLUME_PRESSURE_EVENT = "janitor.volume_pressure"
+_VOLUME_PRESSURE_RE = re.compile(
+    r"^volume-pressure:(?P<started>\d+):(?P<pct>\d+(?:\.\d+)?):(?P<warn>\d+):"
+    r"(?P<freed>\d+):(?P<left>\d*)$"
+)
+
+
+def volume_pressure_kind(
+    started: "int | float",
+    used_pct: float,
+    warn_pct: int,
+    freed: int,
+    left: "int | None",
+) -> str:
+    """The ledger kind of ONE pressure episode (see VOLUME_PRESSURE_PREFIX)."""
+    return (
+        f"{VOLUME_PRESSURE_PREFIX}{int(started)}:{round(float(used_pct), 1)}:"
+        f"{int(warn_pct)}:{max(0, int(freed))}:{'' if left is None else int(left)}"
+    )
+
 
 # The credential variables a container may carry, in Claude Code's own
 # precedence order (design §1.4: `ANTHROPIC_API_KEY` outranks
@@ -578,7 +616,8 @@ def _ping_events(
     rows: "list[dict]", notices: "dict[tuple[str, int], dict]"
 ) -> "list[tuple[int, dict]]":
     """`stalled`, `stability.hold`, `checks.held`, the prompt responder's
-    two families and `auth.rejected` out of the ping ledger.
+    two families, `auth.rejected` and `janitor.volume_pressure` out of the
+    ping ledger.
 
     `kind` is free-form text carrying the episode identity, so it is parsed
     by prefix; kinds this module does not report (`activity-deferred:`,
@@ -690,6 +729,25 @@ def _ping_events(
                     "tokenSuffix": (
                         match.group("suffix") or None
                         if match.group("env") else None
+                    ),
+                },
+            ))
+        elif kind.startswith(VOLUME_PRESSURE_PREFIX):
+            match = _VOLUME_PRESSURE_RE.match(kind)
+            if match is None:
+                continue
+            pct, warn = float(match.group("pct")), int(match.group("warn"))
+            out.append(_event(
+                VOLUME_PRESSURE_EVENT,
+                at,
+                f"{SEAT}:{VOLUME_PRESSURE_EVENT}:{match.group('started')}",
+                reason=f"workspace volume {pct:.1f}% used (warn at {warn}%)",
+                data={
+                    "usedPct": pct,
+                    "warnPct": warn,
+                    "freedBytes": int(match.group("freed")),
+                    "foldersLeft": (
+                        int(match.group("left")) if match.group("left") else None
                     ),
                 },
             ))

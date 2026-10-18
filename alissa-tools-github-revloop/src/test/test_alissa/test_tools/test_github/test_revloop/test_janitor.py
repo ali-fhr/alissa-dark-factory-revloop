@@ -2,7 +2,9 @@
 `REVIEW-*` folders under each hub are removed, unless a live session or an
 open ledger round holds them; nothing else under a hub is ever touched;
 dry-run removes nothing; a full volume warns once; fleet vitals carry
-`diskUsedPct`."""
+`diskUsedPct`. Issue #177: a `REVIEW-*` checkout made INSIDE `<hub>/main` is
+reaped too, the grace shrinks under disk pressure, and a pressure episode
+records one `janitor.volume_pressure` loop event."""
 
 from __future__ import annotations
 
@@ -110,7 +112,9 @@ def test_nothing_outside_the_two_patterns_is_ever_touched(tmp_path):
     keep = [
         folder(hub / "main" / "src", age=stale),
         folder(hub / "main" / ".review-notes", age=stale),
-        folder(hub / "main" / "REVIEW-TASK-1", age=stale),  # REVIEW- under main/
+        folder(hub / "main" / "node_modules", age=stale),
+        folder(hub / "main" / "review-lowercase", age=stale),
+        folder(hub / "main" / "src" / "REVIEW-TASK-1", age=stale),  # nested under main/
         folder(hub / "TASK-12-SOME-WORK", age=stale),
         folder(hub / "review-lowercase", age=stale),
         folder(hub / ".review-scratch-pr7-r1", age=stale),  # scratch beside main/
@@ -122,6 +126,8 @@ def test_nothing_outside_the_two_patterns_is_ever_touched(tmp_path):
     outside = folder(tmp_path / "elsewhere", age=stale)
     (hub / "main" / ".review-scratch-pr9-r1").symlink_to(outside)
     (hub / "REVIEW-TASK-4").symlink_to(outside)
+    (hub / "main" / "REVIEW-TASK-5").symlink_to(outside)
+    (hub / "main" / "REVIEW-TASK-6").write_text("a file, not a folder")
 
     result = run_sweep([hub])
 
@@ -131,6 +137,8 @@ def test_nothing_outside_the_two_patterns_is_ever_touched(tmp_path):
     assert (hub / "main" / ".review-scratch-file").is_file()
     assert (hub / "REVIEW-TASK-3").is_file()
     assert (hub / "main" / ".review-scratch-pr9-r1").is_symlink()
+    assert (hub / "main" / "REVIEW-TASK-5").is_symlink()
+    assert (hub / "main" / "REVIEW-TASK-6").is_file()
     assert (outside / "pr.diff").is_file()
 
 
@@ -302,7 +310,10 @@ def test_real_git_the_removed_worktrees_records_are_pruned(tmp_path):
 
 
 @pytest.fixture
-def ws(tmp_path):
+def ws(tmp_path, monkeypatch):
+    # The volume reads under the warn line unless a test says otherwise, so
+    # the pressure grace (issue #177) never depends on the CI machine's disk.
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 50.0)
     root = tmp_path / "ws"
     hub = make_hub(root, "widgets")
     config = Config(
@@ -741,3 +752,352 @@ def test_the_summary_lines_state_the_deferred_count(ws, caplog):
     assert any(r.getMessage().startswith("[dry-run] janitor: would remove 25 folder(s)")
                and "10 deferred to the next interval" in r.getMessage()
                for r in caplog.records)
+
+
+# -- REVIEW-* checkouts INSIDE <hub>/main (issue #177 c1) ---------------------
+
+
+def test_a_review_checkout_inside_main_is_a_candidate_like_one_beside_it(tmp_path):
+    hub = make_hub(tmp_path)
+    stale = GRACE * 2
+    inside = folder(hub / "main" / "REVIEW-TASK-71", age=stale)
+    beside = folder(hub / "REVIEW-TASK-72", age=stale)
+    fresh_inside = folder(hub / "main" / "REVIEW-TASK-73", age=60)
+    held_inside = folder(hub / "main" / "REVIEW-TASK-74", age=stale)
+    main_file = hub / "main" / "README.md"
+    main_file.write_text("main's own file")
+    guard = Guard()
+    guard.hold("acme/widgets", 9, "TASK-74")
+
+    result = run_sweep([hub], guard)
+
+    assert not inside.exists() and not beside.exists()
+    assert fresh_inside.is_dir() and held_inside.is_dir()
+    assert main_file.is_file()
+    assert {p for p, _ in result.removed} == {inside, beside}
+    assert [p for p, _ in result.held] == [held_inside]
+    kinds = {c.path.name: c.kind for c in janitor_mod.scan_hub(hub)}
+    assert kinds["REVIEW-TASK-73"] == janitor_mod.KIND_REVIEW
+
+
+def test_a_linked_worktree_checkout_goes_through_git_worktree_remove(tmp_path):
+    """A `.git` FILE marks a linked worktree: git removes it (here the fake
+    runner refuses to, so the folder falls back to rmtree); a plain folder
+    and a scratch folder never ask git."""
+    hub = make_hub(tmp_path)
+    stale = GRACE * 2
+    linked = folder(hub / "main" / "REVIEW-TASK-71", age=stale, files=(".git", "a.txt"))
+    plain = folder(hub / "REVIEW-TASK-72", age=stale)
+    scratch = folder(hub / "main" / ".review-scratch-pr7-r1", age=stale, files=(".git",))
+    runner = Runner(fail=True)
+
+    result = run_sweep([hub], runner=runner)
+
+    assert not linked.exists() and not plain.exists() and not scratch.exists()
+    assert len(result.removed) == 3 and result.failed == []
+    removes = [c for c in runner.calls if "remove" in c]
+    assert removes == [[
+        "git", "-C", str(hub / ".source"), "worktree", "remove", "--force", str(linked),
+    ]]
+
+
+def test_real_git_a_checkout_made_inside_main_is_removed_and_unregistered(tmp_path):
+    """Against real git, the incident's shape: a reviewer in `<hub>/main`
+    runs `git worktree add REVIEW-TASK-71`, which lands INSIDE `main/`. The
+    sweep removes it through `git worktree remove --force` (its record goes
+    with it), and `main/` -- its files, its registration -- is untouched."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git("init", "-q", "-b", "main", cwd=seed)
+    (seed / "README.md").write_text("hi")
+    _git("add", "README.md", cwd=seed)
+    _git("commit", "-q", "-m", "seed", cwd=seed)
+    root = tmp_path / "ws"
+    hub = root / "widgets"
+    hub.mkdir(parents=True)
+    _git("clone", "-q", "--bare", str(seed), str(hub / ".source"), cwd=tmp_path)
+    source = hub / ".source"
+    _git("worktree", "add", "-q", str(hub / "main"), "main", cwd=source)
+    _git("worktree", "add", "-q", "--detach", "REVIEW-TASK-71", "main", cwd=hub / "main")
+    checkout = hub / "main" / "REVIEW-TASK-71"
+    (checkout / "node_modules").mkdir()
+    (checkout / "node_modules" / "dep.js").write_text("module.exports = 1")
+    old = time.time() - GRACE * 2
+    for path in (checkout, checkout / ".git", checkout / "README.md", checkout / "node_modules"):
+        os.utime(path, (old, old), follow_symlinks=False)
+    calls = []
+
+    def recording(argv, **kwargs):
+        calls.append(list(argv))
+        return janitor_mod.run(argv, **kwargs)
+
+    result = sweep(
+        janitor_mod.discover_hubs(root), Guard(),
+        grace_seconds=GRACE, now=time.time(), runner=recording,
+    )
+
+    assert [p for p, _ in result.removed] == [checkout]
+    assert not checkout.exists()
+    assert any(c[3:6] == ["worktree", "remove", "--force"] for c in calls)
+    listed = subprocess.run(
+        ["git", "-C", str(source), "worktree", "list", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "REVIEW-TASK-71" not in listed
+    assert f"worktree {hub / 'main'}" in listed
+    assert (hub / "main" / "README.md").is_file()
+
+
+def test_the_reviewer_rule_says_where_the_checkout_goes():
+    """c4: the rule names the place beside `main/` -- the name trust seeds --
+    and the janitor reaps that name in both places."""
+    from alissa.tools.github.revloop.loop import _REVIEWER_RULE
+    from alissa.tools.github.revloop.trust import review_checkout_name
+
+    assert "BESIDE `main/`, never inside it" in _REVIEWER_RULE
+    assert "git worktree add ../REVIEW-<review task ref>" in _REVIEWER_RULE
+    assert review_checkout_name("TASK-71") == "REVIEW-TASK-71"
+
+
+# -- the pressure grace (issue #177 c2) ----------------------------------------
+
+HOUR = 3600
+PRESSURE_GRACE = 2 * HOUR
+
+
+def pressure_sweep(hubs, guard=None, *, under_pressure, dry_run=False, **kw):
+    return sweep(
+        hubs, guard or Guard(), grace_seconds=GRACE, now=NOW, runner=Runner(),
+        dry_run=dry_run, pressure_grace_seconds=PRESSURE_GRACE,
+        under_pressure=under_pressure, **kw,
+    )
+
+
+def test_without_pressure_the_day_grace_holds(tmp_path):
+    hub = make_hub(tmp_path)
+    young = folder(hub / "main" / "REVIEW-TASK-1", age=5 * HOUR)
+
+    result = pressure_sweep([hub], under_pressure=lambda: False)
+
+    assert young.is_dir() and result.removed == [] and result.fresh == 1
+    assert result.pressure is False
+
+
+def test_under_pressure_the_grace_drops_and_held_folders_stay(tmp_path):
+    hub = make_hub(tmp_path)
+    past = folder(hub / "main" / "REVIEW-TASK-1", age=3 * HOUR)
+    scratch = folder(hub / "main" / ".review-scratch-pr8-r1", age=3 * HOUR)
+    inside = folder(hub / "REVIEW-TASK-2", age=1 * HOUR)
+    held = folder(hub / "main" / "REVIEW-TASK-3", age=10 * HOUR)
+    held_scratch = folder(hub / "main" / ".review-scratch-pr9-r1", age=GRACE * 3)
+    guard = Guard()
+    guard.hold("acme/widgets", 9, "TASK-3")
+
+    result = pressure_sweep([hub], guard, under_pressure=lambda: True)
+
+    assert not past.exists() and not scratch.exists()
+    assert inside.is_dir(), "younger than the pressure grace"
+    assert held.is_dir() and held_scratch.is_dir(), "held is never removed"
+    assert result.pressure is True and result.pressure_removed == 2
+    assert result.fresh == 1 and len(result.held) == 2
+
+
+def test_under_pressure_the_oldest_go_first_until_the_volume_recovers(tmp_path):
+    hub = make_hub(tmp_path)
+    other = make_hub(tmp_path, "gadgets")
+    oldest = folder(other / "main" / "REVIEW-TASK-9", age=8 * HOUR)
+    middle = folder(hub / "REVIEW-TASK-5", age=6 * HOUR)
+    newest = folder(hub / "main" / "REVIEW-TASK-1", age=4 * HOUR)
+    stale = folder(hub / "main" / ".review-scratch-pr7-r1", age=GRACE + 60)
+
+    # Pressed until two folders are gone.
+    def pressed():
+        return sum(p.exists() for p in (oldest, middle, newest, stale)) > 2
+
+    result = pressure_sweep([hub, other], under_pressure=pressed)
+
+    assert not stale.exists(), "past the day grace: removed whatever the volume"
+    assert not oldest.exists()
+    assert middle.is_dir() and newest.is_dir()
+    assert [p for p, _ in result.removed] == [stale, oldest]
+    assert result.pressure_removed == 1 and result.fresh == 2
+    assert result.left == 2
+
+
+def test_a_dry_run_under_pressure_reports_every_eligible_folder(tmp_path):
+    hub = make_hub(tmp_path)
+    a = folder(hub / "main" / "REVIEW-TASK-1", age=3 * HOUR)
+    b = folder(hub / "REVIEW-TASK-2", age=4 * HOUR)
+    asked = []
+
+    def pressed():
+        asked.append(1)
+        return True
+
+    result = pressure_sweep([hub], under_pressure=pressed, dry_run=True)
+
+    assert a.is_dir() and b.is_dir()
+    assert [p for p, _ in result.would_remove] == [b, a]
+    assert result.pressure_removed == 2 and len(asked) == 1
+
+
+def test_the_pressure_grace_never_exceeds_the_normal_grace(tmp_path):
+    hub = make_hub(tmp_path)
+    young = folder(hub / "REVIEW-TASK-1", age=2 * HOUR)
+
+    result = sweep([hub], Guard(), grace_seconds=HOUR, now=NOW, runner=Runner(),
+                   pressure_grace_seconds=5 * HOUR, under_pressure=lambda: True)
+
+    assert not young.exists() and result.pressure_removed == 0
+
+
+def test_the_pressure_grace_config_default_env_and_floor(tmp_path, monkeypatch):
+    from alissa.tools.github.revloop import config as config_mod
+
+    assert Config(workspace_root=tmp_path).janitor_pressure_grace_minutes == 120
+    assert config_mod.DEFAULT_JANITOR_PRESSURE_GRACE_MINUTES == 120
+    assert config_mod.env_janitor(
+        {"ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES": "45"}
+    ) == {"janitor_pressure_grace_minutes": 45}
+    assert config_mod.env_janitor(
+        {"ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES": ""}
+    ) == {}
+    with pytest.raises(ValueError, match="ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES"):
+        config_mod.env_janitor({"ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES": "soon"})
+    with pytest.raises(ValueError, match="janitor_pressure_grace_minutes must be >= 1"):
+        Config.build(tmp_path, {"janitor_pressure_grace_minutes": 0}, environ={})
+    assert Config.build(
+        tmp_path, {"janitor_pressure_grace_minutes": 30},
+        environ={"ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES": "45"},
+    ).janitor_pressure_grace_minutes == 45, "the env outranks the file"
+
+
+# -- the watcher under pressure: grace, one event per episode (c2, c3) --------
+
+
+def young_checkout(hub, name="REVIEW-TASK-71", hours=3):
+    path = hub / "main" / name
+    path.mkdir()
+    (path / "pr.diff").write_text("x" * 4096)
+    old = time.time() - hours * HOUR
+    for each in (path / "pr.diff", path):
+        os.utime(each, (old, old))
+    return path
+
+
+def volume_pings(w):
+    return [r for r in w.state.read_pings()
+            if str(r["kind"]).startswith("volume-pressure:")]
+
+
+def test_the_watcher_shrinks_the_grace_while_the_volume_is_pressed(ws, monkeypatch, caplog):
+    w, _, hub = ws
+    checkout = young_checkout(hub)
+    # Pressed while the checkout is on disk; its removal frees the volume.
+    monkeypatch.setattr(janitor_mod, "disk_used_pct",
+                        lambda path: 95.0 if checkout.exists() else 70.0)
+    beside = hub / "REVIEW-TASK-72"
+    beside.mkdir()
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert result is not None and result.pressure is True
+    assert not checkout.exists()
+    assert beside.is_dir(), "fresh even under pressure"
+    assert any("the grace dropped to 120 minute(s)" in r.getMessage()
+               for r in caplog.records)
+    assert len(volume_pings(w)) == 1
+    assert w._janitor_pressure_since is None, "back under the line: episode closed"
+
+
+def test_one_volume_pressure_event_per_episode_and_recovery_closes_it(ws, monkeypatch):
+    w, _, hub = ws
+    pct = {"now": 97.5}
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: pct["now"])
+    young_checkout(hub)
+    t0 = int(time.time())
+
+    w._run_janitor(now=t0)
+    w._janitor_last -= 10 * 60
+    w._run_janitor(now=t0 + 600)
+
+    rows = volume_pings(w)
+    assert len(rows) == 1, "one event per episode, not per sweep"
+    assert rows[0]["repo"] == "" and rows[0]["number"] == 0
+    started, used, warn, freed, left = rows[0]["kind"].split(":")[1:]
+    assert (started, used, warn) == (str(t0), "97.5", "80")
+    assert int(freed) > 0 and left == "0"
+
+    pct["now"] = 60.0
+    w._janitor_last -= 10 * 60
+    w._run_janitor(now=t0 + 1200)
+    assert w._janitor_pressure_since is None
+
+    pct["now"] = 85.0
+    w._janitor_last -= 10 * 60
+    w._run_janitor(now=t0 + 1800)
+    assert len(volume_pings(w)) == 2, "a new episode is a new event"
+
+
+def test_the_event_is_recorded_even_when_the_sweep_cannot_run(ws, monkeypatch):
+    w, alissa, _ = ws
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 99.1)
+
+    def boom():
+        raise CommandError(["alissa", "tmux", "ls"], 1, "no server")
+
+    alissa.list_review_sessions = boom
+
+    assert w._run_janitor(now=NOW) is None
+
+    rows = volume_pings(w)
+    assert len(rows) == 1 and rows[0]["kind"].endswith(":0:")
+
+
+def test_a_dry_run_records_no_volume_pressure_row(ws, monkeypatch, caplog):
+    w, _, _ = ws
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      state_path=w.config.state_db, dry_run=True)
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 95.0)
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        w._run_janitor(now=NOW)
+
+    assert volume_pings(w) == []
+    assert any(r.getMessage().startswith("[dry-run] janitor: would record volume-pressure:")
+               for r in caplog.records)
+
+
+def test_a_zero_warn_line_never_presses_or_records(ws, monkeypatch):
+    w, _, hub = ws
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      state_path=w.config.state_db, janitor_warn_pct=0)
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 99.0)
+    checkout = young_checkout(hub)
+
+    result = w._run_janitor(now=time.time())
+
+    assert result is not None and result.pressure is False
+    assert checkout.is_dir() and volume_pings(w) == []
+
+
+def test_a_failed_ledger_write_leaves_the_episode_unopened(ws, monkeypatch, caplog):
+    w, _, _ = ws
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 95.0)
+    real = w.state.record_ping
+
+    def broken(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(w.state, "record_ping", broken)
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        w._run_janitor(now=time.time())
+    assert w._janitor_pressure_since is None
+    assert any("could not record the volume-pressure episode" in r.getMessage()
+               for r in caplog.records)
+
+    monkeypatch.setattr(w.state, "record_ping", real)
+    w._janitor_last -= 10 * 60
+    w._run_janitor(now=time.time())
+    assert len(volume_pings(w)) == 1, "the next sweep records it"

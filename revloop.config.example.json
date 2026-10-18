@@ -113,6 +113,9 @@
   "_janitor_warn_pct": "Workspace volume usage (percent) at or above which a sweep logs one WARNING. 0 = never; at most 100. Environment: ALISSA_REVIEW_JANITOR_WARN_PCT.",
   "janitor_warn_pct": 80,
 
+  "_janitor_pressure_grace_minutes": "THE GRACE UNDER DISK PRESSURE (issue #177). While the workspace volume is at or above janitor_warn_pct, a scratch folder or REVIEW- checkout (beside main/ or inside it) older than this many minutes is removable too, oldest first, re-reading the volume before each such removal and stopping once it is back under the line; held folders are never removed. >= 1, never longer than janitor_grace_minutes. Each pressure episode also records one janitor.volume_pressure loop event. Environment: ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES.",
+  "janitor_pressure_grace_minutes": 120,
+
   "_alissa_endpoint": "The Alissa API base the loop-events and fleet-vitals client posts to, and (under repos_source 'bows') the feed listing is read from. Leave it at the default unless the deployment points at a staging API.",
   "alissa_endpoint": "https://api.alissa.app",
 

@@ -109,6 +109,7 @@ from .loop_events import (
     round_verdict_prefix,
     ROUND_VERDICT_PREFIX,
     task_number_of,
+    volume_pressure_kind,
 )
 from .proc import CommandError
 from .state import State
@@ -1123,14 +1124,23 @@ _SHELL_RULE = (
 # checkout the review skill lets a reviewer make, and nothing a reviewer
 # writes there needs deleting. The daemon's workspace janitor (janitor.py,
 # issue #167) reclaims it: every `janitor_interval_minutes` it removes each
-# hub's `main/.review-scratch-*` and `REVIEW-*` folders older than
-# `janitor_grace_minutes` that no live session or open round holds, then
-# prunes `.source`'s worktree records. The rule's text does not name the
-# janitor: the reviewer needs only to know it must not delete, and the plan
-# directives that embed this rule are pinned by digest.
+# hub's `main/.review-scratch-*`, `REVIEW-*` and `main/REVIEW-*` folders older
+# than `janitor_grace_minutes` (`janitor_pressure_grace_minutes` while the
+# volume is at or above `janitor_warn_pct`) that no live session or open round
+# holds, then prunes `.source`'s worktree records. The rule's text does not
+# name the janitor: the reviewer needs only to know it must not delete -- and,
+# since issue #177, WHERE its checkout goes. A reviewer starts in `<hub>/main`,
+# so a bare `git worktree add REVIEW-<task>` lands INSIDE `main/`; 121 of
+# those filled the fleet's volume on 2026-10-18. The janitor reaps both
+# places, and the rule names the one beside `main/` (`../REVIEW-<task>`),
+# which is where the trust seeding, the prompt policy and the reaper look.
+# The plan directives that embed this rule are pinned by digest (re-pinned
+# for issue #177 in test_directives.py).
 _REVIEWER_RULE = (
     "You never push and never delete: a reviewer that needs scratch files "
-    "writes them under its own checkout and leaves them. "
+    "writes them under its own checkout and leaves them. A checkout you must "
+    "make to run code goes BESIDE `main/`, never inside it: from your start "
+    "directory, `git worktree add ../REVIEW-<review task ref> <the PR head>`. "
 )
 
 ROUND_1_DIRECTIVE = (
@@ -2622,6 +2632,12 @@ class ReviewWatcher:
         # Whether the janitor has said, once for this process, that it will
         # not sweep under this `hub_template` (issue #175).
         self._janitor_layout_warned = False
+        # When the open volume-pressure episode began (wall clock), or None
+        # while the volume is under `janitor_warn_pct` (issue #177): one
+        # `janitor.volume_pressure` event per episode, and a reading back
+        # under the line closes it. In memory, so a restart under pressure
+        # opens (and reports) a new episode.
+        self._janitor_pressure_since: "float | None" = None
         # The (repo, number, round) whose alive session the stale-round probe
         # just killed as `wedged:first-run-dialog` (issue #136), so the
         # respawn site logs its re-enqueue at INFO instead of a second
@@ -7960,8 +7976,10 @@ class ReviewWatcher:
             return None
         self._janitor_last = mono
         stamp = time.time() if now is None else now
+        pct = self._volume_used_pct()
+        pressed = pct is not None and pct >= self.config.janitor_warn_pct
         try:
-            result = self._sweep_workspace(stamp)
+            result = self._sweep_workspace(stamp, pressed=pressed)
         except Exception as exc:
             log.warning(
                 "janitor: sweep failed unexpectedly (%s: %s) — nothing more is "
@@ -7969,10 +7987,27 @@ class ReviewWatcher:
                 type(exc).__name__, exc, exc_info=True,
             )
             result = None
-        self._warn_disk()
+        self._note_volume(pct, result, stamp)
         return result
 
-    def _sweep_workspace(self, now: float) -> "janitor_mod.SweepResult | None":
+    def _volume_used_pct(self) -> "float | None":
+        """The workspace volume's used percentage, or None when
+        `janitor_warn_pct` is 0 (never warn, never pressed) or the volume
+        cannot be read."""
+        if not self.config.janitor_warn_pct:
+            return None
+        return janitor_mod.disk_used_pct(self.config.workspace_root)
+
+    def _volume_pressed(self) -> bool:
+        """Whether the workspace volume is, right now, at or above
+        `janitor_warn_pct` -- asked by the sweep before each removal only
+        the pressure grace allows (issue #177)."""
+        pct = self._volume_used_pct()
+        return pct is not None and pct >= self.config.janitor_warn_pct
+
+    def _sweep_workspace(
+        self, now: float, *, pressed: bool = False
+    ) -> "janitor_mod.SweepResult | None":
         if not janitor_mod.layout_supported(
             self.config.hub_for, self.config.workspace_root
         ):
@@ -8002,7 +8037,20 @@ class ReviewWatcher:
             grace_seconds=self.config.janitor_grace_minutes * 60,
             now=now,
             dry_run=self.config.dry_run,
+            pressure_grace_seconds=(
+                self.config.janitor_pressure_grace_minutes * 60 if pressed else None
+            ),
+            under_pressure=self._volume_pressed if pressed else None,
         )
+        if result.pressure:
+            log.info(
+                "janitor: volume at or above %d%% — the grace dropped to %d "
+                "minute(s) this sweep; %d folder(s) %s only under it",
+                self.config.janitor_warn_pct,
+                self.config.janitor_pressure_grace_minutes,
+                result.pressure_removed,
+                "would go" if self.config.dry_run else "went",
+            )
         if self.config.dry_run:
             log.info(
                 "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
@@ -8070,18 +8118,62 @@ class ReviewWatcher:
                 )
         return guard
 
-    def _warn_disk(self) -> None:
+    def _note_volume(
+        self,
+        pct: "float | None",
+        result: "janitor_mod.SweepResult | None",
+        stamp: float,
+    ) -> None:
         """One WARNING when the workspace volume is at or above
-        `janitor_warn_pct` (0 = never)."""
+        `janitor_warn_pct` (0 = never), and the pressure EPISODE (issue
+        #177): the first sweep at or above the line records ONE
+        `volume-pressure:` ping -- what the sweep freed and left folded in --
+        which loop_events derives into one `janitor.volume_pressure` event;
+        the first reading back under the line (after this sweep, or at a
+        later one) closes the episode. Dry-run records nothing: it shares the
+        ledger with production, so it only says what it would record. Never
+        raises."""
         threshold = self.config.janitor_warn_pct
-        if not threshold:
+        if not threshold or pct is None:
             return
-        pct = janitor_mod.disk_used_pct(self.config.workspace_root)
-        if pct is not None and pct >= threshold:
-            log.warning(
-                "janitor: workspace volume %s is %.1f%% used (warn at %d%%)",
-                self.config.workspace_root, pct, threshold,
+        if pct < threshold:
+            self._close_pressure_episode(pct)
+            return
+        log.warning(
+            "janitor: workspace volume %s is %.1f%% used (warn at %d%%)",
+            self.config.workspace_root, pct, threshold,
+        )
+        if self._janitor_pressure_since is None:
+            kind = volume_pressure_kind(
+                stamp, pct, threshold,
+                result.freed if result is not None else 0,
+                result.left if result is not None else None,
             )
+            if self.config.dry_run:
+                log.info("[dry-run] janitor: would record %s", kind)
+                self._janitor_pressure_since = stamp
+            else:
+                try:
+                    self.state.record_ping("", 0, kind)
+                    self._janitor_pressure_since = stamp
+                except Exception as exc:
+                    # The episode stays unopened, so the next sweep retries.
+                    log.warning(
+                        "janitor: could not record the volume-pressure episode "
+                        "(%s: %s)", type(exc).__name__, exc,
+                    )
+        after = self._volume_used_pct()
+        if after is not None and after < threshold:
+            self._close_pressure_episode(after)
+
+    def _close_pressure_episode(self, pct: float) -> None:
+        if self._janitor_pressure_since is None:
+            return
+        self._janitor_pressure_since = None
+        log.info(
+            "janitor: volume-pressure episode closed — the workspace is %.1f%% "
+            "used, under the %d%% line", pct, self.config.janitor_warn_pct,
+        )
 
     def _vitals_config(self) -> dict:
         """The snapshot's `config` block (issue #159), read off what this

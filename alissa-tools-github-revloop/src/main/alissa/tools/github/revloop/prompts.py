@@ -16,8 +16,11 @@ developer's `<hub>/TASK-*` worktree; here `SessionContext.worktree` is the
 reviewer's own REVIEW CHECKOUT -- the throwaway `<hub>/REVIEW-<task>`
 worktree the alissa-code-review skill lets a reviewer that must run code
 make beside `main/`. A `dangerous_rm` target inside it is `accept`; anything
-else -- `main/`, the hub, another round's checkout, `/tmp`, an unresolvable
-target, a session whose checkout the loop could not name -- is `decline`.
+else -- `main/` (a `main/REVIEW-*` checkout included: the reviewer rule
+places the checkout beside `main/`, and the janitor, not the reviewer, reaps
+one made inside it -- issue #177), the hub, another round's checkout, `/tmp`,
+an unresolvable target, a session whose checkout the loop could not name --
+is `decline`.
 The reason strings are devloop's verbatim ("target inside worktree", "lane
 worktree unknown") so the sentinel reads one vocabulary across the seats.
 

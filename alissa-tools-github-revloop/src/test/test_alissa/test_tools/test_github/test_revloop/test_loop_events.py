@@ -1375,3 +1375,77 @@ def test_the_link_columns_are_migrated_into_an_old_database(tmp_path):
         events = {e["session"]: e for e in derive_events(st)}
         assert "issueNumber" not in events["old"]
         assert events["new"]["issueNumber"] == 6
+
+
+# -- janitor.volume_pressure (issue #177 c3) ----------------------------------
+
+
+def _pressure_events(ledger):
+    return [e for e in derive_events(ledger)
+            if e["kind"] == loop_events.VOLUME_PRESSURE_EVENT]
+
+
+def test_a_volume_pressure_row_derives_one_anchorless_event(ledger, clock):
+    """Pinned as a literal: the kind (a shape the Studio ingest accepts),
+    the episode-keyed dedupe key, no repo / PR / round / session, a fixed
+    reason, and the four data keys."""
+    ledger.record_ping("", 0, loop_events.volume_pressure_kind(
+        1_792_340_000, 99.14, 80, 43 * 1024 ** 3, 2,
+    ))
+
+    (event,) = _pressure_events(ledger)
+
+    assert event == {
+        "seat": "revloop",
+        "kind": "janitor.volume_pressure",
+        "at": clock.now() * 1000,
+        "dedupeKey": "revloop:janitor.volume_pressure:1792340000",
+        "reason": "workspace volume 99.1% used (warn at 80%)",
+        "data": {
+            "usedPct": 99.1, "warnPct": 80,
+            "freedBytes": 43 * 1024 ** 3, "foldersLeft": 2,
+        },
+    }
+    assert re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$", event["kind"])
+    assert derive_events(ledger) == derive_events(ledger), "deterministic"
+
+
+def test_a_sweep_that_did_not_run_carries_folders_left_null(ledger, clock):
+    ledger.record_ping("", 0, loop_events.volume_pressure_kind(
+        1_792_340_000, 91, 80, 0, None,
+    ))
+
+    (event,) = _pressure_events(ledger)
+
+    assert event["data"] == {
+        "usedPct": 91.0, "warnPct": 80, "freedBytes": 0, "foldersLeft": None,
+    }
+
+
+def test_two_episodes_are_two_events(ledger, clock):
+    ledger.record_ping("", 0, loop_events.volume_pressure_kind(100, 85, 80, 1, 0))
+    clock()
+    ledger.record_ping("", 0, loop_events.volume_pressure_kind(200, 86, 80, 2, 0))
+
+    keys = [e["dedupeKey"] for e in _pressure_events(ledger)]
+
+    assert keys == [
+        "revloop:janitor.volume_pressure:100", "revloop:janitor.volume_pressure:200",
+    ]
+
+
+def test_a_malformed_volume_pressure_row_derives_nothing(ledger):
+    ledger.record_ping("", 0, "volume-pressure:soon:99%:80:1:0")
+    assert _pressure_events(ledger) == []
+
+
+def test_volume_pressure_prefix_is_distinct_from_every_other_ping_family():
+    others = (
+        loop_events.STALLED_PREFIX, loop_events.STABILITY_PREFIX,
+        loop_events.CHECKS_UNSETTLED_PREFIX, loop_events.PROMPT_PREFIX,
+        loop_events.PROMPT_PAGE_PREFIX, loop_events.AUTH_REJECTED_PREFIX,
+        loop_events.ROUND_VERDICT_PREFIX, loop_events.PLAN_ROUND_PREFIX,
+    )
+    for other in others:
+        assert not other.startswith(loop_events.VOLUME_PRESSURE_PREFIX)
+        assert not loop_events.VOLUME_PRESSURE_PREFIX.startswith(other)

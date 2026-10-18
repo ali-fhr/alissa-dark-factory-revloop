@@ -11,7 +11,12 @@ and nothing removed either before this module:
   shared volume held 169 of them, 27 GB of a 46 GB volume.
 * `<hub>/REVIEW-<task ref>/` -- the throwaway checkout the review skill lets a
   reviewer create beside `main/` when it must run code (`trust.
-  review_checkout_name`). Another ~5 GB on the same day.
+  review_checkout_name`). Another ~5 GB on the same day. A reviewer whose
+  shell sits in its spawn cwd makes it INSIDE `main/` instead
+  (`<hub>/main/REVIEW-<task ref>/`): on 2026-10-18 121 of those, 0.6-1.2 GB
+  apiece with their own `node_modules`, filled the fleet's 46 GB volume to
+  100% while the janitor looked only beside `main/` (issue #177). Both
+  places are swept.
 
 Modeled on devloop's janitor.py, but smaller, because what it removes is
 smaller in kind: a reviewer's folders hold no unpushed work by construction
@@ -26,12 +31,17 @@ Three properties everything here is written around:
 
 * **Only the two shapes, only where they are made.** A scratch folder is a
   `.review-scratch-*` DIRECT child of `<hub>/main`, a review checkout a
-  `REVIEW-*` direct child of the hub; symlinks are never candidates. Nothing
-  else under a hub -- `main/`'s own files, `.source`, a task worktree, an
-  operator's clone -- is ever considered, so it is never at risk.
+  `REVIEW-*` direct child of the hub or of `<hub>/main`; symlinks are never
+  candidates. Nothing else under a hub -- `main/`'s own files and its
+  `node_modules`, `.source`, a task worktree, an operator's clone -- is ever
+  considered, so it is never at risk. A review checkout that is a linked git
+  worktree is removed with `git worktree remove --force`, so its record goes
+  with it; anything else with `shutil.rmtree`.
 * **Old AND unheld.** Age is the newest mtime of the folder and its direct
   children (so a round that writes a fresh file into an old folder renews it),
   and the grace is a day by default. A held folder is kept whatever its age.
+  Under disk PRESSURE (issue #177) the grace drops -- to two hours by default
+  -- oldest first, only while the volume is still at or above its warn line.
 * **Nothing raises past its own concern.** A folder that vanishes mid-sweep,
   an unreadable hub, a failed removal: logged and skipped, because this runs
   at the end of a poll pass that must complete.
@@ -184,10 +194,21 @@ class SweepResult:
     pruned: int = 0
     # Unheld stale candidates the per-sweep bound left for the next interval.
     deferred: int = 0
+    # Whether the volume was at or above its warn line when the sweep began,
+    # so the pressure grace applied (issue #177), and how many removals (or,
+    # in a dry run, would-be removals) only that shorter grace allowed.
+    pressure: bool = False
+    pressure_removed: int = 0
 
     @property
     def freed(self) -> int:
         return sum(size for _, size in self.removed)
+
+    @property
+    def left(self) -> int:
+        """Candidate folders still on disk after a live sweep: inside the
+        grace, held, deferred, or failed."""
+        return self.fresh + len(self.held) + self.deferred + len(self.failed)
 
 
 def layout_supported(
@@ -255,8 +276,9 @@ def _dirs(parent: Path, prefix: str) -> "list[Path]":
 
 
 def scan_hub(hub: Path) -> "list[Candidate]":
-    """The janitor's candidates in one hub: `main/.review-scratch-*` and
-    `REVIEW-*`, direct children only, never a walk."""
+    """The janitor's candidates in one hub: `main/.review-scratch-*`,
+    `REVIEW-*` and `main/REVIEW-*` (issue #177), direct children only, never
+    a walk."""
     found = []
     for path in _dirs(hub / "main", SCRATCH_PREFIX):
         match = _SCRATCH_PR_RE.match(path.name[len(SCRATCH_PREFIX):])
@@ -264,7 +286,9 @@ def scan_hub(hub: Path) -> "list[Candidate]":
             path=path, hub=hub, kind=KIND_SCRATCH,
             number=int(match["number"]) if match else None,
         ))
-    for path in _dirs(hub, REVIEW_CHECKOUT_PREFIX):
+    for path in _dirs(hub, REVIEW_CHECKOUT_PREFIX) + _dirs(
+        hub / "main", REVIEW_CHECKOUT_PREFIX
+    ):
         found.append(Candidate(
             path=path, hub=hub, kind=KIND_REVIEW,
             task_ref=path.name[len(REVIEW_CHECKOUT_PREFIX):],
@@ -342,15 +366,51 @@ def disk_used_pct(path: "Path | str") -> "float | None":
 
 def _contained(candidate: Candidate) -> bool:
     """The containment rule, re-asserted at the removal site: the folder is
-    a direct child of its hub (review checkout) or of `<hub>/main` (scratch),
-    both resolved, and not a symlink."""
-    parent = candidate.hub / "main" if candidate.kind == KIND_SCRATCH else candidate.hub
+    a direct child of `<hub>/main` (scratch) or of its hub or `<hub>/main`
+    (review checkout), all resolved, and not a symlink."""
+    main = candidate.hub / "main"
+    parents = (main,) if candidate.kind == KIND_SCRATCH else (candidate.hub, main)
     try:
         if candidate.path.is_symlink():
             return False
-        return candidate.path.resolve().parent == parent.resolve()
+        parent = candidate.path.resolve().parent
+        return any(parent == allowed.resolve() for allowed in parents)
     except OSError:
         return False
+
+
+def _is_linked_worktree(path: Path) -> bool:
+    """Whether `path` is a linked git worktree: its `.git` is a FILE (the
+    `gitdir:` pointer `git worktree add` writes), not a directory."""
+    try:
+        git = path / ".git"
+        return git.is_file() and not git.is_symlink()
+    except OSError:
+        return False
+
+
+def _remove(candidate: Candidate, runner: Runner) -> None:
+    """Remove one contained candidate. A review checkout that is a linked
+    worktree goes through `git worktree remove --force` in its hub's
+    `.source` (issue #177), so the record and the folder go together; when
+    git refuses (a worktree of another repository, a locked one) or the
+    folder is anything else, `shutil.rmtree` removes it and the hub's prune
+    drops whatever record is left. Raises OSError when the folder stays."""
+    if candidate.kind == KIND_REVIEW and _is_linked_worktree(candidate.path):
+        try:
+            runner(
+                ["git", "-C", str(candidate.hub / SOURCE_DIR), "worktree",
+                 "remove", "--force", str(candidate.path)],
+                timeout=120,
+            )
+        except (CommandError, OSError) as exc:
+            log.debug(
+                "janitor: git worktree remove refused %s (%s) — removing the "
+                "folder instead", candidate.path, exc,
+            )
+        if not os.path.lexists(candidate.path):
+            return
+    shutil.rmtree(candidate.path)
 
 
 def prune_worktrees(hub: Path, runner: Runner = run) -> None:
@@ -372,9 +432,20 @@ def sweep(
     max_removals: int = MAX_REMOVALS,
     max_seconds: float = MAX_SWEEP_SECONDS,
     clock: "Callable[[], float]" = time.monotonic,
+    pressure_grace_seconds: "float | None" = None,
+    under_pressure: "Callable[[], bool] | None" = None,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
-    `guard` does not hold, then prune each hub's worktree records.
+    `guard` does not hold, oldest first, then prune each hub's worktree
+    records.
+
+    Under pressure (issue #177): when `under_pressure` is given and answers
+    True at the start of the sweep, a candidate younger than `grace_seconds`
+    but older than `pressure_grace_seconds` is removable too -- but only
+    while `under_pressure()`, asked again before each such removal, still
+    answers True. Candidates are taken oldest first across every hub, so the
+    oldest go first and the sweep stops shrinking the grace the moment the
+    volume is back under its line. A held folder is never removed.
 
     Bounded (issue #175): before each removal, a sweep that has already
     removed `max_removals` folders, or has run `max_seconds` by `clock`,
@@ -384,51 +455,74 @@ def sweep(
 
     Dry-run removes nothing and prunes nothing: it logs each folder it WOULD
     remove (with its size) and reports them in `would_remove`, under the
-    same bound -- so it reports what one live sweep would do."""
+    same bound -- so it reports what one live sweep would do (a dry run frees
+    nothing, so under pressure it reports every pressure-eligible folder)."""
     result = SweepResult()
     started = clock()
     bounded = False
-    for hub in hubs:
+    hub_list = list(hubs)
+    shrunk = grace_seconds
+    if pressure_grace_seconds is not None and under_pressure is not None:
+        result.pressure = under_pressure()
+        if result.pressure:
+            shrunk = min(grace_seconds, pressure_grace_seconds)
+    aged: "list[tuple[float, Candidate]]" = []
+    for hub in hub_list:
         result.hubs += 1
         for candidate in scan_hub(hub):
             mtime = newest_mtime(candidate.path)
             if mtime is None:
                 continue  # vanished mid-sweep
-            if now - mtime < grace_seconds:
-                result.fresh += 1
-                continue
-            why = guard.holds(candidate)
-            if why is not None:
-                log.debug("janitor: keeping %s — %s", candidate.path, why)
-                result.held.append((candidate.path, why))
-                continue
-            if not bounded:
-                taken = len(result.would_remove if dry_run else result.removed)
-                bounded = taken >= max_removals or clock() - started >= max_seconds
-            if bounded:
-                result.deferred += 1
-                continue
-            if not _contained(candidate):
-                result.failed.append((candidate.path, "not contained in its hub"))
-                continue
-            size = dir_bytes(candidate.path)
-            if dry_run:
-                log.info(
-                    "[dry-run] janitor would remove %s (%s, %.1f h old)",
-                    candidate.path, human(size), (now - mtime) / 3600,
-                )
-                result.would_remove.append((candidate.path, size))
-                continue
-            try:
-                shutil.rmtree(candidate.path)
-            except OSError as exc:
-                log.warning("janitor: could not remove %s (%s)", candidate.path, exc)
-                result.failed.append((candidate.path, str(exc)))
-                continue
-            log.debug("janitor: removed %s (%s)", candidate.path, human(size))
-            result.removed.append((candidate.path, size))
-        if dry_run:
+            aged.append((mtime, candidate))
+    aged.sort(key=lambda pair: (pair[0], str(pair[1].path)))
+    for mtime, candidate in aged:
+        age = now - mtime
+        if age < shrunk:
+            result.fresh += 1
             continue
+        why = guard.holds(candidate)
+        if why is not None:
+            log.debug("janitor: keeping %s — %s", candidate.path, why)
+            result.held.append((candidate.path, why))
+            continue
+        early = age < grace_seconds
+        if early and not dry_run and not (under_pressure and under_pressure()):
+            # Back under the line: the normal grace holds again.
+            result.fresh += 1
+            continue
+        if not bounded:
+            taken = len(result.would_remove if dry_run else result.removed)
+            bounded = taken >= max_removals or clock() - started >= max_seconds
+        if bounded:
+            result.deferred += 1
+            continue
+        if not _contained(candidate):
+            result.failed.append((candidate.path, "not contained in its hub"))
+            continue
+        size = dir_bytes(candidate.path)
+        if dry_run:
+            log.info(
+                "[dry-run] janitor would remove %s (%s, %.1f h old%s)",
+                candidate.path, human(size), age / 3600,
+                ", under pressure" if early else "",
+            )
+            result.would_remove.append((candidate.path, size))
+            if early:
+                result.pressure_removed += 1
+            continue
+        try:
+            _remove(candidate, runner)
+        except OSError as exc:
+            log.warning("janitor: could not remove %s (%s)", candidate.path, exc)
+            result.failed.append((candidate.path, str(exc)))
+            continue
+        log.debug("janitor: removed %s (%s)", candidate.path, human(size))
+        result.removed.append((candidate.path, size))
+        if early:
+            result.pressure_removed += 1
+    if dry_run:
+        return result
+    for hub in hub_list:
         try:
             prune_worktrees(hub, runner)
             result.pruned += 1

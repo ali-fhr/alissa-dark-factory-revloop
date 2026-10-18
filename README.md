@@ -129,11 +129,12 @@ and the three `repos_source: bows` keys — `repos_source`
 Work*), and the two plan-directive allowlists — `plan_repos`
 (`ALISSA_REVIEW_PLAN_REPOS`) and `plan_authors` (`ALISSA_REVIEW_PLAN_AUTHORS`;
 see *Plan PRs*), the discovery flag `discovery_review`
-(`ALISSA_REVIEW_DISCOVERY_REVIEW`; see *Discovery PRs*), and the four workspace-janitor keys — `janitor_enabled`
+(`ALISSA_REVIEW_DISCOVERY_REVIEW`; see *Discovery PRs*), and the five workspace-janitor keys — `janitor_enabled`
 (`ALISSA_REVIEW_JANITOR_ENABLED`), `janitor_grace_minutes`
 (`ALISSA_REVIEW_JANITOR_GRACE_MINUTES`), `janitor_interval_minutes`
-(`ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES`) and `janitor_warn_pct`
-(`ALISSA_REVIEW_JANITOR_WARN_PCT`; see *The workspace janitor*). The
+(`ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES`), `janitor_warn_pct`
+(`ALISSA_REVIEW_JANITOR_WARN_PCT`) and `janitor_pressure_grace_minutes`
+(`ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES`; see *The workspace janitor*). The
 environment wins over the file **and** the flags for all twelve, but a
 **blank** value falls through — an unset platform variable reference renders as
 `""`, and that must not fail boot on a mode of `''`. The three boolean rails
@@ -182,7 +183,8 @@ else refused by name.
 | `janitor_enabled` | `true` | the **workspace janitor**: at the end of a pass, every `janitor_interval_minutes`, remove each hub's stale `main/.review-scratch-*` and `REVIEW-*` folders that no live session or open round holds, `git worktree prune` the hub's `.source`, and warn on a full volume — see *The workspace janitor*. `--janitor` / `--no-janitor`; environment `ALISSA_REVIEW_JANITOR_ENABLED` |
 | `janitor_grace_minutes` | `1440` | how old (newest mtime of the folder and its direct children) a scratch folder or `REVIEW-` checkout must be before the janitor may remove it. `>= 1`. `--janitor-grace-minutes`; environment `ALISSA_REVIEW_JANITOR_GRACE_MINUTES` |
 | `janitor_interval_minutes` | `10` | how often the janitor sweeps; `0` = every pass. The first sweep runs at the end of the first pass. `--janitor-interval-minutes`; environment `ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES` |
-| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
+| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING, shrinks the grace to `janitor_pressure_grace_minutes` and records one `janitor.volume_pressure` loop event per episode; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
+| `janitor_pressure_grace_minutes` | `120` | the grace **under disk pressure**: while the volume is at or above `janitor_warn_pct`, a folder older than this is removable too, oldest first, until the volume is back under the line. `>= 1`; never longer than `janitor_grace_minutes`. File or environment `ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES` (no CLI flag) |
 | `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
 #### Who the loop serves
@@ -1259,7 +1261,12 @@ payload files and often a `wt/` worktree off `.source` with its own
 `node_modules`, 250–950 MB apiece) and the throwaway `<hub>/REVIEW-<task>`
 checkout the review skill lets a reviewer create. On 2026-10-12 the Alissa
 fleet's shared volume was 76% full with 169 scratch folders (27 GB) and ~5 GB
-of `REVIEW-*` checkouts.
+of `REVIEW-*` checkouts. On 2026-10-18 it hit 100%: 121 `REVIEW-*` checkouts
+(0.6–1.2 GB each) sat INSIDE `<hub>/main/`, where a reviewer's bare
+`git worktree add REVIEW-<task>` from its start directory lands, and the
+janitor of the day looked only beside `main/` (issue #177). The reviewer
+rule now says the checkout goes beside `main/` (`git worktree add
+../REVIEW-<review task ref> <head>`), and the janitor reaps both places.
 
 The janitor (`janitor.py`, on by default) runs at the end of a pass, every
 `janitor_interval_minutes` (default 10; `0` = every pass):
@@ -1274,10 +1281,14 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   prunes nothing — a hub named another way would not be held by its live
   rounds — and logs **one WARNING per process** naming the template. The
   disk-usage WARNING below still fires.
-- **Candidates** are only `<hub>/main/.review-scratch-*` and `<hub>/REVIEW-*`
-  directories, direct children, never symlinks. Nothing else under a hub
-  (`main/`'s own files, `.source`, task worktrees, an operator's clone) is ever
-  considered.
+- **Candidates** are only `<hub>/main/.review-scratch-*`, `<hub>/REVIEW-*`
+  and `<hub>/main/REVIEW-*` directories, direct children, never symlinks.
+  Nothing else under a hub (`main/`'s own files and `node_modules`, `.source`,
+  task worktrees, an operator's clone) is ever considered. A `REVIEW-*`
+  checkout that is a linked git worktree (its `.git` is a file) is removed
+  with `git worktree remove --force` in the hub's `.source`, so its record
+  goes with it; when git refuses (another repository's worktree, a locked
+  one) the folder is removed directly and the prune below drops the record.
 - **Removed** when the folder's age — the newest mtime of the folder and its
   direct children — is past `janitor_grace_minutes` (default 1440, a day) and
   nothing **holds** it. A PR is held by a live reviewer session (the roster;
@@ -1285,9 +1296,19 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   skill-shaped `review-pr-<n>` with no row holds PR `<n>` in every hub) or by
   an open ledger round (an unreaped spawn younger than the 90-minute
   stale-round window, or a verdict post still owed). A held PR keeps every one
-  of its scratch folders and its review task's `REVIEW-<task>` checkout; a held
-  round whose review task is unknown keeps every `REVIEW-*` in its hub. If the
-  roster cannot be listed the removal half is skipped that interval.
+  of its scratch folders and its review task's `REVIEW-<task>` checkout (in
+  either place); a held round whose review task is unknown keeps every
+  `REVIEW-*` in its hub. If the roster cannot be listed the removal half is
+  skipped that interval.
+- **Under disk pressure the grace shrinks.** When the workspace volume is at
+  or above `janitor_warn_pct` as a sweep starts, the grace drops to
+  `janitor_pressure_grace_minutes` (default 120 — past the 90-minute
+  stale-round window). Candidates are taken **oldest first** across every hub,
+  and before each removal only the shorter grace allows, the volume is read
+  again: the sweep stops shrinking the grace the moment it is back under the
+  line, or when nothing unheld is left. Held folders are never removed, and
+  folders past the normal grace go as always. A dry run reports every folder
+  the shorter grace would allow.
 - **One sweep is bounded** to 25 removals and 120 seconds, checked before
   each removal. Unheld stale folders past the bound are **deferred** to the
   next interval, so a large backlog drains over several sweeps instead of
@@ -1299,7 +1320,18 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   hub(s); … held by a live round, … inside the grace, … failed, … deferred
   to the next interval`. When the
   workspace volume is at or above `janitor_warn_pct` (default 80; `0` = never)
-  the sweep also logs **one WARNING** with the percentage.
+  the sweep also logs **one WARNING** with the percentage, and an INFO line
+  saying the grace dropped and how many folders went only under it.
+- **A pressure episode is a loop event.** The first sweep at or above the
+  line records one `volume-pressure:` ledger row, which the loop-events
+  emitter sends as **`janitor.volume_pressure`** (no repo, no PR; `data:
+  { usedPct, warnPct, freedBytes, foldersLeft }`, `foldersLeft` null when the
+  sweep could not run; deduped on the episode's start second) — so the
+  operator surface sees a full volume, not only a log line. One event per
+  episode: the first reading back under the line closes it, and the next
+  crossing opens a new one. The episode is held in memory, so a restart
+  while still over the line reports a new episode. A dry run records nothing
+  and logs `[dry-run] janitor: would record volume-pressure:…`.
 - **`--dry-run` removes and prunes nothing**: it logs each folder it would
   remove (`[dry-run] janitor would remove <path> (<size>, <age>)`) and a
   `[dry-run] janitor: would remove N folder(s)` summary, under the same
