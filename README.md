@@ -156,7 +156,7 @@ else refused by name.
 | `authors` | `[]` | allowlist of GitHub logins whose PRs are reviewed; empty = all. A **scope filter, not the security boundary** — see *Who the loop serves* |
 | `plan_repos` | `["<owner>/alissa-dark-factory-plans"]` | the **plans repositories** — signal one of the four that make a PR a *plan PR* (see *Plan PRs*). `owner/repo`, or `<owner>/repo` for that repository name under **any** owner (the default names the repository by name only; a deployment names its own). Matched case-insensitively; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_REPOS` (`\|`/`,`-separated) wins over the file, blank falls through |
 | `plan_authors` | `[]` | the **plan generator's login(s)** — signal two of four. **Fail-closed, unlike `authors`: empty means NO PR is a plan PR**, so every PR is reviewed under the code directive until the generator's login is named. GitHub logins (`<app>[bot]` accepted), case-insensitive; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_AUTHORS` (`\|`/`,`-separated) wins over the file, blank falls through |
-| `discovery_review` | `false` | review **discovery PRs** after all (see *Discovery PRs*). Off: a PR in a `plan_repos` repository whose body carries `<!-- alissa-discovery v1 -->` on a line of its own and whose every changed path is under `knowledge-base/` gets no review round. On: every discovery PR is reviewed under the code directive like any other. A non-boolean is refused at load. No CLI flag; `ALISSA_REVIEW_DISCOVERY_REVIEW` (`1/0`, `true/false`, `yes/no`, `on/off`) wins over the file, blank falls through |
+| `discovery_review` | `false` | review **discovery PRs** after all (see *Discovery PRs*). Off: a PR in a `plan_repos` repository whose body carries `<!-- alissa-discovery v1 -->` on a line of its own and whose every changed path is under `knowledge-base/` gets no review round when its `plan-lint` run reads `Discovery-Review: none`, and exactly one light round otherwise. On: every discovery PR is reviewed under the code directive like any other. A non-boolean is refused at load. No CLI flag; `ALISSA_REVIEW_DISCOVERY_REVIEW` (`1/0`, `true/false`, `yes/no`, `on/off`) wins over the file, blank falls through |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
@@ -675,6 +675,47 @@ lands; a dry run logs it and records nothing). Set `discovery_review: true`
 (or `ALISSA_REVIEW_DISCOVERY_REVIEW=1`) to review every discovery PR under the
 code directive like any other PR. Merging discovery PRs is orcloop's lane
 (DS-6), and the devloop discovery directive is DS-7a's.
+
+#### The light review round (issue #179)
+
+Since build-discovery design v1.1 (§3.6, lane DS-13) the skip holds only for
+findings the knowledge-base lint vouches for in full. The linter is the one
+classifier: the `plan-lint` check run on the head ends its output summary
+with `Discovery-Review: none` or `Discovery-Review: light — <reasons>`
+(`external cites: <n>`, `high impact: <question ids>`), and revloop reads
+that line off the run (`CheckContext.summary`, from `check_rollup`) — never
+its own reading of `findings.md`. For a discovery PR (all three signals,
+`discovery_review` off):
+
+| The head's `plan-lint` line | What revloop does |
+|---|---|
+| `Discovery-Review: none` | the skip above, unchanged — no round, one activity line per head |
+| `Discovery-Review: light — …` | **round 1 under `DISCOVERY_LIGHT_DIRECTIVE`**, cap 1 |
+| missing or unreadable — no `plan-lint` run, a summary whose last non-empty line is neither shape, an unreadable rollup, the Actions fallback (which carries no output) | light, the safe reading |
+| not reported yet — the `plan-lint` run still running, or absent while other checks run | held (`QUEUED`, `checks.held`) up to `checks_spawn_wait_seconds`, then light; with the bound at 0, light at once |
+| light, but the `plan-lint` run concluded anything but `success` | held, unbounded: the one round is not spent on a head the lint refused (devloop's fix edge pushes a new one) |
+
+The light directive quotes its rubric **by path** —
+`alissa-code-review:references/discovery-light.md` (skills lane DS-17) holds
+the five questions, the read budget and the severity rule — and states only
+what the daemon relies on: the rubric replaces `rubric.md`, the round's cap
+is 1, everything K1–K8 check is the lint's, target code is read with `gh api`
+at the pinned SHA and never cloned, and an approve carries
+`Merge-Readiness: auto` (a request_changes carries `operator — verdict is
+request_changes`). The shell, reviewer, cap, CI-gate and close-the-round
+clauses are the code directive's. It creates one review task, as any round
+does; the activity line reads `round 1 of 1`.
+
+**No second round.** Once a round is recorded on a discovery PR — its
+verdict in, at the reviewed head or after the fix push — the PR is skipped
+with `… round(s) already recorded and the light round's cap is 1 — no second
+round`, with no rollup read and no cap-out escalation: orcloop merges the fix
+head on the lint of record (§3.5). A round 1 already spawned (in flight, or
+stale and re-enqueued) stays the light round whatever a later head's line
+says. The line is read once per head once its run has completed;
+`discovery_review: true` still sends every discovery PR through the code
+directive, unchanged. The code, plan and fix directives are byte-identical
+(both code templates are now pinned by digest beside the light one).
 
 ### Never approve a red head: the CI checks gate
 

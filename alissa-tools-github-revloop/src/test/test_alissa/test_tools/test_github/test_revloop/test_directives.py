@@ -15,6 +15,7 @@ import pytest
 from alissa.tools.github.revloop.alissa import COMMIT_READINESS_CLASSES
 from alissa.tools.github.revloop.loop import (
     CHECKS_AT_SPAWN_RED,
+    DISCOVERY_LIGHT_DIRECTIVE,
     PLAN_ROUND_1_DIRECTIVE,
     PLAN_ROUND_K_DIRECTIVE,
     PLAN_RUBRIC,
@@ -428,3 +429,88 @@ def test_the_code_directives_are_untouched_by_the_plan_lane():
     for template in (ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE):
         assert "Commit-Readiness" not in template
         assert "PLAN" not in template
+
+
+# -- the discovery light directive (issue #179; design §3.6, DS-13) -----------
+
+# Pinned by digest like the plan templates, and for the same reason: every
+# clause is load-bearing. The code directives are pinned beside it -- issue
+# #179 c5 is that the light lane leaves them byte for byte as they were.
+LIGHT_TEMPLATE_SHA256 = "9ce6fb314436a572d75b01b869e1b8042278b3995d203626cc8e559cda8c116e"
+CODE_TEMPLATE_SHA256 = {
+    "round-1": "4499f865268d5e34e3edc7051bcebaa1c22146c64cd93f053c11087486525be2",
+    "round-k": "865b1cd4c75e58a432148a70643ed3d2eb2e82e8b54dcd3c06fbabe3ee91d0f9",
+}
+
+
+def test_the_light_template_is_pinned_by_digest():
+    digest = hashlib.sha256(DISCOVERY_LIGHT_DIRECTIVE.encode("utf-8")).hexdigest()
+    assert digest == LIGHT_TEMPLATE_SHA256, (
+        f"the discovery light directive changed; if on purpose, re-pin it to {digest}"
+    )
+
+
+@pytest.mark.parametrize(
+    "name, template", [("round-1", ROUND_1_DIRECTIVE), ("round-k", ROUND_K_DIRECTIVE)]
+)
+def test_the_code_templates_are_pinned_by_digest(name, template):
+    digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+    assert digest == CODE_TEMPLATE_SHA256[name], (
+        f"the {name} code directive changed; if on purpose, re-pin it to {digest}"
+    )
+
+
+def test_the_light_directive_quotes_the_rubric_by_path_and_never_inlines_it():
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert "Load the alissa-code-review skill" in text
+    assert "`alissa-code-review:references/discovery-light.md`" in text
+    assert "instead of `rubric.md`" in text
+    # The five questions are the reference's, not the directive's.
+    for question in (
+        "Answers the question.", "Sources support the claims.",
+        "Spot-checked links.", "No stale facts.", "Recommendation justified.",
+    ):
+        assert question not in text
+    assert "plan-directive.md" not in text and "Commit-Readiness" not in text
+
+
+def test_the_light_directive_states_one_round_and_no_mechanics():
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert "THIS IS THE ONLY ROUND" in text
+    assert "the light round's cap is 1" in text
+    assert "EFFECTIVE round cap is 1" in text
+    assert "NOTHING MECHANICAL IS YOURS" in text
+    assert "K1–K8" in text and "never request changes on one" in text
+    assert "NEVER clone a target repository" in text
+
+
+def test_the_light_directive_states_the_merge_readiness_rules():
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert "carries `Merge-Readiness: auto` and never a class" in text
+    assert "`Merge-Readiness: operator — verdict is request_changes`" in text
+    assert "first line under `## Summary`" in text
+    assert "bare last non-empty line" in text
+    assert "do not walk the code checklist" in text
+
+
+def test_the_light_directive_keeps_every_shared_clause():
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert _SHELL_RULE in text and _REVIEWER_RULE in text
+    assert "CI GATE — before you submit ANY verdict" in text
+    assert "CLOSE THE ROUND" in text
+    assert "NEVER push commits, merge, or change PR state." in text
+    assert "Do NOT create further ali-* sessions." in text
+    assert text.rstrip().endswith(
+        "run `alissa tmux kill review-plans-pr7-r2-abc123`. Do nothing after it."
+    )
+
+
+def test_the_light_directive_formats_every_slot():
+    out = render_plan(
+        DISCOVERY_LIGHT_DIRECTIVE,
+        cap=1,
+        credential=_POST_AS_REVIEWER.format(env_var="REV_TOKEN", reviewer="alissa-app"),
+        checks=CHECKS_AT_SPAWN_RED.format(sha="abc123", failing="plan-lint (failure)"),
+        stability="STABILITY. ",
+    )
+    assert "{" not in out and "}" not in out.replace("${REV_TOKEN}", "")
