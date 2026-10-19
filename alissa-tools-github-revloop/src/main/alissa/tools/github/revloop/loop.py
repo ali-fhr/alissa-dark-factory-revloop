@@ -1276,22 +1276,32 @@ DISCOVERY_MARKER = "<!-- alissa-discovery v1 -->"
 DISCOVERY_PREFIX = "knowledge-base/"
 
 
-def discovery_marked(config: Config, pr: PullRequest) -> bool:
+def plan_repo_marked(config: Config, pr: PullRequest, marker: str) -> bool:
     """The two signals readable without a GitHub call: the plans repository
-    and the marker on a line of its own (the plan marker's rule)."""
+    and `marker` on a line of its own (the plan marker's rule)."""
     if not config.is_plan_repo(pr.full_name):
         return False
     body = pr.body.replace("\r\n", "\n")
-    return any(line.strip() == DISCOVERY_MARKER for line in body.split("\n"))
+    return any(line.strip() == marker for line in body.split("\n"))
+
+
+def discovery_marked(config: Config, pr: PullRequest) -> bool:
+    """A plans-repository PR carrying the discovery marker."""
+    return plan_repo_marked(config, pr, DISCOVERY_MARKER)
+
+
+def outside_prefix(paths: "list[str]", prefix: str) -> "list[str]":
+    """The changed paths NOT under `prefix`. An empty diff answers with a
+    placeholder rather than nothing: "every path is confined" must not hold
+    vacuously for a PR that changes no path at all."""
+    if not paths:
+        return ["(no changed files)"]
+    return [p for p in paths if not p.startswith(prefix)]
 
 
 def outside_discovery_prefix(paths: "list[str]") -> "list[str]":
-    """The changed paths NOT under `knowledge-base/`. An empty diff answers
-    with a placeholder rather than nothing: "every path is confined" must not
-    hold vacuously for a PR that changes no path at all."""
-    if not paths:
-        return ["(no changed files)"]
-    return [p for p in paths if not p.startswith(DISCOVERY_PREFIX)]
+    """The changed paths NOT under `knowledge-base/`."""
+    return outside_prefix(paths, DISCOVERY_PREFIX)
 
 
 def discovery_skip_kind(head_sha: str) -> str:
@@ -1299,6 +1309,35 @@ def discovery_skip_kind(head_sha: str) -> str:
     per head, since the review request stands and the skip is re-decided on
     every poll."""
     return f"activity-discovery-skip:{head_sha}"
+
+
+# -- the integration-check skip (issue #181; integration-check design §3.6, IC-4)
+#
+# An INTEGRATION-CHECK PR is an integration check's report: one run directory
+# under the plans repository's `integration-check/`. Its defences are the lint
+# (I3-I6), the evidence the report must cite and the person reading it at
+# Validate, so a judgment review would only add a session per check -- revloop
+# starts NO round on it, the discovery skip's v0.1 shape with no light round.
+#
+# All THREE signals, or it is not an integration-check PR: the repository is
+# in `plan_repos`, the body carries the integration-check marker on a line of
+# its own, and EVERY changed path is under `integration-check/`. Anything
+# else -- or files that cannot be read in full -- is reviewed under the CODE
+# directive. The fleet flag `integration_check_review`
+# (config.INTEGRATION_CHECK_REVIEW_ENV) turns the skip off.
+INTEGRATION_CHECK_MARKER = "<!-- alissa-integration-check v1 -->"
+INTEGRATION_CHECK_PREFIX = "integration-check/"
+
+
+def integration_check_marked(config: Config, pr: PullRequest) -> bool:
+    """A plans-repository PR carrying the integration-check marker."""
+    return plan_repo_marked(config, pr, INTEGRATION_CHECK_MARKER)
+
+
+def integration_check_skip_kind(head_sha: str) -> str:
+    """The skip's activity-line ledger kind: one line per head, as for
+    discovery (`discovery_skip_kind`)."""
+    return f"activity-integration-check-skip:{head_sha}"
 
 
 # -- the light review round (issue #179; build-discovery design §3.6, DS-13) --
@@ -2874,12 +2913,12 @@ class ReviewWatcher:
         # hold a place forever.
         self._waiting: dict[tuple[str, int], Waiting] = {}
         self._wait_seq = 0
-        # The discovery skip's file reads (issue #171), keyed by (repo, PR,
-        # head): the changed paths outside `knowledge-base/` at that head. A
+        # The discovery and integration-check skips' file reads (issues #171,
+        # #181), keyed by (repo, PR, head): the head's changed paths. A
         # skipped PR keeps its review request, so it is re-decided every poll,
         # and a head's file list never changes -- one paged read per head, not
         # one per poll. Only successful reads are kept; a failed one retries.
-        self._discovery_outside: "dict[tuple[str, int, str], list[str]]" = {}
+        self._changed_paths: "dict[tuple[str, int, str], list[str]]" = {}
         # The light round's review-line reads (issue #179), keyed the same
         # way: only a SETTLED line (a completed `plan-lint` run) is kept, so
         # a pending or unreadable read retries next poll. And the heads whose
@@ -3369,7 +3408,13 @@ class ReviewWatcher:
         # cannot be read) passes on to round 1 under the light directive, and
         # one with a round already recorded is skipped -- the cap of 1 is
         # enforced here, so the cap-out escalation below never fires for it.
+        #
+        # THE INTEGRATION-CHECK SKIP (issue #181) sits with it, for the same
+        # reasons; it has no light round, so a marked, confined PR is skipped
+        # whatever `completed` says.
         skipped = self._discovery_skip(pr, completed)
+        if skipped is None:
+            skipped = self._integration_check_skip(pr)
         if skipped is not None:
             return skipped
 
@@ -3549,32 +3594,7 @@ class ReviewWatcher:
             )
             return None
 
-        key = (pr.full_name, pr.number, pr.head_sha)
-        outside = self._discovery_outside.get(key)
-        if outside is None:
-            try:
-                paths = self.github.pull_request_files(pr.owner, pr.repo, pr.number)
-            except RateLimited:
-                # Throttling is not a fact about the diff (the stability
-                # guard's rule): raised on, so the poll backs off.
-                raise
-            except (CommandError, TruncatedListing) as exc:
-                log.warning(
-                    "%s carries the discovery marker but its changed files "
-                    "cannot be read in full — reviewing under the code "
-                    "directive: %s",
-                    pr.slug, exc,
-                )
-                return None
-            outside = outside_discovery_prefix(paths)
-            self._discovery_outside[key] = outside
-
-        if outside:
-            log.info(
-                "%s carries the discovery marker but changes %d path(s) outside "
-                "%s (first: %s) — reviewing under the code directive",
-                pr.slug, len(outside), DISCOVERY_PREFIX, outside[0],
-            )
+        if not self._confined_to(pr, DISCOVERY_PREFIX, "discovery"):
             return None
 
         signals = (
@@ -3584,8 +3604,9 @@ class ReviewWatcher:
         if completed >= DISCOVERY_LIGHT_CAP:
             # No rollup read: whatever the line says now, the PR's one round
             # is spent, and its fix head merges on the lint of record (§3.5).
-            return self._skip_discovery(
+            return self._skip_marked(
                 pr,
+                discovery_skip_kind(pr.head_sha),
                 f"{signals}; {completed} round(s) already recorded and the "
                 f"light round's cap is {DISCOVERY_LIGHT_CAP} — no second round "
                 f"(the fix head merges on the `{PLAN_LINT_CHECK}` run of record)",
@@ -3626,8 +3647,9 @@ class ReviewWatcher:
                 self._discovery_lines[key] = line
 
         if line.level == DISCOVERY_REVIEW_NONE:
-            return self._skip_discovery(
+            return self._skip_marked(
                 pr,
+                discovery_skip_kind(pr.head_sha),
                 f"{signals}; `{PLAN_LINT_CHECK}` reads `Discovery-Review: none` "
                 f"— no review round (discovery_review is off)",
             )
@@ -3682,10 +3704,74 @@ class ReviewWatcher:
         self._discovery_held_logged.add(seen)
         log.log(level, "%s: %s", pr.slug, reason)
 
-    def _skip_discovery(self, pr: PullRequest, reason: str) -> Decision:
-        """The SKIPPED decision for a discovery PR, with its one activity
-        line per head (see `_discovery_skip`)."""
-        kind = discovery_skip_kind(pr.head_sha)
+    def _confined_to(self, pr: PullRequest, prefix: str, what: str) -> bool:
+        """Whether every path the PR's head changes is under `prefix` -- the
+        third signal of the discovery and integration-check skips. False (and
+        a log line saying why) when one is not, or when the files cannot be
+        read in full: the code directive is the safe reading. `what` names
+        the marker in that line."""
+        key = (pr.full_name, pr.number, pr.head_sha)
+        paths = self._changed_paths.get(key)
+        if paths is None:
+            try:
+                paths = self.github.pull_request_files(pr.owner, pr.repo, pr.number)
+            except RateLimited:
+                # Throttling is not a fact about the diff (the stability
+                # guard's rule): raised on, so the poll backs off.
+                raise
+            except (CommandError, TruncatedListing) as exc:
+                log.warning(
+                    "%s carries the %s marker but its changed files cannot be "
+                    "read in full — reviewing under the code directive: %s",
+                    pr.slug, what, exc,
+                )
+                return False
+            self._changed_paths[key] = paths
+
+        outside = outside_prefix(paths, prefix)
+        if outside:
+            log.info(
+                "%s carries the %s marker but changes %d path(s) outside %s "
+                "(first: %s) — reviewing under the code directive",
+                pr.slug, what, len(outside), prefix, outside[0],
+            )
+            return False
+        return True
+
+    # -- the integration-check skip (issue #181) ---------------------------
+
+    def _integration_check_skip(self, pr: PullRequest) -> Decision | None:
+        """A SKIPPED decision for an integration-check PR, or None to review
+        it under the code directive -- whenever any of the three signals
+        fails, the files cannot be read in full, or the fleet flag
+        `integration_check_review` is on. The cheap signals are read first,
+        so an unmarked PR never costs a files read. One activity line per
+        head, as for discovery (`_skip_marked`)."""
+        if not integration_check_marked(self.config, pr):
+            return None
+        if self.config.integration_check_review:
+            log.debug(
+                "%s carries the integration-check marker but "
+                "integration_check_review is on — reviewing under the code "
+                "directive",
+                pr.slug,
+            )
+            return None
+        if not self._confined_to(pr, INTEGRATION_CHECK_PREFIX, "integration-check"):
+            return None
+        return self._skip_marked(
+            pr,
+            integration_check_skip_kind(pr.head_sha),
+            f"integration-check PR — plans repository, "
+            f"`{INTEGRATION_CHECK_MARKER}` marker, every changed path under "
+            f"`{INTEGRATION_CHECK_PREFIX}`; no review round "
+            f"(integration_check_review is off)",
+        )
+
+    def _skip_marked(self, pr: PullRequest, kind: str, reason: str) -> Decision:
+        """The SKIPPED decision for a discovery or integration-check PR, with
+        its one activity line per head under the ping-ledger `kind` (see
+        `_discovery_skip`)."""
         if not self.state.pinged(pr.full_name, pr.number, kind):
             log.info("%s at %s: skipping review — %s", pr.slug, pr.head_sha[:8], reason)
             if self._append_activity(

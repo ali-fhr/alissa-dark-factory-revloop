@@ -129,7 +129,8 @@ and the three `repos_source: bows` keys — `repos_source`
 Work*), and the two plan-directive allowlists — `plan_repos`
 (`ALISSA_REVIEW_PLAN_REPOS`) and `plan_authors` (`ALISSA_REVIEW_PLAN_AUTHORS`;
 see *Plan PRs*), the discovery flag `discovery_review`
-(`ALISSA_REVIEW_DISCOVERY_REVIEW`; see *Discovery PRs*), and the five workspace-janitor keys — `janitor_enabled`
+(`ALISSA_REVIEW_DISCOVERY_REVIEW`; see *Discovery PRs*), the integration-check flag `integration_check_review`
+(`ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW`; see *Integration-check PRs*), and the five workspace-janitor keys — `janitor_enabled`
 (`ALISSA_REVIEW_JANITOR_ENABLED`), `janitor_grace_minutes`
 (`ALISSA_REVIEW_JANITOR_GRACE_MINUTES`), `janitor_interval_minutes`
 (`ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES`), `janitor_warn_pct`
@@ -157,6 +158,7 @@ else refused by name.
 | `plan_repos` | `["<owner>/alissa-dark-factory-plans"]` | the **plans repositories** — signal one of the four that make a PR a *plan PR* (see *Plan PRs*). `owner/repo`, or `<owner>/repo` for that repository name under **any** owner (the default names the repository by name only; a deployment names its own). Matched case-insensitively; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_REPOS` (`\|`/`,`-separated) wins over the file, blank falls through |
 | `plan_authors` | `[]` | the **plan generator's login(s)** — signal two of four. **Fail-closed, unlike `authors`: empty means NO PR is a plan PR**, so every PR is reviewed under the code directive until the generator's login is named. GitHub logins (`<app>[bot]` accepted), case-insensitive; a malformed entry is refused at load. No CLI flag; `ALISSA_REVIEW_PLAN_AUTHORS` (`\|`/`,`-separated) wins over the file, blank falls through |
 | `discovery_review` | `false` | review **discovery PRs** after all (see *Discovery PRs*). Off: a PR in a `plan_repos` repository whose body carries `<!-- alissa-discovery v1 -->` on a line of its own and whose every changed path is under `knowledge-base/` gets no review round when its `plan-lint` run reads `Discovery-Review: none`, and exactly one light round otherwise. On: every discovery PR is reviewed under the code directive like any other. A non-boolean is refused at load. No CLI flag; `ALISSA_REVIEW_DISCOVERY_REVIEW` (`1/0`, `true/false`, `yes/no`, `on/off`) wins over the file, blank falls through |
+| `integration_check_review` | `false` | review **integration-check PRs** after all (see *Integration-check PRs*). Off: a PR in a `plan_repos` repository whose body carries `<!-- alissa-integration-check v1 -->` on a line of its own and whose every changed path is under `integration-check/` gets no review round. On: every integration-check PR is reviewed under the code directive like any other. A non-boolean is refused at load. No CLI flag; `ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW` (`1/0`, `true/false`, `yes/no`, `on/off`) wins over the file, blank falls through |
 | `operators` | `[]` | GitHub logins whose re-entry ack may re-open a capped PR; empty = none |
 | `agent_profile` | `claude` | agent the worker launches for reviewer sessions |
 | `reviewer_login` | `null` | the identity every verdict is posted under; resolved from `gh api user` when null |
@@ -716,6 +718,40 @@ says. The line is read once per head once its run has completed;
 `discovery_review: true` still sends every discovery PR through the code
 directive, unchanged. The code, plan and fix directives are byte-identical
 (both code templates are now pinned by digest beside the light one).
+
+### Integration-check PRs
+
+An **integration-check PR** (issue #181; Alissa Build integration-check design
+§3.6, lane IC-4) carries an integration check's report: one run directory
+`integration-check/<YYYY>/<MM>/<DD>/<milestone>/` (`report.md` plus
+`evidence/**`) in the plans repository. Its defences are the lint (I3–I6),
+the evidence the report must cite, and the person reading it at Validate — a
+judgment review would only add a session per check. revloop therefore
+**starts no round** on it when all three signals hold:
+
+1. the repository is in `plan_repos` (`ALISSA_REVIEW_PLAN_REPOS`);
+2. the PR body carries `<!-- alissa-integration-check v1 -->` on a line of
+   its own;
+3. **every** changed path is under `integration-check/` — the same paged
+   files read as the discovery skip (a rename counts both names; an empty or
+   unreadable listing is not "confined").
+
+Anything short of that is **reviewed under the code directive, unchanged**.
+The skip sits beside the discovery skip — the same place in the decision,
+the same one activity line per head:
+
+```
+- 2026-10-19 14:00:00 UTC — skipped at `abc12345` — integration-check PR — plans repository, `<!-- alissa-integration-check v1 -->` marker, every changed path under `integration-check/`; no review round (integration_check_review is off)
+```
+
+(ledger kind `activity-integration-check-skip:<head>`). There is **no light
+round**: the skip holds whatever rounds are recorded and reads no check run.
+A round already running (started while the flag was on) still reaches its
+verdict of record. Set `integration_check_review: true` (or
+`ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW=1`) to review every integration-check
+PR under the code directive; the two flags are independent. Merging these PRs
+on the lint of record is orcloop's lane (IC-5), and the devloop directive
+that writes them is IC-3's.
 
 ### Never approve a red head: the CI checks gate
 
