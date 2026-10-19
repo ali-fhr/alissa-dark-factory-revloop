@@ -4,6 +4,27 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.21
+
+- **One light review round for discovery PRs whose `plan-lint` line reads
+  light** (issue #179; build-discovery design §3.3, §3.6, lane DS-13; origin
+  TASK-554389731, implementation TASK-856656579). A discovery PR (plans
+  repository, `<!-- alissa-discovery v1 -->`, diff confined to
+  `knowledge-base/`) is now classified by the `Discovery-Review:` line its
+  `plan-lint` check run's summary ends with: `none` keeps the issue #171 skip;
+  `light` — and a missing or unreadable line, the safe reading — starts round
+  1 under the new `DISCOVERY_LIGHT_DIRECTIVE` (rubric quoted by path as
+  `alissa-code-review:references/discovery-light.md`, cap 1, nothing
+  mechanical is the reviewer's, `Merge-Readiness: auto` on an approve). Once a
+  round is recorded the PR is skipped — no second round after the fix push,
+  no cap-out escalation. A `plan-lint` run that has not reported holds the
+  round up to `checks_spawn_wait_seconds`; a light head whose lint concluded
+  anything but success holds unbounded. `discovery_review: true` is unchanged.
+- **`CheckContext.summary`**: `check_rollup` keeps each check run's
+  `output.summary` (empty for statuses and the Actions fallback).
+- The code directives are byte-identical, and now pinned by digest in
+  `test_directives.py` beside the light directive.
+
 ## 0.31.20
 
 - **The janitor also reaps `REVIEW-*` checkouts made INSIDE `<hub>/main`**

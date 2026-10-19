@@ -284,6 +284,12 @@ class CheckContext:
     name: str
     conclusion: str = ""
     url: str = ""
+    # A check RUN's `output.summary` (issue #179): what the discovery light
+    # round reads the `plan-lint` run's `Discovery-Review:` line from. Empty
+    # for a commit status, for an Actions-fallback job (the jobs API carries
+    # no output) and for a run that published none -- each of which reads as
+    # a missing line, never as `none`.
+    summary: str = ""
 
     @property
     def running(self) -> bool:
@@ -366,6 +372,17 @@ def _completed_conclusion(payload: dict) -> str:
     """
     completed = str(payload.get("status") or "").lower() == _RUN_COMPLETED
     return str(payload.get("conclusion") or "").lower() if completed else ""
+
+
+def _run_summary(run_: dict) -> str:
+    """A check run's `output.summary`, or "" when it carries none (or an
+    `output` that is not an object -- a malformed payload is a missing
+    summary, not a crash in the rollup read)."""
+    output = run_.get("output")
+    if not isinstance(output, dict):
+        return ""
+    summary = output.get("summary")
+    return summary if isinstance(summary, str) else ""
 
 
 def _run_order(run_: dict) -> "tuple[int, int]":
@@ -995,6 +1012,7 @@ class GitHub:
                     name=str(run_.get("name") or "unnamed check"),
                     conclusion=_completed_conclusion(run_),
                     url=str(run_.get("html_url") or run_.get("details_url") or ""),
+                    summary=_run_summary(run_),
                 )
             )
         return out
