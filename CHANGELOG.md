@@ -4,6 +4,24 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.22
+
+- **No review round on integration-check PRs** (issue #181; Alissa Build
+  integration-check design §3.6, lane IC-4; origin TASK-822721872,
+  implementation TASK-802195744). A PR in a `plan_repos` repository whose
+  body carries `<!-- alissa-integration-check v1 -->` on a line of its own and
+  whose every changed path is under `integration-check/` is `SKIPPED` beside
+  the discovery skip, with one activity line per head (ledger kind
+  `activity-integration-check-skip:<head>`). No light round. A marked PR that
+  touches anything else, or whose files cannot be read in full, is reviewed
+  under the code directive.
+  - New fleet flag `integration_check_review`
+    (`ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW`, default off) reviews every one
+    under the code directive.
+  - The discovery and integration-check skips share one per-head cache of
+    the changed paths (`_changed_paths`, was `_discovery_outside`) and one
+    activity-line helper (`_skip_marked`, was `_skip_discovery`).
+
 ## 0.31.21
 
 - **One light review round for discovery PRs whose `plan-lint` line reads

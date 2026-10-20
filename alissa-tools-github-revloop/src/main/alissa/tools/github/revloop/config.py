@@ -184,6 +184,7 @@ CONFIG_KEYS = (
     "plan_repos",
     "plan_authors",
     "discovery_review",
+    "integration_check_review",
     "operators",
     "agent_profile",
     "reviewer_login",
@@ -281,6 +282,15 @@ PLAN_REPO_OWNER_PLACEHOLDER = "<owner>"
 # discovery PR is reviewed under the code directive like any other PR. Same
 # env > file > default precedence and boolean spellings as the janitor's rail.
 DISCOVERY_REVIEW_ENV = "ALISSA_REVIEW_DISCOVERY_REVIEW"
+
+# The integration-check fleet flag (issue #181; integration-check design §3.6,
+# IC-4). OFF by default: an INTEGRATION-CHECK PR -- a plans repository, the
+# integration-check marker, every changed path under `integration-check/`
+# (loop.ReviewWatcher._integration_check_skip) -- gets no review round,
+# because its defences are the lint (I3-I6), the evidence it must cite and the
+# person reading the report at Validate. ON, every one is reviewed under the
+# code directive like any other PR. Same rail as the discovery flag.
+INTEGRATION_CHECK_REVIEW_ENV = "ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW"
 DEFAULT_PLAN_REPO_NAME = "alissa-dark-factory-plans"
 DEFAULT_PLAN_REPOS: "tuple[str, ...]" = (
     f"{PLAN_REPO_OWNER_PLACEHOLDER}/{DEFAULT_PLAN_REPO_NAME}",
@@ -925,6 +935,10 @@ class Config:
     # False -- the default -- skips them.
     discovery_review: bool = False
 
+    # Review integration-check PRs after all (issue #181); see
+    # INTEGRATION_CHECK_REVIEW_ENV. False -- the default -- skips them.
+    integration_check_review: bool = False
+
     # GitHub logins whose re-entry ack may raise a capped PR's effective cap
     # (loop.parse_reentry_ack). Empty -- the default -- means NO ack is ever
     # honoured: the lever fails closed, because anyone who can comment on a PR
@@ -1309,6 +1323,18 @@ class Config:
             raise ValueError(
                 f"discovery_review must be true or false, got {discovery_review!r}"
             )
+        # The integration-check flag (issue #181), same layer, same reason.
+        env_ic = _env_bool(INTEGRATION_CHECK_REVIEW_ENV, environ)
+        if env_ic is not None:
+            raw["integration_check_review"] = env_ic
+        integration_check_review = raw.get(
+            "integration_check_review", cls.integration_check_review
+        )
+        if not isinstance(integration_check_review, bool):
+            raise ValueError(
+                "integration_check_review must be true or false, "
+                f"got {integration_check_review!r}"
+            )
 
         source = raw.get("repos_source", cls.repos_source)
         if source not in _REPOS_SOURCES:
@@ -1604,6 +1630,7 @@ class Config:
             plan_repos=plan_repos,
             plan_authors=plan_authors,
             discovery_review=discovery_review,
+            integration_check_review=integration_check_review,
             operators=operators,
             agent_profile=raw.get("agent_profile", "claude"),
             reviewer_login=raw.get("reviewer_login"),

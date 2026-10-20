@@ -14,6 +14,12 @@ unreadable one, the safe reading (c3) -- gets exactly one round under
 DISCOVERY_LIGHT_DIRECTIVE, and none after its fix push (c2);
 `discovery_review: true` still reviews every discovery PR under the code
 directive (c4).
+
+Issue #181 (integration-check design §3.6, IC-4) adds the same skip for an
+integration check's report: the plans repository, the integration-check
+marker, every changed path under `integration-check/` -- no round (c1); a
+marked PR touching anything else is reviewed under the code directive (c2);
+`integration_check_review: true` reviews every one (c3). No light round.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import alissa.tools.github.revloop.loop as loop_mod
 from alissa.tools.github.revloop.config import (
     CONFIG_KEYS,
     DISCOVERY_REVIEW_ENV,
+    INTEGRATION_CHECK_REVIEW_ENV,
     Config,
 )
 from alissa.tools.github.revloop.ghclient import (
@@ -43,11 +50,14 @@ from alissa.tools.github.revloop.loop import (
     DISCOVERY_MARKER,
     DISCOVERY_REVIEW_LIGHT,
     DISCOVERY_REVIEW_NONE,
+    INTEGRATION_CHECK_MARKER,
     Action,
     ReviewWatcher,
     discovery_marked,
     discovery_review_line,
     discovery_skip_kind,
+    integration_check_marked,
+    integration_check_skip_kind,
     outside_discovery_prefix,
 )
 from alissa.tools.github.revloop.proc import CommandError
@@ -663,3 +673,185 @@ def test_the_light_directive_is_the_one_rendered(config):
     w.evaluate(OWNER, REPO, NUMBER)
     head = DISCOVERY_LIGHT_DIRECTIVE.split("{assignment}")[0]
     assert al.enqueued[0]["directive"].startswith(head)
+
+
+# -- issue #181: the integration-check skip -----------------------------------
+
+IC_BODY = (
+    "# Integration check: shop-m1, run 1\n"
+    f"{INTEGRATION_CHECK_MARKER}\n"
+    "Alissa-Task: TASK-77\n"
+)
+IC_FILES = [
+    "integration-check/2026/10/19/shop-m1/report.md",
+    "integration-check/2026/10/19/shop-m1/evidence/build.log",
+    "integration-check/2026/10/19/shop-m1/evidence/c1-checkout-1440.png",
+]
+
+
+def ic_watcher(config, pr=None, **kw):
+    w, gh, al = discovery_watcher(config, pr or make_pr(body=IC_BODY), **kw)
+    gh.files = list(IC_FILES)
+    return w, gh, al
+
+
+def test_ic_c1_a_confined_marked_pr_gets_no_round_and_no_review_task(config):
+    w, gh, al = ic_watcher(config)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED
+    assert "integration-check PR" in d.reason and "integration-check/" in d.reason
+    assert "integration_check_review is off" in d.reason
+    assert al.enqueued == [] and al.task is None and gh.submitted == []
+    assert w.state.get_spawn(SLUG, NUMBER, 1) is None
+
+
+def test_ic_c1_the_skip_is_logged_once_per_head(config):
+    w, gh, al = ic_watcher(config)
+
+    for _ in range(3):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+
+    [comment] = activity_comments(gh)
+    assert comment.body.count("skipped at `abc123`") == 1
+    assert gh.files_reads == 1
+    assert w.state.pinged(SLUG, NUMBER, integration_check_skip_kind("abc123"))
+    assert not w.state.pinged(SLUG, NUMBER, discovery_skip_kind("abc123"))
+
+    gh.move_head("def456")
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+    [comment] = activity_comments(gh)
+    assert comment.body.count("skipped at") == 2
+
+
+def test_ic_c1_no_light_round_a_recorded_round_still_skips(config):
+    """Unlike discovery there is no light round and no lint read: the skip
+    holds whatever `completed` says and never reads the check rollup."""
+    w, gh, al = ic_watcher(config, reviews=[review("COMMENTED")])
+    gh.default_rollup = lint_rollup(lint_run(REPORT_HEAD + LIGHT_LINE))
+    gh.check_rollup = lambda *a: pytest.fail("the IC skip reads no rollup")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+    assert al.enqueued == []
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        IC_FILES + ["README.md"],
+        IC_FILES + ["knowledge-base/2026/10/19/TASK-1/findings.md"],
+        ["integration-check/x/report.md", "plans/2026-10-19-x/plan.md"],
+        ["integration-checks/x/report.md"],   # a sibling prefix is not the prefix
+        [],                                   # an empty diff is not "confined"
+    ],
+)
+def test_ic_c2_a_marked_pr_touching_anything_else_gets_the_code_directive(config, files):
+    w, gh, al = ic_watcher(config)
+    gh.files = files
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 1
+    assert_code_directive(al)
+    assert all("skipped at" not in c.body for c in activity_comments(gh))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CommandError(["gh", "api"], 1, "HTTP 502"),
+        TruncatedListing("acme/widgets#7 reached GitHub's 3000-file listing cap"),
+    ],
+)
+def test_ic_c2_unreadable_files_are_a_code_review(config, error):
+    w, gh, al = ic_watcher(config)
+    gh.files_error = error
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert_code_directive(al)
+
+
+def test_ic_c2_throttling_while_reading_files_backs_the_poll_off(config):
+    w, gh, al = ic_watcher(config)
+    gh.files_error = RateLimited("API rate limit exceeded")
+
+    with pytest.raises(RateLimited):
+        w.evaluate(OWNER, REPO, NUMBER)
+    assert al.enqueued == []
+
+
+@pytest.mark.parametrize(
+    "config_kw, body",
+    [
+        ({"plan_repos": ("acme/alissa-dark-factory-plans",)}, IC_BODY),  # not a plans repo
+        ({}, "# Integration check\nno marker here\n"),
+        ({}, f"see {INTEGRATION_CHECK_MARKER} inline\n"),
+        ({}, "<!-- alissa-integration-check v2 -->\n"),
+        ({}, DISCOVERY_BODY),                  # the discovery marker is not this one
+    ],
+)
+def test_ic_c2_an_unmarked_or_out_of_repo_pr_is_reviewed(config, config_kw, body):
+    w, gh, al = ic_watcher(dataclasses.replace(config, **config_kw), make_pr(body=body))
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert_code_directive(al)
+
+
+def test_ic_the_marker_survives_crlf_and_surrounding_whitespace(config):
+    pr = make_pr(body=f"# IC\r\n   {INTEGRATION_CHECK_MARKER}  \r\n")
+    assert integration_check_marked(config, pr)
+
+
+def test_ic_c3_the_flag_reviews_every_one_under_the_code_directive(config):
+    w, gh, al = ic_watcher(dataclasses.replace(config, integration_check_review=True))
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED
+    assert_code_directive(al)
+    assert gh.files_reads == 0  # the flag short-circuits the files read
+
+
+def test_ic_c3_the_flags_are_independent(config):
+    w, gh, al = ic_watcher(dataclasses.replace(config, discovery_review=True))
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+
+    w, gh, al = discovery_watcher(dataclasses.replace(config, integration_check_review=True))
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+
+
+def test_ic_a_round_already_running_still_converges(config):
+    w, gh, al = ic_watcher(
+        config, reviews=[review("COMMENTED")], task=FakeTask(), verdict="approve"
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.CONVERGED
+    assert gh.files_reads == 0
+
+
+def test_integration_check_review_is_off_by_default_and_a_known_key(tmp_path):
+    assert "integration_check_review" in CONFIG_KEYS
+    assert Config.build(tmp_path, {}, environ={}).integration_check_review is False
+    assert Config.build(
+        tmp_path, {"integration_check_review": True}, environ={}
+    ).integration_check_review
+
+
+@pytest.mark.parametrize(
+    "file_value, env_value, expect",
+    [(False, "on", True), (True, "0", False), (True, " ", True), (False, "", False)],
+)
+def test_the_ic_env_rail_wins_over_the_file(tmp_path, file_value, env_value, expect):
+    cfg = Config.build(
+        tmp_path, {"integration_check_review": file_value},
+        environ={INTEGRATION_CHECK_REVIEW_ENV: env_value},
+    )
+    assert cfg.integration_check_review is expect
+
+
+def test_a_malformed_ic_value_is_refused(tmp_path):
+    with pytest.raises(ValueError, match=INTEGRATION_CHECK_REVIEW_ENV):
+        Config.build(tmp_path, {}, environ={INTEGRATION_CHECK_REVIEW_ENV: "maybe"})
+    with pytest.raises(ValueError, match="integration_check_review must be true or false"):
+        Config.build(tmp_path, {"integration_check_review": "false"}, environ={})
