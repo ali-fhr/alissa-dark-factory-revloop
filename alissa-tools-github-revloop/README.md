@@ -36,6 +36,19 @@ flag `discovery_review` (`ALISSA_REVIEW_DISCOVERY_REVIEW`, default off) turns
 the skip off: every discovery PR is then reviewed like any other. See
 *Discovery PRs* in the repository README.
 
+## Integration-check PRs are not reviewed
+
+A PR in a plans repository (`plan_repos`, `ALISSA_REVIEW_PLAN_REPOS`) whose
+body carries `<!-- alissa-integration-check v1 -->` on a line of its own and
+whose every changed path is under `integration-check/` gets **no review
+round** either — the same skip, beside the discovery one, with one
+activity-comment line per head. There is no light round. A marked PR that
+touches anything else (or whose file list cannot be read in full) is reviewed
+under the code directive, unchanged. The fleet flag `integration_check_review`
+(`ALISSA_REVIEW_INTEGRATION_CHECK_REVIEW`, default off) turns the skip off:
+every integration-check PR is then reviewed like any other. The two flags are
+independent. See *Integration-check PRs* in the repository README.
+
 ## Install
 
 ```sh
