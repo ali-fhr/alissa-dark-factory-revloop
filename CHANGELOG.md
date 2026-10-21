@@ -4,6 +4,42 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.28
+
+- **Fleet auto-upgrade, the revloop self-hosted path** (issue #193, MDF M6
+  AU-6; origin TASK-832158417, implementation TASK-1202294679). A port of
+  devloop's AU-4 and orcloop's AU-5, so the three seats behave the same way.
+  - **The vitals answer is read.** `fleet_vitals.py` parses the answer's
+    `upgrade` block (`mode`, `target`, `autoUpgrade`, `paused`, `drain`) and
+    keeps the last one. An answer without it (an older Studio) changes
+    nothing. A malformed block is ignored, never read as a partial one.
+  - **Drain, through the seat-drain gate.** While `drain` is true, or while
+    a self-hosted seat has a target to move to (`autoUpgrade`, not
+    `paused`, `target.version` strictly newer than the running version and
+    not on the skip list), `_claim_spawn` stands every round down as the
+    QUEUED `drained` stage a parking drain gives, on the first claim and on
+    the post-hub re-claim. Running reviews finish. One INFO line per change
+    of state.
+  - **Self-upgrade at idle** (new `self_upgrade.py`, self-hosted only).
+    After two consecutive polls with no live reviewer session and no
+    undispatched item in `alissa tmux queue ls`, the daemon writes
+    `/workspace/.alissa-upgrade/revloop.json` (`ALISSA_UPGRADE_DIR`
+    overrides the directory) and exits 0. The entrypoint then exits 75, so
+    "on failure" restart policies restart the container too.
+  - **Boot-time install, confirm, roll back** (`entrypoint.sh` step 0a,
+    root pass, daemon role, before the firewall). An unconfirmed target is
+    `pip install`ed with 3 tries. The daemon confirms it after its first
+    answered poll. A failed install, or a request still unconfirmed after 2
+    boots or 10 min, reinstalls `previous`, puts the target on the skip list
+    and leaves an `upgradeFailed: {version, reason}` report that the next
+    vitals post carries once. A newer target clears the skip list. A failed
+    step only warns; the installed version boots.
+  - **Never a downgrade.** A target at or below the running version (numeric
+    `X.Y.Z`; unparseable counts as not newer) never drains nor writes a
+    request, and the entrypoint refuses one too (`not_newer`).
+  - Never while `paused`, never in `managed` mode, never with a live
+    session.
+
 ## 0.31.27
 
 - **Two held walks that each need several sweeps take turns** (issue #191,

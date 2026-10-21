@@ -18,3 +18,16 @@ def isolated_claude_home(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(ccdir))
     return home, ccdir
+
+
+@pytest.fixture(autouse=True)
+def scratch_upgrade_dir(tmp_path_factory, monkeypatch):
+    """Point the self-upgrade request file (issue #193) at a scratch
+    directory for EVERY test.
+
+    Every `ReviewWatcher` builds a `SelfUpgrader` whose default directory is
+    the container's `/workspace/.alissa-upgrade`; a test that feeds it a
+    vitals answer must never read or write the seat's real request file."""
+    root = tmp_path_factory.mktemp("alissa-upgrade")
+    monkeypatch.setenv("ALISSA_UPGRADE_DIR", str(root))
+    return root

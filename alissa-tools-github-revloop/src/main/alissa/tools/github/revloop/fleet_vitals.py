@@ -65,6 +65,16 @@ out-of-pass push leaves it out (that process never resolves the feed
 authority nor refreshes the allowlist, so its answer would be a different
 one). A Studio whose strict schema predates the block gets the `idle`
 treatment: resent without it, offered again after BLOCK_REPROBE_S.
+
+Fleet auto-upgrade (issue #193, Studio AU-1) makes the ANSWER matter: every
+answer carries an `upgrade` block (`self_upgrade.parse_upgrade`; absent on an
+older Studio). The pusher keeps the last one read (`FleetVitalsPusher.upgrade`)
+and hands each answer to the daemon's `SelfUpgrader`, which drains and
+upgrades on it. The request side gains `upgradeFailed: {version, reason}`,
+the seat's report that a version would not start and was rolled back: sent
+once, on the next snapshot after the rollback, and treated like the other
+optional blocks by a Studio that refuses it. The console's pusher has no
+upgrader: it reads the answer and acts on nothing.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from . import parking
+from . import self_upgrade as self_upgrade_mod
 from .alissa import parse_session_name, session_repo_slug
 from .alissa_client import (
     NOT_ACTIVATED,
@@ -120,8 +131,9 @@ VITALS_FAILED = "failed"
 # naming one of them is an old Studio, not a bad snapshot.
 #
 # `diskUsedPct` (issue #167) joins them: the workspace volume's used percent,
-# which Studio's schema may not carry yet.
-OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct")
+# which Studio's schema may not carry yet. `upgradeFailed` (issue #193, the
+# fleet auto-upgrade report) joins them for the same reason.
+OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct", "upgradeFailed")
 
 # How long a snapshot leaves an optional block out after Studio refused it as
 # an unknown key, before it offers the block again. An hour: one extra POST
@@ -501,6 +513,7 @@ class FleetVitalsPusher:
         *,
         clock: Callable[[], float] = time.time,
         config_reader: "Callable[[], Mapping | None] | None" = None,
+        upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
     ):
         self.config = config
         self._sources = sources
@@ -517,6 +530,12 @@ class FleetVitalsPusher:
         # Per optional block: until when it is left out (Studio refused it
         # as an unknown key). Absent = offer it.
         self._refused_until: "dict[str, float]" = {}
+        # The daemon's self-upgrade state (issue #193), or None -- the
+        # console's pusher -- to read the answer and act on nothing.
+        self.upgrader = upgrader
+        # The last `upgrade` block a vitals answer carried (issue #193), kept
+        # across answers that lack one.
+        self.upgrade: "self_upgrade_mod.UpgradeAnswer | None" = None
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
@@ -568,6 +587,9 @@ class FleetVitalsPusher:
                 type(exc).__name__, exc,
             )
             return VITALS_FAILED
+        report = self._upgrade_report()
+        if report is not None:
+            snapshot["upgradeFailed"] = report
         now = self._clock()
         for key, until in self._refused_until.items():
             if now < until:
@@ -587,6 +609,34 @@ class FleetVitalsPusher:
         snaps = self._sources.snapshots(1)
         heartbeat = snaps[0]["ts"] if snaps else self._clock()
         return self.push_once(heartbeat_at=heartbeat, queue_depth=None)
+
+    def _upgrade_report(self) -> "dict | None":
+        """The `upgradeFailed` report owed to Studio, or None. A reader that
+        fails costs the report this pass, never the snapshot."""
+        if self.upgrader is None:
+            return None
+        try:
+            return self.upgrader.report()
+        except Exception as exc:
+            log.warning("fleet-vitals: could not read the upgrade report (%s)", exc)
+            return None
+
+    def _answered(self, answer: object, snapshot: "Mapping") -> None:
+        """Read one successful answer: keep its `upgrade` block and hand it
+        to the upgrader, then mark a carried `upgradeFailed` delivered.
+        Never raises: the push already succeeded."""
+        try:
+            parsed = self_upgrade_mod.parse_upgrade(answer)
+            if parsed is not None:
+                self.upgrade = parsed
+            if self.upgrader is None:
+                return
+            self.upgrader.observe(answer)
+            sent = snapshot.get("upgradeFailed")
+            if isinstance(sent, Mapping):
+                self.upgrader.reported(sent)
+        except Exception as exc:
+            log.warning("fleet-vitals: could not read the upgrade answer (%s)", exc)
 
     @staticmethod
     def _refused_blocks(exc: AlissaError, snapshot: dict) -> "list[str]":
@@ -630,6 +680,7 @@ class FleetVitalsPusher:
                 return self._post(trimmed)
             self._warn_failed(exc)
             return VITALS_FAILED
+        self._answered(result, snapshot)
         log.info(
             "fleet-vitals: pushed (%s; replaced=%s)",
             describe(snapshot), result.get("replaced"),
@@ -698,6 +749,7 @@ def build_pusher(
     github: object = None,
     endpoint: "str | None" = None,
     config_reader: "Callable[[], Mapping | None] | None" = None,
+    upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
 ) -> FleetVitalsPusher:
     """The pusher the watcher wires in when `fleet_vitals_enabled` is on.
 
@@ -709,8 +761,8 @@ def build_pusher(
     at construction, because a daemon must boot and poll whether or not
     vitals can authenticate. The import is local because `sources` imports
     `loop`, which imports this module. `config_reader` is the daemon's
-    `config` block source (issue #159); the console builds its own pusher
-    without one.
+    `config` block source (issue #159), and `upgrader` its self-upgrade
+    state (issue #193); the console builds its own pusher without either.
     """
     from .version import version
     from .webui.sources import Sources
@@ -722,5 +774,5 @@ def build_pusher(
     )
     return FleetVitalsPusher(
         config, sources, AlissaClient(base=endpoint),
-        config_reader=config_reader,
+        config_reader=config_reader, upgrader=upgrader,
     )

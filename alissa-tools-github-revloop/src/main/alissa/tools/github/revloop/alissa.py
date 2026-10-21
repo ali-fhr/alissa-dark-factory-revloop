@@ -1576,6 +1576,16 @@ class Alissa:
                 )
         return sessions
 
+    def list_queues(self) -> object:
+        """`alissa tmux queue ls --json`, parsed, or None when the CLI does
+        not answer (`parking.queued_items` reads None as unknown, never
+        empty). Read by the self-upgrade idle check only (issue #193)."""
+        try:
+            return run_json(["alissa", "tmux", "queue", "ls", "--json"], timeout=60)
+        except (CommandError, OSError, ValueError) as exc:
+            log.debug("could not list the alissa tmux queue (%s)", exc)
+            return None
+
     def kill_session(self, session: str) -> None:
         """Kill ONE finished reviewer's managed session to free its worker slot.
 

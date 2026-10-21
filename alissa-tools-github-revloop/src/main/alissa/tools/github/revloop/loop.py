@@ -27,6 +27,7 @@ from typing import Callable
 from . import janitor as janitor_mod
 from . import parking as parking_mod
 from . import prompts as prompts_mod
+from . import self_upgrade as self_upgrade_mod
 from .alissa import (
     COMMIT_READINESS_TRAILER_LABEL,
     MANAGED_PREFIX,
@@ -113,6 +114,7 @@ from .loop_events import (
 )
 from .proc import CommandError
 from .state import State
+from .version import version as running_version
 
 log = logging.getLogger(__name__)
 
@@ -2730,6 +2732,7 @@ class ReviewWatcher:
         alissa: Alissa | None = None,
         state: State | None = None,
         bow_client: "AlissaClient | None" = None,
+        self_upgrade: "self_upgrade_mod.SelfUpgrader | None" = None,
     ):
         self.config = config
         # The BOW-derived allowlist (`repos_source: "bows"`, issue #119), or
@@ -2766,10 +2769,18 @@ class ReviewWatcher:
         # built, read or logged for the disabled default. The pusher owns
         # its own in-process `Sources` (the console's data layer), so the
         # console sidecar need not be running.
+        #
+        # Fleet auto-upgrade (issue #193): the drain and self-upgrade state,
+        # fed by the vitals answer. Built always: it reads nothing until an
+        # answer arrives, so a seat without vitals never drains on it.
+        self.self_upgrade = self_upgrade or self_upgrade_mod.SelfUpgrader(
+            running_version.value, dry_run=config.dry_run,
+        )
         self._fleet_vitals: FleetVitalsPusher | None = (
             build_pusher(
                 config, github=self.github, endpoint=config.alissa_endpoint,
                 config_reader=self._vitals_config,
+                upgrader=self.self_upgrade,
             )
             if config.fleet_vitals_enabled
             else None
@@ -6745,8 +6756,26 @@ class ReviewWatcher:
         """Claim (or, `late`, re-claim) the spawn of `name` against the drain
         flag: None when the spawn may proceed, else the QUEUED `drained`
         decision that stands the round down. Dry-run reads the flag and
-        claims nothing. See `_drain_gated`."""
+        claims nothing. See `_drain_gated`.
+
+        The fleet auto-upgrade hold (issue #193) is read FIRST, on both
+        claims: while Studio's vitals answer says drain, or a self-hosted
+        seat is draining to upgrade, the round stands down the same QUEUED
+        `drained` way a parking drain does -- owed, no spawn row, no round
+        burned. Running reviews are not touched. The upgrader logs the state
+        change once; each held round is a DEBUG line here."""
         where = " after its hub was provisioned" if late else ""
+        hold = self.self_upgrade.hold()
+        if hold is not None:
+            detail = self.self_upgrade.hold_detail()
+            log.debug("%s round %d: not spawning%s — %s", pr.slug, round_, where, detail)
+            return Decision(
+                Action.QUEUED,
+                f"round {round_} held{where} — {detail}; running reviews finish "
+                f"normally, retrying once the drain lifts",
+                round_,
+                drained=True,
+            )
         try:
             if self.config.dry_run:
                 drain = self.state.drain()
@@ -8278,18 +8307,39 @@ class ReviewWatcher:
         # heartbeat is the completion time of a pass whose exhaust is already
         # written and whose events are already on their way.
         vitals = self._push_fleet_vitals(completed_at=time.time())
+        # The self-upgrade step (issue #193), right after the push that read
+        # this pass's answer, on the sweep's own roster.
+        upgrade = self._after_pass_upgrade()
         # The workspace janitor (issue #167), last: it is the one part of the
         # pass that is pure housekeeping, and it never raises.
         self._run_janitor()
         log.info(
             "poll summary: %d candidate(s), %d reaped, %d parked on a prompt, "
-            "%d answered%s, %d ms, vitals: %s",
+            "%d answered%s, %d ms, vitals: %s%s",
             len(results), reaped, len(self._prompt_sweep.waiting),
             self._prompt_sweep.answered,
             " (spawns HELD)" if self._prompt_sweep.hold else "",
             duration_ms, vitals,
+            f"; upgrade: {upgrade}" if upgrade != self_upgrade_mod.NONE else "",
         )
         return results
+
+    def _after_pass_upgrade(self) -> str:
+        """The pass's self-upgrade step (issue #193): `exit` once the seat
+        has been idle for two polls (no live reviewer session, no
+        undispatched queue item) with a self-hosted upgrade wanted -- the
+        request file is then written and `run_forever` returns -- `wait`
+        while draining towards one, `none` otherwise. The roster is the reap
+        sweep's (`_pass_roster`, None when it could not list: never idle).
+        Never raises."""
+        try:
+            return self.self_upgrade.after_pass(
+                self._pass_roster,
+                queued=lambda: parking_mod.queued_items(self.alissa.list_queues()),
+            )
+        except Exception as exc:
+            log.warning("self-upgrade: the after-pass check failed (%s)", exc)
+            return self_upgrade_mod.NONE
 
     def _emit_loop_events(self) -> None:
         """Push this pass's loop telemetry to Studio, when enabled (issue
@@ -8768,6 +8818,12 @@ class ReviewWatcher:
                     self.poll_once()
                     backoff = self.config.poll_interval
                     self._note_poll_recovered(failures)
+                    if self.self_upgrade.exit_requested:
+                        # Issue #193: return, so the CLI exits 0 and the
+                        # container restarts; the entrypoint installs the
+                        # target at boot.
+                        log.info("stopping for the self-upgrade")
+                        return
                 except LedgerUnwritable:
                     # Already logged, streak-limited and escalating, by the
                     # gate itself. What matters HERE is what is NOT done: the
