@@ -1382,6 +1382,54 @@ def test_an_abandoned_held_walk_no_longer_starves_the_folders_behind_it(tmp_path
         "small stays sized (from the cache) on every sweep after the first"
 
 
+def test_two_held_walks_cut_short_take_turns_so_neither_starves(tmp_path):
+    # Issue #191, the review probe of PR #190: `big` needs more than
+    # SIZE_CACHE_SECONDS of sweeps, so its figure expires the sweep after it
+    # lands and its walk starts over. `young` must still get its turns.
+    hub = make_hub(tmp_path)
+    big = folder(tree(hub / "REVIEW-TASK-70", 60), age=4 * DAY)
+    young = folder(tree(hub / "REVIEW-TASK-81", 20), age=2 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    guard.hold("acme/widgets", 8, "TASK-81")
+    big_key = "widgets: TASK-70 has a live session or open round"
+    young_key = "widgets: TASK-81 has a live session or open round"
+    sizes: dict = {}
+    clock = Ticks()
+    sweeps = []
+    for i in range(25):
+        sweeps.append(sweep([hub], guard, grace_seconds=GRACE, now=NOW + 600 * i,
+                            runner=Runner(), max_seconds=10.0, clock=clock, sizes=sizes))
+
+    assert any(sw.held_bytes.get(young_key) for sw in sweeps), "young was never sized"
+    young_at = next(i for i, sw in enumerate(sweeps) if sw.held_bytes.get(young_key))
+    assert young_at < 8, "young waits only its share of turns, not big's whole walk"
+    assert sweeps[young_at].held_bytes[young_key] == janitor_mod.dir_bytes(young)
+    assert any(sw.held_bytes.get(big_key) == janitor_mod.dir_bytes(big) for sw in sweeps), \
+        "taking turns still lets big finish"
+
+
+def test_kept_walks_go_least_recently_advanced_first(tmp_path, monkeypatch):
+    hub = make_hub(tmp_path)
+    old = folder(hub / "REVIEW-TASK-70", age=4 * DAY)
+    new = folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    guard.hold("acme/widgets", 8, "TASK-81")
+    sizes: dict = {
+        old: janitor_mod.HeldWalk(NOW - 4 * DAY, NOW - 600, 0, [os.fspath(old)], advanced=NOW - 60),
+        new: janitor_mod.HeldWalk(NOW - 2 * DAY, NOW - 600, 0, [os.fspath(new)], advanced=NOW - 600),
+    }
+    walked = []
+    monkeypatch.setattr(janitor_mod, "held_bytes_of",
+                        lambda p, stop, progress=None: walked.append(p.name))
+
+    sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
+
+    assert walked == ["REVIEW-TASK-81", "REVIEW-TASK-70"], "the walk that waited longest goes first"
+    assert sizes[old].advanced == sizes[new].advanced == NOW
+
+
 def test_a_held_walk_cut_short_restarts_when_its_folder_mtime_moves(tmp_path):
     hub = make_hub(tmp_path)
     big = folder(tree(hub / "REVIEW-TASK-70", 30), age=4 * DAY)

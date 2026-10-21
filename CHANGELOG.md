@@ -4,6 +4,18 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.27
+
+- **Two held walks that each need several sweeps take turns** (issue #191,
+  the `[minor]` finding left on PR #190's approve; origin TASK-720091232,
+  implementation TASK-1488007433).
+  - A kept `HeldWalk` now records `advanced`, the sweep it last read a
+    directory, and kept walks resume least-recently-advanced first instead
+    of oldest first. Before, a walk needing more than an hour of sweeps
+    finished, expired the next sweep, started over and kept every sweep's
+    leftover budget, so a younger kept walk was never sized. Folders whose
+    walk was not cut short still go first, oldest first.
+
 ## 0.31.26
 
 - **A held folder too big for one sweep no longer starves the held folders
