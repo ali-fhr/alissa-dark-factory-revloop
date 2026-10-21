@@ -222,6 +222,181 @@ needs_recursive_chown() {
   return 1
 }
 
+# -----------------------------------------------------------------------------
+# 0a. Self-upgrade at boot (issue #193, fleet auto-upgrade AU-6).
+#
+# A self-hosted daemon that Studio's vitals answer gives a new target drains,
+# waits until it is idle, writes ${ALISSA_UPGRADE_DIR:-/workspace/.alissa-
+# upgrade}/revloop.json and exits so the container restarts. This block is the
+# other half. It runs in the ROOT pass, because the daemon is pip-installed
+# into the system site-packages, and BEFORE the firewall, because pip needs
+# PyPI:
+#
+#   * an unconfirmed request whose target differs from the installed
+#     alissa-tools-github-revloop is installed (`pip install` with bounded
+#     retries). A failed install boots the installed version, adds the target
+#     to the file's skip list and leaves an `upgradeFailed` report for the
+#     daemon's next vitals post. A target not newer than both the installed
+#     version and `previous` is never installed (state `not_newer`);
+#   * every boot on the target is counted. A request still unconfirmed after
+#     2 boots, or 10 min after its first boot, is ROLLED BACK: `previous` is
+#     reinstalled, the target joins the skip list and the report is left.
+#
+# The daemon confirms the request after its first answered vitals poll on the
+# target. Both sides keep the keys they do not own (see self_upgrade.py).
+# Best-effort: a failure here only warns, and the installed version boots.
+# -----------------------------------------------------------------------------
+# >>> self_upgrade_boot
+self_upgrade_boot() {
+  local dir="${ALISSA_UPGRADE_DIR:-/workspace/.alissa-upgrade}"
+  [ -f "${dir}/revloop.json" ] || return 0
+  python3 - "${dir}/revloop.json" "${1:-}" "${SELF_UPGRADE_RETRY_DELAY:-5}" <<'PY'
+import importlib.metadata as md
+import json, os, pwd, re, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
+
+path, owner, delay = sys.argv[1], sys.argv[2], float(sys.argv[3])
+DIST = "alissa-tools-github-revloop"
+VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+TRIES, MAX_BOOTS, WINDOW_S = 3, 2, 600
+
+
+def log(msg):
+    print(f"[entrypoint] self-upgrade: {msg}", file=sys.stderr, flush=True)
+
+
+def iso(ts):
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def installed():
+    try:
+        return md.version(DIST)
+    except md.PackageNotFoundError:
+        return None
+
+
+def pip_install(version):
+    last = ""
+    for attempt in range(1, TRIES + 1):
+        proc = subprocess.run(
+            ["pip", "install", "--no-cache-dir", "--disable-pip-version-check",
+             "--quiet", f"{DIST}=={version}"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            log(f"installed {DIST}=={version}")
+            return True, ""
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        last = lines[-1] if lines else f"pip exited {proc.returncode}"
+        log(f"pip install {DIST}=={version} failed (try {attempt} of {TRIES}): {last}")
+        if attempt < TRIES:
+            time.sleep(delay * attempt)
+    return False, last
+
+
+def write(data):
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".revloop-", suffix=".json", dir=directory)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    if owner and os.geteuid() == 0:
+        ids = pwd.getpwnam(owner)
+        for p in (directory, tmp):
+            os.chown(p, ids.pw_uid, ids.pw_gid)
+    os.replace(tmp, path)
+
+
+def fail(data, target, state, reason):
+    skip = [v for v in data.get("skip") or [] if isinstance(v, str)]
+    if target not in skip:
+        skip.append(target)
+    report = {"version": target, "reason": reason[:300]}
+    if data.get("upgradeFailed") != report:
+        # A report already sent is not sent again unless it changed.
+        data["upgradeFailedReported"] = False
+    data.update({"state": state, "skip": skip, "lastError": reason, "upgradeFailed": report})
+    write(data)
+    log(f"{target} is now on the skip list ({state}: {reason})")
+
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError) as exc:
+    log(f"could not read {path} ({exc}) — booting the installed version")
+    sys.exit(0)
+if not isinstance(data, dict):
+    log(f"{path} is not a JSON object — booting the installed version")
+    sys.exit(0)
+# rollback_failed: an earlier boot could not reinstall `previous`; retry it.
+if data.get("confirmed") or data.get("state") not in ("requested", "installed", "rollback_failed"):
+    sys.exit(0)
+
+target = (data.get("target") or {}).get("version") if isinstance(data.get("target"), dict) else None
+previous = data.get("previous")
+running = installed()
+now = time.time()
+if not isinstance(target, str) or not VERSION.match(target):
+    log(f"the request names no X.Y.Z target ({target!r}) — ignoring it")
+    data["state"] = "invalid"
+    write(data)
+    sys.exit(0)
+
+boots = int(data.get("boots") or 0)
+first = data.get("firstBootTs")
+expired = isinstance(first, (int, float)) and now - first > WINDOW_S
+retry = data.get("state") == "rollback_failed"
+if retry or boots >= MAX_BOOTS or expired:
+    if retry and isinstance(data.get("rollbackReason"), str):
+        reason = data["rollbackReason"]
+    elif expired and boots < MAX_BOOTS:
+        reason = f"not confirmed within {WINDOW_S // 60} min of its first boot"
+    else:
+        reason = f"not confirmed after {boots} boots"
+    data["rollbackReason"] = reason
+    log(f"rolling back {target}: {reason}")
+    ok = True
+    if isinstance(previous, str) and VERSION.match(previous) and running != previous:
+        ok, err = pip_install(previous)
+    if ok:
+        fail(data, target, "rolled_back", f"rolled back to {previous}: {reason}")
+    else:
+        # Not final: the next boot retries the reinstall. The target is
+        # skipped already, so the daemon neither confirms nor re-requests it.
+        log(f"WARN: could not reinstall {previous} ({err}) — booting {running}; the next boot retries")
+        fail(data, target, "rollback_failed", f"could not reinstall {previous} ({err}); {reason}")
+    sys.exit(0)
+
+if running != target:
+    # Never a downgrade: the target must be newer than what is installed and
+    # than the version that asked. (A rollback reinstalls `previous` above.)
+    floor = [tuple(map(int, v.split("."))) for v in (running, previous)
+             if isinstance(v, str) and VERSION.match(v)]
+    if floor and tuple(map(int, target.split("."))) <= max(floor):
+        log(f"{target} is not newer than {running} (requested from {previous}) — not installing it")
+        data["state"] = "not_newer"
+        write(data)
+        sys.exit(0)
+    log(f"installing {DIST}=={target} (installed: {running}, requested from {previous})")
+    ok, err = pip_install(target)
+    if not ok:
+        fail(data, target, "install_failed", f"pip install failed: {err}")
+        log(f"booting the installed {running}")
+        sys.exit(0)
+
+data["boots"] = boots + 1
+if not isinstance(first, (int, float)):
+    data["firstBootTs"] = now
+    data["firstBootAt"] = iso(now)
+data["state"] = "installed"
+write(data)
+log(f"booting {target} (boot {boots + 1} of {MAX_BOOTS} before a rollback)")
+PY
+}
+# <<< self_upgrade_boot
+
 if [ "$(id -u)" = "0" ]; then
   TMUX_DIR="${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
   mkdir -p "${WORKSPACE_ROOT}" "${TMUX_DIR}"
@@ -262,6 +437,15 @@ if [ "$(id -u)" = "0" ]; then
     fi
   done
   log "workspace mount ${WORKSPACE_ROOT} owned by ${RUNTIME_USER}"
+
+  # Step 0a, daemon role only (the executor never self-upgrades), after the
+  # ownership fix-up and before the firewall closes egress to PyPI. It only
+  # ever warns: a failure here (a full volume included) boots the installed
+  # version and never stops the boot.
+  if [ "${CONTAINER_ROLE}" = "daemon" ]; then
+    self_upgrade_boot "${RUNTIME_USER}" \
+      || log "WARN: the boot-time self-upgrade step failed — booting the installed alissa-tools-github-revloop"
+  fi
 
   if [ "${ALISSA_ENABLE_FIREWALL:-0}" = "1" ]; then
     log "raising egress firewall (ALISSA_ENABLE_FIREWALL=1)"
@@ -1718,4 +1902,18 @@ trap shutdown TERM INT
 log "starting alissa-revloop over ${WORKSPACE_ROOT}"
 alissa-revloop --workspace-root "${WORKSPACE_ROOT}" "$@" &
 DAEMON_PID=$!
-wait "${DAEMON_PID}"
+DAEMON_RC=0
+wait "${DAEMON_PID}" || DAEMON_RC=$?
+
+# The daemon exits 0 to self-upgrade (issue #193, step 0a above) after writing
+# its request. A plain exit 0 would leave a container under an "on failure"
+# restart policy (Railway's default) stopped, so the container exits 75
+# (EX_TEMPFAIL) instead: both "always" and "on failure" policies restart it.
+# >>> self_upgrade_exit
+if [ "${DAEMON_RC}" = "0" ] \
+   && grep -qs '"state": "requested"' "${ALISSA_UPGRADE_DIR:-/workspace/.alissa-upgrade}/revloop.json"; then
+  log "alissa-revloop exited for a self-upgrade — restarting the container (exit 75) to install it"
+  exit 75
+fi
+# <<< self_upgrade_exit
+exit "${DAEMON_RC}"
