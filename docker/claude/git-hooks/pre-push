@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# =============================================================================
+# System pre-push hook of the reviewer seat (issue #195, MDF M7 push safety,
+# GP-3): it refuses EVERY push.
+#
+# Installed at /usr/local/share/alissa/git-hooks/pre-push and made every
+# repository's hook with `git config --system core.hooksPath
+# /usr/local/share/alissa/git-hooks` (Dockerfile; re-asserted by the
+# entrypoint's root pass in the daemon role). It is the git-level half of the
+# seat's push safety: hooks/guard-git.py refuses the push commands it can read
+# in a Bash command, this hook refuses the ones it cannot see — a push run by
+# a script or a test suite — whatever the refs, the remote or the flags.
+#
+# Reviewers never push (CR6): there is nothing to judge, so there is no
+# allow-list and no off switch here. The executor role (CONTAINER_ROLE=
+# executor), which runs Studio queue jobs rather than reviews, has the system
+# core.hooksPath removed at boot, so this hook never runs there.
+#
+# Limits, by git's own precedence: a `core.hooksPath` in a repository's own
+# config (husky's `prepare` sets one) wins over this system one, and
+# GIT_CONFIG_NOSYSTEM drops the system config — guard-git.py refuses both
+# shapes in a command; `git push --no-verify` skips every pre-push hook, and
+# guard-git.py refuses it only where it can read it in the Bash command: a
+# push it cannot see (`echo 'git push --no-verify' | sh`, `watch git push
+# --no-verify`, a `python3 -c` string, a script) passes both layers. Pushes
+# through the GitHub API never reach git at all; only guard-git.py sees them.
+#
+# Exercised by docker/claude/tests-hooks-guard.sh (section 5).
+# =============================================================================
+# git writes the refs on stdin; drain it so git never sees a broken pipe.
+cat >/dev/null 2>&1 || true
+printf 'alissa pre-push: REFUSED — %s\n' \
+  "Reviewer seat: reviewers never push or merge — record findings in the review instead." >&2
+printf 'alissa pre-push: %s\n' \
+  "Post them with \`gh pr review\` (or review comments); pushing is the implementer's job." >&2
+exit 1

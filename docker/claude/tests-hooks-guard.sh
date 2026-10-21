@@ -13,6 +13,10 @@
 #      ALISSA_TMUX_SESSION (the managed seat's export) wins without asking
 #      tmux. The seat running this script may itself export both, so every
 #      marker call scrubs them explicitly.
+#   5. git-hooks/pre-push (issue #195) — real pushes into a scratch bare
+#      remote, with the hook dir as core.hooksPath: every one is refused with
+#      the reviewer-seat reason and the remote stays empty; fetch and
+#      worktree add still pass. guard-git.py's table is test_git_guard.py.
 #
 # Same shape as tests-image-contract.sh (one `  ok ` / `  FAIL ` line per
 # assertion, a count at the end), but needs no docker: python3 only. Wired
@@ -214,6 +218,58 @@ out="$(printf 'not json' | env -u ALISSA_TMUX_SESSION ALISSA_WAITING_DIR="$WD" p
 if [ "$rc" = "0" ] && [ -z "$out" ]; then pass "note-waiting on malformed stdin: exit 0, no stdout"; else bad "note-waiting malformed: exit $rc, stdout ${out:-<empty>}"; fi
 out="$(printf 'not json' | env -u ALISSA_TMUX_SESSION ALISSA_WAITING_DIR="$WD" python3 "$CLEAR" 2>/dev/null)"; rc=$?
 if [ "$rc" = "0" ] && [ -z "$out" ]; then pass "clear-waiting on malformed stdin: exit 0, no stdout"; else bad "clear-waiting malformed: exit $rc, stdout ${out:-<empty>}"; fi
+
+echo "5. git-hooks/pre-push — every push refused (issue #195)"
+PRE_PUSH="${SCRIPT_DIR}/git-hooks/pre-push"
+PRE_PUSH_HEAD="Reviewer seat: reviewers never push or merge — record findings in the review instead."
+if [ -x "$PRE_PUSH" ]; then pass "executable: git-hooks/pre-push"; else bad "not executable: $PRE_PUSH"; fi
+# A scratch clone and a bare remote; no system/global config leaks in, and the
+# hook dir is handed to git exactly as the image's system core.hooksPath does.
+G="${T}/git"
+mkdir -p "${G}/home"
+gitx() {
+  env -i PATH="$PATH" HOME="${G}/home" GIT_CONFIG_NOSYSTEM=1 \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com \
+    git -c "core.hooksPath=${SCRIPT_DIR}/git-hooks" "$@"
+}
+gitx init -q --bare "${G}/remote.git"
+gitx init -q -b main "${G}/clone"
+printf 'a\n' > "${G}/clone/a.txt"
+gitx -C "${G}/clone" add a.txt
+gitx -C "${G}/clone" commit -qm init
+gitx -C "${G}/clone" remote add origin "${G}/remote.git"
+gitx -C "${G}/clone" tag v1
+gitx -C "${G}/clone" checkout -q -b TASK-1-x
+push_refused() {  # label, push args…
+  local label="$1" err rc refs
+  shift
+  err="$(gitx -C "${G}/clone" push "$@" 2>&1)"; rc=$?
+  refs="$(gitx -C "${G}/remote.git" for-each-ref --format='%(refname)')"
+  if [ "$rc" != "0" ] && printf '%s' "$err" | grep -qF "alissa pre-push: REFUSED — ${PRE_PUSH_HEAD}" && [ -z "$refs" ]; then
+    pass "pre-push refuses: ${label}"
+  else
+    bad "pre-push let through: ${label} (exit $rc, remote refs: ${refs:-<none>}): ${err}"
+  fi
+}
+push_refused "a TASK branch (git push -u origin HEAD)" -u origin HEAD
+push_refused "the default branch (git push origin HEAD:main)" origin HEAD:main
+push_refused "a tag (git push --tags)" --tags origin
+push_refused "every branch (git push --all)" --all origin
+push_refused "a local-path remote by URL" "${G}/remote.git" HEAD:refs/heads/TASK-1-x
+# The hook alone, as git calls it: refs on stdin, exit 1, one message on stderr.
+err="$(printf 'refs/heads/TASK-1-x %s refs/heads/TASK-1-x %s\n' "$(printf '1%.0s' {1..40})" "$(printf '0%.0s' {1..40})" \
+  | "$PRE_PUSH" origin https://github.com/acme/app.git 2>&1 >/dev/null)"; rc=$?
+if [ "$rc" = "1" ] && printf '%s' "$err" | grep -qF "$PRE_PUSH_HEAD"; then pass "pre-push called directly: exit 1 with the reason"; else bad "pre-push called directly: exit $rc, stderr: ${err:-<none>}"; fi
+out="$("$PRE_PUSH" origin https://github.com/acme/app.git </dev/null 2>/dev/null)"; rc=$?
+if [ "$rc" = "1" ] && [ -z "$out" ]; then pass "pre-push with empty stdin: exit 1, nothing on stdout"; else bad "pre-push with empty stdin: exit $rc, stdout: ${out:-<empty>}"; fi
+out="$(env ALISSA_PUSH_GUARD=off "$PRE_PUSH" origin x </dev/null 2>&1)"; rc=$?
+if [ "$rc" = "1" ]; then pass "pre-push has no off lever (ALISSA_PUSH_GUARD=off still refuses)"; else bad "pre-push honoured ALISSA_PUSH_GUARD=off: exit $rc"; fi
+# Fetch and worktree add are untouched by the hook dir.
+if gitx -C "${G}/clone" fetch -q origin && gitx -C "${G}/clone" worktree add -q --detach "${G}/REVIEW-x" HEAD; then
+  pass "fetch and worktree add pass with the hook dir in place"
+else
+  bad "fetch / worktree add failed with the hook dir in place"
+fi
 
 echo ""
 if [ "${fail}" = "0" ]; then

@@ -122,7 +122,7 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c
 # start (the entrypoint's monitor logs it), so a pin below that sets
 # ALISSA_UI_HOST=0.0.0.0 — it does not move the floor. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
 # (capability-probed, not version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.31.28
+ARG REVLOOP_VERSION=0.31.29
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.
@@ -145,10 +145,22 @@ COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY hooks/guard-shell.py   /usr/local/share/alissa/hooks/guard-shell.py
 COPY hooks/note-waiting.py  /usr/local/share/alissa/hooks/note-waiting.py
 COPY hooks/clear-waiting.py /usr/local/share/alissa/hooks/clear-waiting.py
+# Push safety (issue #195, GP-3): reviewers never push or merge. The PreToolUse
+# git guard (imports guard-shell.py's tokenizer from its own directory) and a
+# pre-push hook that refuses EVERY push, made every repository's hook by the
+# system core.hooksPath below. The entrypoint's root pass re-asserts it in the
+# daemon role and removes it in the executor role (Studio queue jobs, not
+# reviews). The directory holds pre-push alone: a repository's own other hooks
+# do not run in the seat, which neither commits nor pushes.
+COPY hooks/guard-git.py     /usr/local/share/alissa/hooks/guard-git.py
+COPY git-hooks/pre-push     /usr/local/share/alissa/git-hooks/pre-push
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/revloop-config.sh /usr/local/bin/init-firewall.sh \
         /usr/local/share/alissa/hooks/guard-shell.py \
+        /usr/local/share/alissa/hooks/guard-git.py \
         /usr/local/share/alissa/hooks/note-waiting.py \
-        /usr/local/share/alissa/hooks/clear-waiting.py
+        /usr/local/share/alissa/hooks/clear-waiting.py \
+        /usr/local/share/alissa/git-hooks/pre-push \
+    && git config --system core.hooksPath /usr/local/share/alissa/git-hooks
 
 # Agent profile the worker uses to launch reviewers non-interactively. Without
 # this, worker-spawned claude sessions stop on the first-run trust/permission

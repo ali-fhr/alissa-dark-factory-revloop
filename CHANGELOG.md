@@ -4,6 +4,39 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.29
+
+- **Push safety: reviewers never push or merge** (issue #195, MDF M7 GP-3;
+  origin TASK-376772128, implementation TASK-267850458). A stricter port of
+  devloop's GP-2: the reviewer seat has no push to judge, so none is allowed.
+  - **`docker/claude/hooks/guard-git.py`**, a `PreToolUse` hook registered
+    next to `guard-shell.py` (whose tokenizer it imports): denies every
+    `git push` and the other remote-writing verbs, `gh pr merge`, `gh api`
+    merges (`…/merges`, a non-GET `…/pulls/<n>/merge`, GraphQL merge
+    mutations), and the hook bypasses (`commit --no-verify`,
+    `core.hooksPath` via `-c` / `--config-env` / `git config`,
+    `GIT_CONFIG_NOSYSTEM`). The reason says to record findings in the review
+    instead. Fails open.
+  - Review round 1 (PR #196): the guard also denies pushes by API — a non-GET
+    `gh api` on `…/git/(refs|commits|trees|blobs|tags)` or `…/contents/…`,
+    `gh pr update-branch` and `…/update-branch`, the GraphQL ref and commit
+    mutations, and a `gh api graphql` query it cannot read (`-F
+    query=@file`, `--input`, `$VAR`) — and a `git config alias.<x>` write
+    that runs a push. The pre-push header and the README name the gap both
+    layers share: a `--no-verify` push the guard cannot read in the command.
+  - Review round 2 (PR #196): gh's flags may come before the subcommand
+    (`gh -R o/r pr merge 7`, `gh -X PUT api …`), so the guard finds the
+    subcommand the way gh (cobra) does; a `gh alias set` standing for a
+    denied command and `gh alias import` are denied; and the API writes are
+    denied when sent by `curl` / `wget` to a literal `api.github.com` URL.
+  - **`docker/claude/git-hooks/pre-push`** refuses every push, installed as
+    every repository's hook by `git config --system core.hooksPath
+    /usr/local/share/alissa/git-hooks` (Dockerfile).
+  - **Entrypoint**: the root pass re-asserts the system `core.hooksPath` and
+    logs `push guard: ON (reviewer — every push refused)`; the executor role
+    (Studio queue jobs, not reviews) removes it and skips the git guard.
+    No off lever in the daemon role.
+
 ## 0.31.28
 
 - **Fleet auto-upgrade, the revloop self-hosted path** (issue #193, MDF M6

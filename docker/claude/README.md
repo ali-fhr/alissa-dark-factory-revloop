@@ -891,6 +891,41 @@ an optimization, and only one of those may delay a boot.
 If you turn this off (`ALISSA_WORKSPACE_PRUNE=0`), nothing else reclaims the
 volume; plan on pruning by hand.
 
+### Push safety: reviewers never push or merge (no lever)
+
+The reviewer seat is read-only by contract (CR6), and reviewers run
+`claude --dangerously-skip-permissions` with a token that may carry write
+access. Issue #195 (MDF M7, GP-3) enforces the contract in the seat with two
+layers; unlike devloop's GP-2, which judges each push, nothing is allowed:
+
+| layer | where | refuses |
+|---|---|---|
+| `guard-git.py` | `PreToolUse` (`Bash`), next to `guard-shell.py` (whose tokenizer it imports) | every `git push` (any remote, refspec or flag), `git send-pack`/`http-push`/`subtree push`/`lfs push`, `gh repo sync`; `gh pr merge`, `gh api …/merges`, a non-GET `gh api …/pulls/<n>/merge` or `…/merge-upstream`, GraphQL merge mutations; `git commit --no-verify`/`-n`, `-c core.hooksPath=…`, `--config-env=core.hooksPath=…`, `git config core.hooksPath` (explicit reads pass), `-c alias.*`/`git config alias.*` that runs a push, `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_SYSTEM` assignments; pushes by API — a non-GET `gh api` on `…/git/(refs\|commits\|trees\|blobs\|tags)` or `…/contents/…`, `gh pr update-branch` / `…/update-branch`, the GraphQL ref and commit mutations (`createRef`, `updateRef(s)`, `deleteRef`, `createCommitOnBranch`, `updatePullRequestBranch`), and a `gh api graphql` query it cannot read (`-F query=@file`, `--input`, `$VAR`); the same writes by `curl`/`wget` to a literal `api.github.com` URL; every gh form above with flags before the subcommand (`gh -R o/r pr merge 7`, `gh -X PUT api …` — gh is a cobra CLI and finds the subcommand past them, and so does the guard); a `gh alias set` standing for one of them, and `gh alias import`. The deny reason says to record findings in the review instead. Fails open. |
+| `pre-push` | `/usr/local/share/alissa/git-hooks`, every repository's hook via `git config --system core.hooksPath` | every push, whatever the refs — the pushes the guard cannot see (a script, a test suite). |
+
+Reads, fetches, `git worktree add`, `gh pr review` and `gh pr view` pass.
+The hook directory holds `pre-push` alone, so a repository's own other hooks
+(`pre-commit`, `post-checkout`, …) do not run in the seat. A
+`core.hooksPath` in a repository's own config (husky's `prepare` sets one)
+wins over the system one; there `guard-git.py` is the only layer. The two
+layers are not airtight either: `guard-git.py` reads only the Bash command
+text, so a push it cannot see (`echo 'git push --no-verify' | sh`, `watch
+git push --no-verify`, a `python3 -c` string, a script) that also passes
+`--no-verify` skips the pre-push too. Pushes through the GitHub API (REST
+ref and contents writes, GraphQL mutations) never reach git, so the pre-push
+cannot back them up; the guard is their only layer, and it sees only an
+API write the command spells out — not a URL in a variable, a `curl -K`
+config file, or another HTTP client (httpie, a `python3 -c` request).
+
+There is no off lever in the daemon role. The **executor role**
+(`CONTAINER_ROLE=executor`) runs Studio queue jobs, not reviews: its boot
+removes the system `core.hooksPath` (only when it is the image's) and does
+not register `guard-git.py`. Boot log: `push guard: ON (reviewer — every push
+refused)` or `push guard: OFF (executor role — …)`. Tested by
+`test_git_guard.py` (the guard's table), `tests-hooks-guard.sh` section 5
+(the pre-push against real pushes) and `test_entrypoint_hooks.py`
+(registration, `core.hooksPath`).
+
 ### The shell guard, the waiting marker and the prompt responder: `ALISSA_SHELL_GUARD`, `ALISSA_WAITING_DIR`, `ALISSA_PROMPT_*` (runtime env)
 
 `--dangerously-skip-permissions` does not silence everything (issue #138;
@@ -1475,8 +1510,9 @@ volumes:
    pre-trusting the `ALISSA_REVIEW_REPOS` hubs, the hubs the daemon **derived**
    on a previous boot (read from `${ALISSA_WORKSPACE_ROOT}/.alissa-derived-repos`;
    bows mode, issue #136) and every hub already on disk, root and `main/` each;
-   merge the three Claude Code hooks (the `rm` guard unless
-   `ALISSA_SHELL_GUARD=off`, the waiting marker and its clearer — see *The
+   merge the Claude Code hooks (the `rm` guard unless
+   `ALISSA_SHELL_GUARD=off`, the git guard in the daemon role — see *Push
+   safety* — the waiting marker and its clearer — see *The
    shell guard, the waiting marker and the prompt responder*) into
    `settings.json` and its `$CLAUDE_CONFIG_DIR` mirror without touching an
    operator's own hooks

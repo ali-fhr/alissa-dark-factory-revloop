@@ -21,7 +21,14 @@ $CLAUDE_CONFIG_DIR / workspace roots. What is pinned:
     pruned, while a foreign hook sharing its group survives;
   * the block is mirrored into `$CLAUDE_CONFIG_DIR/settings.json`, and a
     blank CLAUDE_CONFIG_DIR writes $HOME alone;
-  * the other seeded keys are untouched by the hooks merge.
+  * the other seeded keys are untouched by the hooks merge;
+  * push safety (issue #195): the git guard is registered next to the rm
+    guard in the daemon (reviewer) role, with no lever, and left out — a
+    previous boot's registration pruned — in the executor role; the
+    Dockerfile ships the refuse-all pre-push and points the system
+    core.hooksPath at it; the root pass's `push_guard_boot` re-asserts it and
+    logs `push guard: ON (reviewer — every push refused)`, and removes it
+    (only when it is ours) in the executor role.
 """
 
 import json
@@ -43,6 +50,7 @@ pytestmark = pytest.mark.skipif(
 HEREDOC_OPEN = "python3 - \"${WORKSPACE_ROOT}\" <<'PY' || true"
 HOOKS_DIR = "/usr/local/share/alissa/hooks"
 GUARD = f"{HOOKS_DIR}/guard-shell.py"
+GIT_GUARD = f"{HOOKS_DIR}/guard-git.py"
 NOTE = f"{HOOKS_DIR}/note-waiting.py"
 CLEAR = f"{HOOKS_DIR}/clear-waiting.py"
 
@@ -99,11 +107,12 @@ def test_first_boot_registers_the_three_hooks_once(tmp_path):
     home_settings, cc_settings, out = run_seeding(tmp_path)
     for path in (home_settings, cc_settings):
         s = load(path)
-        assert commands(s, "PreToolUse") == [GUARD]
+        assert commands(s, "PreToolUse") == [GUARD, GIT_GUARD]
         assert commands(s, "Notification") == [NOTE]
         assert commands(s, "UserPromptSubmit") == [CLEAR]
         assert commands(s, "PostToolUse") == [CLEAR]
         assert group_for(s, "PreToolUse", GUARD)["matcher"] == "Bash"
+        assert group_for(s, "PreToolUse", GIT_GUARD)["matcher"] == "Bash"
         assert group_for(s, "Notification", NOTE)["matcher"] == "permission_prompt|idle_prompt"
         # UserPromptSubmit has no matcher support; PostToolUse without one fires on every tool.
         assert "matcher" not in group_for(s, "UserPromptSubmit", CLEAR)
@@ -118,18 +127,19 @@ def test_first_boot_registers_the_three_hooks_once(tmp_path):
         assert s["theme"] == "dark"
         assert s["tui"] == "fullscreen"
     assert "shell guard ON" in out
+    assert "git guard ON" in out
     assert "waiting marker ON" in out
     assert "pre-trusted" in out and "reviewer dir(s)" in out, "the seeding line still reports the trust merge"
 
 
 def test_shipped_paths_match_the_dockerfile():
     text = DOCKERFILE.read_text()
-    for script in (GUARD, NOTE, CLEAR):
+    for script in (GUARD, GIT_GUARD, NOTE, CLEAR):
         assert f"COPY hooks/{os.path.basename(script)}" in text, script
         assert script in text
     chmod = text[text.index("RUN chmod 0755"):]
     chmod = chmod[:chmod.index("\n\n")]
-    for script in (GUARD, NOTE, CLEAR):
+    for script in (GUARD, GIT_GUARD, NOTE, CLEAR):
         assert script in chmod, f"{script} not chmod 0755 in the Dockerfile"
 
 
@@ -141,7 +151,8 @@ def test_second_boot_is_idempotent(tmp_path):
     assert (load(home_settings), load(cc_settings)) == first
     for s in first:
         for event in ("PreToolUse", "Notification", "UserPromptSubmit", "PostToolUse"):
-            assert len(s["hooks"][event]) == 1, (event, s["hooks"][event])
+            want = 2 if event == "PreToolUse" else 1  # the rm guard and the git guard, a group each
+            assert len(s["hooks"][event]) == want, (event, s["hooks"][event])
 
 
 def test_foreign_hooks_survive_in_place(tmp_path):
@@ -162,11 +173,12 @@ def test_foreign_hooks_survive_in_place(tmp_path):
     s = load(home_settings)
     assert s["hooks"]["PreToolUse"][0] == foreign["hooks"]["PreToolUse"][0]
     assert s["hooks"]["PreToolUse"][1] == foreign["hooks"]["PreToolUse"][1]
-    assert commands(s, "PreToolUse") == ["/opt/operator/audit.sh", "/opt/operator/lint.sh", GUARD]
+    assert commands(s, "PreToolUse") == ["/opt/operator/audit.sh", "/opt/operator/lint.sh", GUARD, GIT_GUARD]
     assert s["hooks"]["Stop"] == foreign["hooks"]["Stop"]
     assert s["theme"] == "light"  # setdefault, as before
     run_seeding(tmp_path)
-    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", "/opt/operator/lint.sh", GUARD]
+    assert commands(load(home_settings), "PreToolUse") == [
+        "/opt/operator/audit.sh", "/opt/operator/lint.sh", GUARD, GIT_GUARD]
 
 
 @pytest.mark.parametrize("value", ["off", "OFF", "0", "false", "no"])
@@ -174,7 +186,7 @@ def test_shell_guard_off_skips_the_guard_and_keeps_the_marker(tmp_path, value):
     home_settings, cc_settings, out = run_seeding(tmp_path, extra_env={"ALISSA_SHELL_GUARD": value})
     for path in (home_settings, cc_settings):
         s = load(path)
-        assert "PreToolUse" not in s["hooks"], s["hooks"]
+        assert commands(s, "PreToolUse") == [GIT_GUARD], s["hooks"]  # the git guard has no shell-guard lever
         assert commands(s, "Notification") == [NOTE]
         assert commands(s, "UserPromptSubmit") == [CLEAR]
         assert commands(s, "PostToolUse") == [CLEAR]
@@ -184,7 +196,7 @@ def test_shell_guard_off_skips_the_guard_and_keeps_the_marker(tmp_path, value):
 @pytest.mark.parametrize("value", ["", "on", "1", "yes", "anything-else"])
 def test_shell_guard_other_values_keep_it_on(tmp_path, value):
     home_settings, _, _ = run_seeding(tmp_path, extra_env={"ALISSA_SHELL_GUARD": value})
-    assert commands(load(home_settings), "PreToolUse") == [GUARD]
+    assert commands(load(home_settings), "PreToolUse") == [GUARD, GIT_GUARD]
 
 
 def test_shell_guard_off_removes_a_previous_boots_registration(tmp_path):
@@ -196,15 +208,15 @@ def test_shell_guard_off_removes_a_previous_boots_registration(tmp_path):
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/operator/audit.sh"}]},
     ]}}))
     home_settings, cc_settings, _ = run_seeding(tmp_path)
-    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", GUARD]
-    assert commands(load(cc_settings), "PreToolUse") == [GUARD]
+    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", GUARD, GIT_GUARD]
+    assert commands(load(cc_settings), "PreToolUse") == [GUARD, GIT_GUARD]
     run_seeding(tmp_path, extra_env={"ALISSA_SHELL_GUARD": "off"})
-    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh"]
-    assert "PreToolUse" not in load(cc_settings)["hooks"]
+    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", GIT_GUARD]
+    assert commands(load(cc_settings), "PreToolUse") == [GIT_GUARD]
     # And back on: registered again, once.
     run_seeding(tmp_path)
-    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", GUARD]
-    assert commands(load(cc_settings), "PreToolUse") == [GUARD]
+    assert commands(load(home_settings), "PreToolUse") == ["/opt/operator/audit.sh", GIT_GUARD, GUARD]
+    assert commands(load(cc_settings), "PreToolUse") == [GIT_GUARD, GUARD]
 
 
 def test_guard_sharing_a_group_with_a_foreign_hook_is_removed_not_the_group(tmp_path):
@@ -220,6 +232,7 @@ def test_guard_sharing_a_group_with_a_foreign_hook_is_removed_not_the_group(tmp_
     s = load(home_settings)
     assert s["hooks"]["PreToolUse"] == [
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/operator/audit.sh"}]},
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": GIT_GUARD, "timeout": 10}]},
     ]
 
 
@@ -248,6 +261,7 @@ def test_stale_registrations_under_the_hooks_dir_are_pruned(tmp_path):
     assert s["hooks"]["PreToolUse"] == [  # the stale script gone, the foreign hook kept, ours re-added
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/operator/audit.sh"}]},
         {"matcher": "Bash", "hooks": [{"type": "command", "command": GUARD, "timeout": 10}]},
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": GIT_GUARD, "timeout": 10}]},
     ]
     assert "Stop" not in s["hooks"]
     assert commands(s, "PostToolUse") == [CLEAR]
@@ -258,7 +272,7 @@ def test_stale_registrations_under_the_hooks_dir_are_pruned(tmp_path):
 
 def test_blank_config_dir_writes_home_alone(tmp_path):
     home_settings, cc_settings, _ = run_seeding(tmp_path, config_dir=False)
-    assert commands(load(home_settings), "PreToolUse") == [GUARD]
+    assert commands(load(home_settings), "PreToolUse") == [GUARD, GIT_GUARD]
     assert not cc_settings.exists()
 
 
@@ -267,10 +281,124 @@ def test_a_non_dict_hooks_value_is_replaced_not_crashed_on(tmp_path):
     home.mkdir(parents=True)
     (home / "settings.json").write_text(json.dumps({"hooks": "garbage"}))
     home_settings, _, _ = run_seeding(tmp_path)
-    assert commands(load(home_settings), "PreToolUse") == [GUARD]
+    assert commands(load(home_settings), "PreToolUse") == [GUARD, GIT_GUARD]
 
 
 def test_entrypoint_documents_the_lever():
     readme = (REPO_ROOT / "docker" / "claude" / "README.md").read_text()
     assert "`ALISSA_SHELL_GUARD`" in readme
     assert "`ALISSA_WAITING_DIR`" in readme
+
+
+# -- push safety (issue #195): the git guard's registration and core.hooksPath --
+
+GIT_HOOKS_DIR = "/usr/local/share/alissa/git-hooks"
+ON_LINE = "[entrypoint] push guard: ON (reviewer — every push refused)"
+
+
+@pytest.mark.parametrize("value", ["off", "0", "false", "no"])
+def test_the_git_guard_has_no_off_lever_in_the_daemon_role(tmp_path, value):
+    """Reviewers never push: devloop's ALISSA_PUSH_GUARD lever is not ported,
+    and the rm guard's own lever leaves the git guard alone."""
+    home_settings, _, out = run_seeding(tmp_path, extra_env={
+        "ALISSA_PUSH_GUARD": value, "ALISSA_SHELL_GUARD": value, "CONTAINER_ROLE": "daemon"})
+    assert commands(load(home_settings), "PreToolUse") == [GIT_GUARD]
+    assert "git guard ON" in out
+
+
+@pytest.mark.parametrize("role", ["executor", "EXECUTOR"])
+def test_the_executor_role_runs_without_the_git_guard_and_prunes_a_previous_one(tmp_path, role):
+    home_settings, cc_settings, _ = run_seeding(tmp_path)
+    assert commands(load(home_settings), "PreToolUse") == [GUARD, GIT_GUARD]
+    home_settings, cc_settings, out = run_seeding(tmp_path, extra_env={"CONTAINER_ROLE": role})
+    for path in (home_settings, cc_settings):
+        assert commands(load(path), "PreToolUse") == [GUARD]
+    assert "git guard OFF (executor role)" in out
+    run_seeding(tmp_path)  # back in the daemon role: registered again, once
+    assert commands(load(home_settings), "PreToolUse") == [GUARD, GIT_GUARD]
+
+
+def test_dockerfile_ships_the_pre_push_hook_and_sets_the_system_hooks_path():
+    text = DOCKERFILE.read_text()
+    assert f"COPY git-hooks/pre-push     {GIT_HOOKS_DIR}/pre-push" in text
+    chmod = text[text.index("RUN chmod 0755"):]
+    chmod = chmod[:chmod.index("\n\n")]
+    assert f"{GIT_HOOKS_DIR}/pre-push" in chmod
+    assert f"git config --system core.hooksPath {GIT_HOOKS_DIR}" in chmod
+    shipped = REPO_ROOT / "docker" / "claude" / "git-hooks"
+    assert sorted(p.name for p in shipped.iterdir()) == ["pre-push"]
+    assert os.access(shipped / "pre-push", os.X_OK)
+
+
+def push_guard_block() -> str:
+    text = ENTRYPOINT.read_text()
+    start = text.index("# >>> push_guard_boot\n")
+    end = text.index("# <<< push_guard_boot\n")
+    return text[start:end]
+
+
+def run_push_guard_boot(tmp_path, hooks_dir, role="daemon"):
+    system = tmp_path / "gitconfig-system"
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "GIT_CONFIG_SYSTEM": str(system)}
+    script = ("log() { printf '[entrypoint] %s\\n' \"$*\" >&2; }\n" + push_guard_block()
+              + f'\npush_guard_boot "{hooks_dir}" "{role}" || exit 7\n')
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    got = subprocess.run(["git", "config", "--system", "--get", "core.hooksPath"],
+                         capture_output=True, text=True, env=env).stdout.strip()
+    return done, got, env
+
+
+def scratch_hooks(tmp_path):
+    hooks = tmp_path / "git-hooks"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text("#!/bin/sh\nexit 1\n")
+    (hooks / "pre-push").chmod(0o755)
+    return hooks
+
+
+def test_the_root_pass_calls_push_guard_boot_with_the_role_before_dropping_privileges():
+    text = ENTRYPOINT.read_text()
+    root = text[text.index('if [ "$(id -u)" = "0" ]; then'):]
+    root = root[:root.index("exec gosu")]
+    assert f'push_guard_boot {GIT_HOOKS_DIR} "${{CONTAINER_ROLE}}"' in root
+
+
+def test_push_guard_boot_sets_the_system_hooks_path_and_logs_on(tmp_path):
+    hooks = scratch_hooks(tmp_path)
+    done, got, _ = run_push_guard_boot(tmp_path, hooks)
+    assert done.returncode == 0, done.stderr
+    assert got == str(hooks)
+    assert done.stderr.strip().splitlines() == [ON_LINE]
+    done, got, _ = run_push_guard_boot(tmp_path, hooks)  # idempotent
+    assert (done.returncode, got) == (0, str(hooks))
+    assert done.stderr.strip().splitlines() == [ON_LINE]
+
+
+def test_push_guard_boot_heals_an_operator_edit_in_the_daemon_role(tmp_path):
+    hooks = scratch_hooks(tmp_path)
+    _, _, env = run_push_guard_boot(tmp_path, hooks)
+    subprocess.run(["git", "config", "--system", "core.hooksPath", "/tmp/elsewhere"], env=env, check=True)
+    done, got, _ = run_push_guard_boot(tmp_path, hooks)
+    assert done.returncode == 0, done.stderr
+    assert got == str(hooks)
+
+
+def test_push_guard_boot_warns_when_the_hook_is_missing(tmp_path):
+    done, got, _ = run_push_guard_boot(tmp_path, tmp_path / "absent")
+    assert done.returncode == 7
+    assert "pre-push is missing" in done.stderr
+    assert got == ""
+
+
+def test_push_guard_boot_removes_only_our_hooks_path_in_the_executor_role(tmp_path):
+    hooks = scratch_hooks(tmp_path)
+    run_push_guard_boot(tmp_path, hooks)
+    done, got, env = run_push_guard_boot(tmp_path, hooks, role="executor")
+    assert done.returncode == 0, done.stderr
+    assert got == ""
+    assert "push guard: OFF (executor role" in done.stderr
+    # an operator's own system hooksPath is never removed
+    subprocess.run(["git", "config", "--system", "core.hooksPath", "/opt/operator/hooks"], env=env, check=True)
+    done, got, _ = run_push_guard_boot(tmp_path, hooks, role="executor")
+    assert done.returncode == 0, done.stderr
+    assert got == "/opt/operator/hooks"

@@ -397,6 +397,40 @@ PY
 }
 # <<< self_upgrade_boot
 
+# -----------------------------------------------------------------------------
+# 0b. Push safety at git level (issue #195, MDF M7, GP-3). Root pass only:
+# `git config --system` writes /etc/gitconfig. The Dockerfile already sets
+# core.hooksPath to the hooks dir, whose pre-push refuses every push; this
+# re-asserts it on every boot in the daemon role (an /etc/gitconfig edited by
+# hand heals) and REMOVES it, when it is ours, in the executor role: Studio
+# queue jobs are not reviews and may push their own branches. Step 3a
+# registers guard-git.py on the same role split. There is no off lever in the
+# daemon role — reviewers never push. Logs one line either way. Takes the
+# hooks dir and the role as $1/$2 so a test can point them at a scratch copy
+# (with GIT_CONFIG_SYSTEM aimed at a scratch file).
+# -----------------------------------------------------------------------------
+# >>> push_guard_boot
+push_guard_boot() {
+  local hooks_dir="${1:-/usr/local/share/alissa/git-hooks}" role="${2:-daemon}" current
+  current="$(git config --system --get core.hooksPath 2>/dev/null)" || current=""
+  if [ "${role}" != "daemon" ]; then
+    if [ "${current}" = "${hooks_dir}" ]; then
+      git config --system --unset core.hooksPath || return 1
+    fi
+    log "push guard: OFF (${role} role — not a reviewer seat; no git guard, no system pre-push)"
+    return 0
+  fi
+  if [ ! -x "${hooks_dir}/pre-push" ]; then
+    log "WARN: push guard: ${hooks_dir}/pre-push is missing — the system pre-push is NOT installed"
+    return 1
+  fi
+  if [ "${current}" != "${hooks_dir}" ]; then
+    git config --system core.hooksPath "${hooks_dir}" || return 1
+  fi
+  log "push guard: ON (reviewer — every push refused)"
+}
+# <<< push_guard_boot
+
 if [ "$(id -u)" = "0" ]; then
   TMUX_DIR="${TMUX_TMPDIR:-/home/${RUNTIME_USER}/.tmux}"
   mkdir -p "${WORKSPACE_ROOT}" "${TMUX_DIR}"
@@ -452,6 +486,9 @@ if [ "$(id -u)" = "0" ]; then
     /usr/local/bin/init-firewall.sh \
       || die "firewall init failed — did you pass --cap-add=NET_ADMIN?"
   fi
+
+  push_guard_boot /usr/local/share/alissa/git-hooks "${CONTAINER_ROLE}" \
+    || log "WARN: push guard: setting the system core.hooksPath failed — pushes are refused by guard-git.py only"
 
   log "dropping to ${RUNTIME_USER}"
   exec gosu "${RUNTIME_USER}" "$0" "$@"
@@ -1105,8 +1142,9 @@ fi
 # /usr/local/share/alissa/hooks — the PreToolUse rm guard (refuses, with an
 # instructive reason, the rm shapes that would open the "Dangerous rm
 # operation" dialog nobody can answer; ALISSA_SHELL_GUARD=off unregisters it),
-# the Notification "waiting for input" marker and its UserPromptSubmit /
-# PostToolUse clearer. See docker/claude/README.md.
+# the PreToolUse git guard (issue #195: reviewers never push or merge; daemon
+# role only, see 0b), the Notification "waiting for input" marker and its
+# UserPromptSubmit / PostToolUse clearer. See docker/claude/README.md.
 #
 # BOWS MODE (issue #136): under repos_source=bows ALISSA_REVIEW_REPOS is empty —
 # the allowlist is DERIVED from the feed Bodies of Work by the daemon at
@@ -1190,11 +1228,16 @@ def state(d):  # ~/.claude.json equivalent: onboarding + per-project trust
 # next boot. (A pre-#138 image has no hook code and cannot; see the README.)
 HOOKS_DIR = "/usr/local/share/alissa/hooks"
 GUARD_HOOK = os.path.join(HOOKS_DIR, "guard-shell.py")
+GIT_GUARD_HOOK = os.path.join(HOOKS_DIR, "guard-git.py")  # push safety (issue #195)
 NOTE_HOOK = os.path.join(HOOKS_DIR, "note-waiting.py")
 CLEAR_HOOK = os.path.join(HOOKS_DIR, "clear-waiting.py")
 guard_on = os.environ.get("ALISSA_SHELL_GUARD", "").strip().lower() not in ("off", "0", "false", "no")
+# Reviewers never push (issue #195): no lever in the daemon role; the executor
+# role runs Studio queue jobs, not reviews, and is left without the git guard.
+push_guard_on = (os.environ.get("CONTAINER_ROLE") or "daemon").strip().lower() == "daemon"
 HOOK_SPECS = [  # (event, matcher or None, script, timeout in seconds)
     ("PreToolUse", "Bash", GUARD_HOOK, 10),
+    ("PreToolUse", "Bash", GIT_GUARD_HOOK, 10),
     ("Notification", "permission_prompt|idle_prompt", NOTE_HOOK, 10),
     ("UserPromptSubmit", None, CLEAR_HOOK, 10),
     ("PostToolUse", None, CLEAR_HOOK, 10),
@@ -1236,7 +1279,8 @@ def hooks(d):
     table = d.get("hooks")
     if not isinstance(table, dict):
         table = d["hooks"] = {}
-    specs = [spec for spec in HOOK_SPECS if guard_on or spec[2] != GUARD_HOOK]
+    specs = [spec for spec in HOOK_SPECS
+             if (guard_on or spec[2] != GUARD_HOOK) and (push_guard_on or spec[2] != GIT_GUARD_HOOK)]
     _prune_stale(table, {(e, m, s) for e, m, s, _ in specs})
     for event, matcher, script, timeout in specs:
         groups = table.get(event)
@@ -1268,7 +1312,8 @@ for t in settings_targets:
     merge(t, settings)
 print(f"[entrypoint] seeded claude first-run config; pre-trusted {len(paths)} reviewer dir(s)"
       f" ({len(derived)} derived repo(s) read from {derived_file});"
-      f" hooks: shell guard {'ON' if guard_on else 'OFF (ALISSA_SHELL_GUARD)'}, waiting marker ON")
+      f" hooks: shell guard {'ON' if guard_on else 'OFF (ALISSA_SHELL_GUARD)'},"
+      f" git guard {'ON' if push_guard_on else 'OFF (executor role)'}, waiting marker ON")
 PY
 
 # -----------------------------------------------------------------------------
