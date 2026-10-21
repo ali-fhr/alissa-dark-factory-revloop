@@ -4,6 +4,24 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.32
+
+- **The reviewer seat's git guard closes two bypass classes** (issue #201,
+  the two `[minor]` findings left on PR #196's approve; origin
+  TASK-1358559635, implementation TASK-668775912).
+  - Every `gh alias set` is now refused, beside `gh alias import`. gh
+    appends the call's own words to an alias's expansion, so an alias to a
+    command group (`gh alias set m pr`, then `gh m merge 7`; `gh alias set
+    a api`, then `gh a -X PUT …/merge`) or with a `$1` placeholder rebuilt
+    every gh deny, and `gh alias set s -` read the expansion from stdin.
+    `gh alias list` and `gh alias delete` still pass.
+  - curl / wget to the API is recognised whatever the URL's shape: any case
+    (`HTTPS://API.GITHUB.COM/…`), with userinfo (`https://x:$TOKEN@api.github.com/…`,
+    which curl sends as Basic auth), with a port, as `--url=…`, and without
+    a scheme — the host now comes off the path either way, so
+    `api.github.com/graphql` is judged as GraphQL. The command prefilter
+    matches the host in any case too.
+
 ## 0.31.31
 
 - **The self-upgrade request lives on the workspace volume** (issue #199,

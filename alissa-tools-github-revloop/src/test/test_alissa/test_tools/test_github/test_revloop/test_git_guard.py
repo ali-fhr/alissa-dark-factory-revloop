@@ -183,6 +183,13 @@ MERGES = [
     "gh alias set --shell p 'git push origin HEAD'",
     "gh alias import aliases.yml",
     "gh alias import - < aliases.yml",
+    # an alias to a command group: gh appends the call's words (issue #201)
+    "gh alias set m pr",
+    "gh alias set a api",
+    "gh alias set a 'api -X PUT'",
+    "gh alias set p 'pr $1 7'",
+    "gh alias set s - < expansion.txt",
+    "gh -R o/r alias set v 'pr view'",
     # curl / wget straight to the API
     "curl -X PUT -H 'Authorization: token x' https://api.github.com/repos/o/r/pulls/7/merge",
     "curl -sX PUT https://api.github.com/repos/o/r/pulls/7/merge",
@@ -263,6 +270,17 @@ API_PUSHES = [
     "wget --post-file q.json https://api.github.com/graphql",
     "echo x | xargs curl -X DELETE https://api.github.com/repos/o/r/git/refs/heads/main",
     "bash -c 'curl -X PATCH https://api.github.com/repos/o/r/git/refs/heads/main -d @b.json'",
+    # the host as curl reads it: userinfo, any case, no scheme, a port (issue #201)
+    "curl -X PATCH https://x:$GH_TOKEN@api.github.com/repos/o/r/git/refs/heads/main -d '{\"sha\":\"a\"}'",
+    "curl -X PATCH 'https://x-access-token:abc@api.github.com/repos/o/r/git/refs/heads/main' -d @b.json",
+    "curl -X PATCH HTTPS://API.GITHUB.COM/repos/o/r/git/refs/heads/main -d '{\"sha\":\"a\"}'",
+    "curl -X DELETE Api.GitHub.com/repos/o/r/git/refs/heads/main",
+    "curl -d '{\"query\":\"mutation{updateRef(input:{}){clientMutationId}}\"}' api.github.com/graphql",
+    "curl -d @q.json api.github.com/graphql",
+    "curl -d @q.json https://api.github.com:443/graphql",
+    "curl -d @q.json https://api.github.com/GraphQL",
+    "curl -X PATCH --url=https://api.github.com/repos/o/r/git/refs/heads/main -d @b.json",
+    "wget --method=DELETE http://user@API.github.com/repos/o/r/git/refs/heads/main",
 ]
 
 
@@ -403,8 +421,8 @@ PASSES = [
     "gh -X POST api repos/o/r/pulls/7/reviews -f event=COMMENT -f body=x",
     "gh --paginate api repos/o/r/pulls/7/merge -X PUT",
     "gh -- pr merge 7",
-    "gh alias set v 'pr view'",
     "gh alias list",
+    "gh alias delete m",
     # curl / wget reads of the API, and writes elsewhere
     "curl https://api.github.com/repos/o/r/git/refs/heads/main",
     "curl -s -H 'Accept: application/vnd.github+json' https://api.github.com/repos/o/r/contents/README.md",
@@ -413,6 +431,11 @@ PASSES = [
     "curl -X POST https://api.github.com/repos/o/r/pulls/7/reviews -d '{\"event\":\"COMMENT\"}'",
     "curl https://api.github.com/graphql -d '{\"query\":\"query { viewer { login } }\"}'",
     "curl -X PATCH https://example.com/repos/o/r/git/refs/heads/main -d x",
+    "curl -X PATCH https://api.github.com@example.com/repos/o/r/git/refs/heads/main -d x",
+    "curl -X PATCH https://api.github.com.example.com/repos/o/r/git/refs/heads/main -d x",
+    "curl HTTPS://API.GITHUB.COM/repos/o/r/git/refs/heads/main",
+    "curl https://x:$GH_TOKEN@api.github.com/repos/o/r/pulls/7",
+    "curl api.github.com/graphql -d '{\"query\":\"query { viewer { login } }\"}'",
     "wget -qO- https://api.github.com/repos/o/r/pulls/7",
     "git config --get-regexp alias",
     "git config --global --get alias.p",
@@ -471,6 +494,12 @@ def test_a_command_naming_no_git_is_never_parsed(monkeypatch):
     monkeypatch.setattr(module, "_load_shell_guard", boom)
     payload = {"tool_name": "Bash", "cwd": CWD, "tool_input": {"command": "rm -f a && ls | sort"}}
     assert module.decide(payload) is None
+
+
+def test_an_upper_case_api_host_is_parsed():
+    # the prefilter matches the host in any case, or `curl HTTPS://API.GITHUB.COM/…` is never looked at
+    reason = denied("curl -X PUT HTTPS://API.GITHUB.COM/repos/o/r/pulls/7/merge")
+    assert "merges a pull request" in reason, reason
 
 
 def test_the_budget():
