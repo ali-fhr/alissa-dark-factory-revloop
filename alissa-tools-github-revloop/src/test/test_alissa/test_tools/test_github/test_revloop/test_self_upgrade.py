@@ -1080,3 +1080,39 @@ def test_both_writers_write_the_spelling_the_exit_check_greps(tmp_path):
     assert "json.dump(data, fh, indent=2, sort_keys=True)" in lift(
         "# >>> self_upgrade_boot", "# <<< self_upgrade_boot")
     assert os.environ.get("ALISSA_UPGRADE_DIR"), "conftest scrubs the real directory"
+
+
+# -- the request directory follows the workspace volume (issue #199) -------------
+
+def upgrade_dir_env(env):
+    """Run the entrypoint's export block, then read the variable from a child
+    process — as the daemon (and the gosu pass) would see it."""
+    script = lift("# >>> upgrade_dir_env", "# <<< upgrade_dir_env")
+    script = 'WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"\n' + script
+    script += '\nbash -c \'printf %s "${ALISSA_UPGRADE_DIR-unset}"\'\n'
+    base = {"PATH": "/usr/local/bin:/usr/bin:/bin"}
+    proc = subprocess.run(["bash", "-c", script], env={**base, **env},
+                          capture_output=True, text=True, timeout=30, check=True)
+    return proc.stdout
+
+
+@bash_only
+@pytest.mark.parametrize("env, expected", [
+    ({}, mod.DEFAULT_UPGRADE_DIR),
+    ({"ALISSA_WORKSPACE_ROOT": "/data/ws"}, "/data/ws/.alissa-upgrade"),
+    ({"ALISSA_WORKSPACE_ROOT": "/data/ws", "ALISSA_UPGRADE_DIR": "/elsewhere"}, "/elsewhere"),
+    ({"ALISSA_WORKSPACE_ROOT": "/data/ws", "ALISSA_UPGRADE_DIR": ""}, "/data/ws/.alissa-upgrade"),
+])
+def test_the_upgrade_dir_is_exported_from_the_workspace_root(env, expected):
+    assert upgrade_dir_env(env) == expected
+
+
+def test_the_upgrade_dir_is_exported_before_anything_reads_it():
+    text = ENTRYPOINT.read_text()
+    root = text.index('WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"\n')
+    export = text.index("# >>> upgrade_dir_env")
+    assert root < export, "the export reads WORKSPACE_ROOT"
+    assert export < text.index('if [ "$(id -u)" = "0" ]; then'), "before the root pass"
+    assert export < text.index('    self_upgrade_boot "${RUNTIME_USER}"'), "before step 0a"
+    assert export < text.index("alissa-revloop --workspace-root"), "before the daemon starts"
+    assert export < text.index("# >>> self_upgrade_exit"), "before the exit check"
