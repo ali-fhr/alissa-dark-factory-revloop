@@ -4,6 +4,20 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.31
+
+- **The self-upgrade request lives on the workspace volume** (issue #199,
+  the `[minor]` finding left on PR #194's approve; origin TASK-835303932,
+  implementation TASK-1803682860). The entrypoint now exports
+  `ALISSA_UPGRADE_DIR="${ALISSA_UPGRADE_DIR:-${WORKSPACE_ROOT}/.alissa-upgrade}"`
+  right after it resolves `WORKSPACE_ROOT`, so the daemon, the boot step
+  (0a) and the exit-75 check all use `<ALISSA_WORKSPACE_ROOT>/.alissa-upgrade`.
+  Before, a deploy that moved the volume off `/workspace` wrote the request
+  to the image's `/workspace` on the container's ephemeral filesystem; a
+  restart into a fresh container lost it, and the seat drained and asked
+  again for ever. The default layout is unchanged, and an explicit
+  `ALISSA_UPGRADE_DIR` still wins.
+
 ## 0.31.30
 
 - **A finished long walk restarts at the back of the held-sizing queue**

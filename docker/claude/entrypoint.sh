@@ -45,6 +45,15 @@ ENTRYPOINT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "${ENTRYPOINT_DIR}/revloop-config.sh"
 
 WORKSPACE_ROOT="${ALISSA_WORKSPACE_ROOT:-/workspace}"
+# The self-upgrade request directory (step 0a and the exit-75 check below, and
+# the daemon's self_upgrade.py, which inherits this export) lives on the
+# workspace volume (issue #199). A deploy that moves the volume off /workspace
+# would otherwise write the request to the image's /workspace, on the
+# container's ephemeral filesystem: a restart into a fresh container loses it,
+# and the seat drains and requests again for ever. An explicit value wins.
+# >>> upgrade_dir_env
+export ALISSA_UPGRADE_DIR="${ALISSA_UPGRADE_DIR:-${WORKSPACE_ROOT}/.alissa-upgrade}"
+# <<< upgrade_dir_env
 WORKSPACE_NAME="${ALISSA_WORKSPACE:-alissa-review}"
 RUNTIME_USER=alissa
 
@@ -226,8 +235,9 @@ needs_recursive_chown() {
 # 0a. Self-upgrade at boot (issue #193, fleet auto-upgrade AU-6).
 #
 # A self-hosted daemon that Studio's vitals answer gives a new target drains,
-# waits until it is idle, writes ${ALISSA_UPGRADE_DIR:-/workspace/.alissa-
-# upgrade}/revloop.json and exits so the container restarts. This block is the
+# waits until it is idle, writes ${ALISSA_UPGRADE_DIR}/revloop.json (exported
+# at the top: ${WORKSPACE_ROOT}/.alissa-upgrade unless set) and exits so the
+# container restarts. This block is the
 # other half. It runs in the ROOT pass, because the daemon is pip-installed
 # into the system site-packages, and BEFORE the firewall, because pip needs
 # PyPI:
