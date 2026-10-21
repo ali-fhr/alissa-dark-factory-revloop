@@ -29,7 +29,8 @@ inside `sh -c` / `bash -c` / `eval` strings):
   * the same API writes sent with `curl` / `wget` to a literal
     `api.github.com` URL (round 2) — any case, with or without a scheme,
     with userinfo (`https://x:$TOKEN@api.github.com/…`) or a port, as a
-    word or `--url=` (issue #201): a non-GET method — explicit, or implied
+    word or `--url=` (issue #201), with a scheme of one to three slashes
+    (`https:/…`, `https:///…`, which curl normalises; issue #203): a non-GET method — explicit, or implied
     by a body (`-d`, `--json`, `-F`, `-T`, `--post-data`, …) — on the paths
     above, a GraphQL ref or merge mutation in the body, or a GraphQL body
     read from a file (`@…`) or built by `$(…)`;
@@ -142,8 +143,10 @@ COBRA_BOOL = ("-h", "--help", "--version")
 
 # curl / wget straight to the REST or GraphQL API (round 2 of PR #196).
 # Hostnames are case-insensitive, and curl sends a URL's userinfo
-# (`https://x:$TOKEN@api.github.com/…`) as Basic auth (issue #201).
-GH_API_URL = re.compile(r"(https?://)?([^/\s]*@)?api\.github\.com\.?(:\d+)?(/|$)", re.I)
+# (`https://x:$TOKEN@api.github.com/…`) as Basic auth (issue #201). curl
+# also normalises a scheme written with one or three slashes (`https:/…`,
+# `https:///…`) to `https://` (issue #203).
+GH_API_URL = re.compile(r"(https?:/{1,3})?([^/\s]*@)?api\.github\.com\.?(:\d+)?(/|$)", re.I)
 CURL_BODY = ("--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode", "--json", "--form",
              "--form-string")
 # curl long options whose value is the NEXT word.

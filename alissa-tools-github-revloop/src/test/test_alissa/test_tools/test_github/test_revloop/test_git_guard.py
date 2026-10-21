@@ -195,6 +195,10 @@ MERGES = [
     "curl -sX PUT https://api.github.com/repos/o/r/pulls/7/merge",
     "curl -d '{\"base\":\"main\",\"head\":\"x\"}' https://api.github.com/repos/o/r/merges",
     "wget --method=PUT https://api.github.com/repos/o/r/pulls/7/merge",
+    # curl normalises a scheme of one or three slashes to `https://` (issue #203)
+    "curl -X PUT https:/api.github.com/repos/o/r/pulls/7/merge",
+    "curl -X PUT https:///api.github.com/repos/o/r/pulls/7/merge",
+    "curl -X PUT HTTP:/API.GITHUB.COM/repos/o/r/pulls/7/merge",
 ]
 
 

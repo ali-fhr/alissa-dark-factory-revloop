@@ -4,6 +4,18 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.33
+
+- **The reviewer seat's git guard reads a scheme of one to three slashes**
+  (issue #203, the `[minor]` finding left on PR #202's approve; origin
+  TASK-1681352611, implementation TASK-1113899137). curl normalises
+  `https:/api.github.com/…` and `https:///api.github.com/…` to
+  `https://api.github.com/…` (curl 7.88.1 answers 200 for both; four
+  slashes is a malformed URL, exit 3), so the API URL pattern's scheme is
+  now `(https?:/{1,3})?` and `curl -X PUT https:/…/pulls/7/merge` and
+  `https:///…` are denied like the two-slash form. 0.31.32's "whatever
+  the URL's shape" left these two out.
+
 ## 0.31.32
 
 - **The reviewer seat's git guard closes two bypass classes** (issue #201,
