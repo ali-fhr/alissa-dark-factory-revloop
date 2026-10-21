@@ -117,6 +117,17 @@ HOLD_SKEW_SECONDS = 5 * 60
 # round window, and one WARNING names what holds the most bytes.
 BACKSTOP_PCT = 95.0
 
+# How long a held folder's cached size is trusted (issue #187). The cache is
+# keyed on the folder's newest mtime, which only sees the folder and its
+# direct children: a write deeper down (an `npm ci` filling `node_modules`)
+# leaves it unchanged. So an entry is re-walked once it is this old, mtime
+# or not.
+SIZE_CACHE_SECONDS = 60 * 60
+
+# One held folder's cached size: (newest mtime, bytes, the sweep `now` it
+# was walked at).
+SizeCache = dict[Path, tuple[float, int, float]]
+
 # The two reasons a hub-wide hold gives, so the sweep summary groups them.
 HUB_HOLD_BOUNDED = "a live round in this hub names no review task and spawned before this checkout"
 HUB_HOLD_UNBOUNDED = "a live round in this hub names no review task or spawn time"
@@ -259,6 +270,10 @@ class SweepResult:
     # checkouts only it released from a hub-wide hold.
     held_bytes: "dict[str, int]" = field(default_factory=dict)
     held_unsized: int = 0
+    # Issue #187: held folders whose size came from the cache, not a walk
+    # this sweep, so the summary can say its figure may be up to
+    # SIZE_CACHE_SECONDS old.
+    held_cached: int = 0
     backstop: bool = False
     backstop_released: int = 0
 
@@ -294,11 +309,16 @@ HELD_REASONS_LOGGED = 10
 def held_summary(result: SweepResult) -> str:
     """The sweep summary's held-bytes tail (issue #185): every hub/reason
     holding bytes, largest first, at most HELD_REASONS_LOGGED of them, and
-    how many held folders went unsized."""
+    how many held folders were sized from the cache or went unsized."""
     tail = held_reasons(result.top_held(HELD_REASONS_LOGGED))
     rest = len(result.held_bytes) - HELD_REASONS_LOGGED
     if rest > 0:
         tail += f", +{rest} more reason(s)"
+    if result.held_cached:
+        tail += (
+            f"; {result.held_cached} held size(s) cached, up to "
+            f"{SIZE_CACHE_SECONDS // 60} min old"
+        )
     if result.held_unsized:
         tail += f"; {result.held_unsized} held folder(s) not sized this sweep"
     return tail
@@ -415,9 +435,23 @@ def dir_bytes(path: "Path | str") -> int:
     """Bytes allocated under `path` (st_blocks, the figure `du` reports and a
     removal frees), following no symlinks. Iterative, and every per-entry
     error is skipped -- devloop's `dir_size` walk, counting blocks."""
+    return _walk_bytes(path, None) or 0
+
+
+def held_bytes_of(path: "Path | str", stop: "Callable[[], bool]") -> "int | None":
+    """`dir_bytes` for a held folder (issue #187): `stop` is asked before
+    each directory is read, and the walk gives up -- None, never a partial
+    figure -- the moment it answers True, so one large tree cannot run the
+    sweep past its time budget."""
+    return _walk_bytes(path, stop)
+
+
+def _walk_bytes(path: "Path | str", stop: "Callable[[], bool] | None") -> "int | None":
     total = 0
     stack = [os.fspath(path)]
     while stack:
+        if stop is not None and stop():
+            return None
         current = stack.pop()
         try:
             with os.scandir(current) as entries:
@@ -528,7 +562,7 @@ def sweep(
     pressure_grace_seconds: "float | None" = None,
     under_pressure: "Callable[[], bool] | None" = None,
     stale_round_seconds: "float | None" = None,
-    sizes: "dict[Path, tuple[float, int]] | None" = None,
+    sizes: "SizeCache | None" = None,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
     `guard` does not hold, oldest first, then prune each hub's worktree
@@ -559,10 +593,14 @@ def sweep(
     checkout older than that window: no live round can own a checkout older
     than the stale window. `backstop_released` counts what only it freed.
 
-    Every held folder is sized into `held_bytes` per hub and reason. `sizes`
-    (path -> (mtime, bytes)), when given, caches those walks across sweeps
-    and is re-keyed to this sweep's held folders; sizing stops at the time
-    budget too, and what was left unsized is counted in `held_unsized`."""
+    Every held folder is sized into `held_bytes` per hub and reason, AFTER
+    the removal loop and on whatever is left of the time budget (issue
+    #187): removal never pays for observability. A walk that reaches the
+    budget mid-tree is abandoned, and every folder left unsized is counted in
+    `held_unsized`. `sizes` (a `SizeCache`), when given, caches those walks
+    across sweeps and is re-keyed to this sweep's held folders; an entry is
+    reused while the folder's mtime is unchanged AND it is younger than
+    SIZE_CACHE_SECONDS by `now`, and each reuse is counted in `held_cached`."""
     result = SweepResult()
     started = clock()
     bounded = False
@@ -576,7 +614,7 @@ def sweep(
     if stale_round_seconds is not None:
         result.backstop = True
         void_before = now - stale_round_seconds
-    seen_sizes: "dict[Path, tuple[float, int]]" = {}
+    held_queue: "list[tuple[float, Candidate, str]]" = []
     aged: "list[tuple[float, Candidate]]" = []
     for hub in hub_list:
         result.hubs += 1
@@ -603,17 +641,7 @@ def sweep(
         if why is not None:
             log.debug("janitor: keeping %s — %s", candidate.path, why)
             result.held.append((candidate.path, why))
-            key = f"{candidate.hub_slug}: {why}"
-            cached = (sizes or {}).get(candidate.path)
-            if cached is not None and cached[0] == mtime:
-                size = cached[1]
-            elif clock() - started >= max_seconds:
-                result.held_unsized += 1
-                continue
-            else:
-                size = dir_bytes(candidate.path)
-            seen_sizes[candidate.path] = (mtime, size)
-            result.held_bytes[key] = result.held_bytes.get(key, 0) + size
+            held_queue.append((mtime, candidate, f"{candidate.hub_slug}: {why}"))
             continue
         early = age < grace_seconds
         if early and not dry_run and not (under_pressure and under_pressure()):
@@ -650,9 +678,8 @@ def sweep(
         result.removed.append((candidate.path, size))
         if early:
             result.pressure_removed += 1
-    if sizes is not None:
-        sizes.clear()
-        sizes.update(seen_sizes)
+    _size_held(held_queue, result, sizes, now=now,
+               out_of_time=lambda: clock() - started >= max_seconds)
     if dry_run:
         return result
     for hub in hub_list:
@@ -662,3 +689,37 @@ def sweep(
         except (CommandError, OSError) as exc:
             log.warning("janitor: git worktree prune failed in %s (%s)", hub, exc)
     return result
+
+
+def _size_held(
+    queue: "list[tuple[float, Candidate, str]]",
+    result: SweepResult,
+    sizes: "SizeCache | None",
+    *,
+    now: float,
+    out_of_time: "Callable[[], bool]",
+) -> None:
+    """Size the sweep's held folders into `result.held_bytes`, after the
+    removals (issue #187). A fresh cache entry costs nothing and is always
+    used; anything else is walked only while `out_of_time()` answers False,
+    and a walk is abandoned the moment it does. `sizes` is then re-keyed to
+    what this sweep sized, so entries for gone or unsized folders drop out."""
+    seen: SizeCache = {}
+    for mtime, candidate, key in queue:
+        cached = (sizes or {}).get(candidate.path)
+        if (cached is not None and cached[0] == mtime
+                and now - cached[2] < SIZE_CACHE_SECONDS):
+            size = cached[1]
+            seen[candidate.path] = cached
+            result.held_cached += 1
+        else:
+            walked = None if out_of_time() else held_bytes_of(candidate.path, out_of_time)
+            if walked is None:
+                result.held_unsized += 1
+                continue
+            size = walked
+            seen[candidate.path] = (mtime, size, now)
+        result.held_bytes[key] = result.held_bytes.get(key, 0) + size
+    if sizes is not None:
+        sizes.clear()
+        sizes.update(seen)

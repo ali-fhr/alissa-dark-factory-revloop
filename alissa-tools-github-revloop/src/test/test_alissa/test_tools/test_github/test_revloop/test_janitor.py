@@ -1194,8 +1194,9 @@ def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypa
     guard.hold("acme/widgets", 8, None, since=NOW - 3 * DAY)
     sizes: dict = {}
     walks = []
-    real = janitor_mod.dir_bytes
-    monkeypatch.setattr(janitor_mod, "dir_bytes", lambda p: walks.append(p) or real(p))
+    real = janitor_mod.held_bytes_of
+    monkeypatch.setattr(janitor_mod, "held_bytes_of",
+                        lambda p, stop: walks.append(p) or real(p, stop))
 
     first = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
 
@@ -1210,7 +1211,10 @@ def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypa
     second = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
     assert second.held_bytes == first.held_bytes
     assert len(walks) == 2, "an unchanged held folder is not walked again"
+    assert second.held_cached == 2 and first.held_cached == 0
     assert "widgets: TASK-70" in janitor_mod.held_summary(second)
+    assert "2 held size(s) cached, up to 60 min old" in janitor_mod.held_summary(second)
+    assert "cached" not in janitor_mod.held_summary(first)
 
 
 def test_held_folders_past_the_time_budget_go_unsized(tmp_path):
@@ -1224,6 +1228,93 @@ def test_held_folders_past_the_time_budget_go_unsized(tmp_path):
 
     assert len(result.held) == 1 and result.held_unsized == 1 and result.held_bytes == {}
     assert "1 held folder(s) not sized" in janitor_mod.held_summary(result)
+
+
+def test_held_sizes_are_re_walked_once_the_cache_entry_ages_out(tmp_path):
+    hub = make_hub(tmp_path)
+    held = folder(hub / "REVIEW-TASK-70", age=3 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    sizes: dict = {}
+    first = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
+    # An `npm ci` deep in the tree: the folder's newest mtime does not move.
+    deep = held / "node_modules" / "pkg"
+    deep.mkdir(parents=True)
+    (deep / "index.js").write_text("x" * 65536)
+    os.utime(held / "node_modules", (NOW - 3 * DAY, NOW - 3 * DAY))
+    os.utime(held, (NOW - 3 * DAY, NOW - 3 * DAY))
+
+    fresh = sweep([hub], guard, grace_seconds=GRACE, now=NOW + 60, runner=Runner(),
+                  sizes=sizes)
+    assert fresh.held_bytes == first.held_bytes and fresh.held_cached == 1
+
+    aged = sweep([hub], guard, grace_seconds=GRACE,
+                 now=NOW + janitor_mod.SIZE_CACHE_SECONDS, runner=Runner(), sizes=sizes)
+    assert aged.held_cached == 0
+    assert aged.held_total > first.held_total, "an aged entry is walked again"
+    assert next(iter(sizes.values()))[2] == NOW + janitor_mod.SIZE_CACHE_SECONDS
+
+
+def test_held_folders_are_sized_after_removals_so_sizing_never_defers_one(tmp_path, monkeypatch):
+    hub = make_hub(tmp_path)
+    folder(hub / "REVIEW-TASK-70", age=5 * DAY)  # held, and oldest: first in line
+    stale = folder(hub / "REVIEW-TASK-81", age=3 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    now = [0.0]
+    events = []
+
+    def slow_walk(path, stop):
+        events.append(("size", path.name))
+        now[0] += 1000.0  # one walk eats the whole budget
+        return 4096
+
+    real_remove = janitor_mod._remove
+
+    def remove(candidate, runner):
+        events.append(("remove", candidate.path.name))
+        real_remove(candidate, runner)
+
+    monkeypatch.setattr(janitor_mod, "held_bytes_of", slow_walk)
+    monkeypatch.setattr(janitor_mod, "_remove", remove)
+
+    result = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                   max_seconds=120.0, clock=lambda: now[0])
+
+    assert not stale.exists() and result.deferred == 0
+    assert events == [("remove", "REVIEW-TASK-81"), ("size", "REVIEW-TASK-70")]
+    assert result.held_total == 4096 and result.held_unsized == 0
+
+
+def test_held_sizing_gets_only_the_budget_the_removals_left(tmp_path):
+    hub = make_hub(tmp_path)
+    folder(hub / "REVIEW-TASK-70", age=3 * DAY)
+    folder(hub / "REVIEW-TASK-81", age=4 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    ticks = iter([0.0, 0.0, 200.0, 200.0, 200.0])  # the removal runs the budget out
+
+    result = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                   max_seconds=120.0, clock=lambda: next(ticks, 200.0))
+
+    assert len(result.removed) == 1
+    assert result.held_unsized == 1 and result.held_bytes == {}
+
+
+def test_a_held_walk_stops_mid_tree_at_the_budget(tmp_path):
+    root = tmp_path / "big"
+    for i in range(5):
+        (root / f"d{i}" / "deeper").mkdir(parents=True)
+        (root / f"d{i}" / "deeper" / "f").write_text("x" * 4096)
+    asked = []
+
+    def stop():
+        asked.append(1)
+        return len(asked) > 3
+
+    assert janitor_mod.held_bytes_of(root, stop) is None, "no partial figure"
+    assert len(asked) == 4
+    assert janitor_mod.held_bytes_of(root, lambda: False) == janitor_mod.dir_bytes(root) > 0
 
 
 def test_the_watcher_bounds_a_ledger_round_without_a_task_ref_by_its_spawn(ws, caplog):
