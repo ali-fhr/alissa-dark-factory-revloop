@@ -4,6 +4,27 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.29
+
+- **Push safety: reviewers never push or merge** (issue #195, MDF M7 GP-3;
+  origin TASK-376772128, implementation TASK-267850458). A stricter port of
+  devloop's GP-2: the reviewer seat has no push to judge, so none is allowed.
+  - **`docker/claude/hooks/guard-git.py`**, a `PreToolUse` hook registered
+    next to `guard-shell.py` (whose tokenizer it imports): denies every
+    `git push` and the other remote-writing verbs, `gh pr merge`, `gh api`
+    merges (`…/merges`, a non-GET `…/pulls/<n>/merge`, GraphQL merge
+    mutations), and the hook bypasses (`commit --no-verify`,
+    `core.hooksPath` via `-c` / `--config-env` / `git config`,
+    `GIT_CONFIG_NOSYSTEM`). The reason says to record findings in the review
+    instead. Fails open.
+  - **`docker/claude/git-hooks/pre-push`** refuses every push, installed as
+    every repository's hook by `git config --system core.hooksPath
+    /usr/local/share/alissa/git-hooks` (Dockerfile).
+  - **Entrypoint**: the root pass re-asserts the system `core.hooksPath` and
+    logs `push guard: ON (reviewer — every push refused)`; the executor role
+    (Studio queue jobs, not reviews) removes it and skips the git guard.
+    No off lever in the daemon role.
+
 ## 0.31.28
 
 - **Fleet auto-upgrade, the revloop self-hosted path** (issue #193, MDF M6
