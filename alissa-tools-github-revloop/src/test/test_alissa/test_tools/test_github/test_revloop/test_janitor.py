@@ -1196,7 +1196,7 @@ def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypa
     walks = []
     real = janitor_mod.held_bytes_of
     monkeypatch.setattr(janitor_mod, "held_bytes_of",
-                        lambda p, stop: walks.append(p) or real(p, stop))
+                        lambda p, stop, progress=None: walks.append(p) or real(p, stop, progress))
 
     first = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
 
@@ -1264,7 +1264,7 @@ def test_held_folders_are_sized_after_removals_so_sizing_never_defers_one(tmp_pa
     now = [0.0]
     events = []
 
-    def slow_walk(path, stop):
+    def slow_walk(path, stop, progress=None):
         events.append(("size", path.name))
         now[0] += 1000.0  # one walk eats the whole budget
         return 4096
@@ -1315,6 +1315,121 @@ def test_a_held_walk_stops_mid_tree_at_the_budget(tmp_path):
     assert janitor_mod.held_bytes_of(root, stop) is None, "no partial figure"
     assert len(asked) == 4
     assert janitor_mod.held_bytes_of(root, lambda: False) == janitor_mod.dir_bytes(root) > 0
+
+
+def tree(path: Path, dirs: int) -> Path:
+    """A held checkout with `dirs` subdirectories, one file each, so a walk
+    asks its stop question once per directory."""
+    for i in range(dirs):
+        (path / f"d{i}").mkdir(parents=True)
+        (path / f"d{i}" / "f").write_text("x" * 4096)
+    return path
+
+
+class Ticks:
+    """A clock that moves one second each time it is read, so the sweep's
+    budget buys a fixed number of directory reads."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        self.now += 1.0
+        return self.now
+
+
+def test_an_abandoned_held_walk_no_longer_starves_the_folders_behind_it(tmp_path):
+    # Issue #189, the review probe of PR #188: `big` (oldest, so first in
+    # line) needs more than one sweep's budget, `small` queues behind it.
+    hub = make_hub(tmp_path)
+    big = folder(tree(hub / "REVIEW-TASK-70", 30), age=4 * DAY)
+    small = folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    guard.hold("acme/widgets", 8, "TASK-81")
+    big_key = "widgets: TASK-70 has a live session or open round"
+    small_key = "widgets: TASK-81 has a live session or open round"
+    sizes: dict = {}
+    clock = Ticks()
+
+    def one_sweep():
+        return sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                     max_seconds=10.0, clock=clock, sizes=sizes)
+
+    first = one_sweep()
+    assert first.held_bytes == {} and first.held_unsized == 2
+    assert first.held_resuming == 1, "big's walk is kept, small never began"
+    assert isinstance(sizes[big], janitor_mod.HeldWalk) and small not in sizes
+    assert "(1 walk(s) resume next sweep)" in janitor_mod.held_summary(first)
+    kept = sizes[big].total
+    assert kept > 0
+
+    second = one_sweep()
+    assert second.held_bytes == {small_key: janitor_mod.dir_bytes(small)}, \
+        "small is sized ahead of the walk that was cut short"
+    assert second.held_unsized == 1 and second.held_resuming == 1
+    assert sizes[big].total > kept, "big's walk carried on, it did not restart"
+
+    sweeps = [first, second]
+    while isinstance(sizes.get(big), janitor_mod.HeldWalk):
+        sweeps.append(one_sweep())
+        assert len(sweeps) < 10, "big's walk never finished"
+    done = sweeps[-1]
+    assert done.held_bytes[big_key] == janitor_mod.dir_bytes(big)
+    assert done.held_unsized == 0 and done.held_resuming == 0
+    assert sizes[big] == (NOW - 4 * DAY, janitor_mod.dir_bytes(big), NOW)
+    assert all(sw.held_bytes.get(small_key) for sw in sweeps[1:]), \
+        "small stays sized (from the cache) on every sweep after the first"
+
+
+def test_a_held_walk_cut_short_restarts_when_its_folder_mtime_moves(tmp_path):
+    hub = make_hub(tmp_path)
+    big = folder(tree(hub / "REVIEW-TASK-70", 30), age=4 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    sizes: dict = {}
+    sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+          max_seconds=10.0, clock=Ticks(), sizes=sizes)
+    assert isinstance(sizes[big], janitor_mod.HeldWalk)
+    sizes[big].total += 10 ** 9  # a stale partial figure must not survive
+    folder(big, age=3 * DAY, files=("new.diff",))
+
+    later = sweep([hub], guard, grace_seconds=GRACE, now=NOW + 60, runner=Runner(),
+                  sizes=sizes)
+
+    assert later.held_total == janitor_mod.dir_bytes(big)
+    assert sizes[big] == (NOW - 3 * DAY, janitor_mod.dir_bytes(big), NOW + 60)
+
+
+def test_a_held_walk_cut_short_is_kept_when_no_budget_is_left_to_resume_it(tmp_path):
+    hub = make_hub(tmp_path)
+    big = folder(tree(hub / "REVIEW-TASK-70", 30), age=4 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    sizes: dict = {}
+    sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+          max_seconds=10.0, clock=Ticks(), sizes=sizes)
+    kept = sizes[big]
+
+    starved = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                    max_seconds=0.0, sizes=sizes)
+
+    assert starved.held_unsized == 1 and starved.held_resuming == 1
+    assert sizes[big] is kept, "the walk keeps its place for a sweep with budget"
+
+
+def test_a_held_walk_resumes_from_its_progress(tmp_path):
+    root = tree(tmp_path / "big", 6)
+    progress = janitor_mod.HeldWalk(0.0, NOW, 0, [os.fspath(root)])
+    asked = []
+
+    def stop():
+        asked.append(1)
+        return len(asked) > 3
+
+    assert janitor_mod.held_bytes_of(root, stop, progress) is None
+    assert progress.total > 0 and progress.stack, "the walk left its place"
+    assert janitor_mod.held_bytes_of(root, lambda: False, progress) == janitor_mod.dir_bytes(root)
 
 
 def test_the_watcher_bounds_a_ledger_round_without_a_task_ref_by_its_spawn(ws, caplog):

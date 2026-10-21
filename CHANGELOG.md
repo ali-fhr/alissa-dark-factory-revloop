@@ -4,6 +4,25 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.26
+
+- **A held folder too big for one sweep no longer starves the held folders
+  behind it** (issue #189, the `[minor]` finding left on PR #188's approve;
+  origin TASK-1654535453, implementation TASK-964751730).
+  - A held-size walk cut short by the sweep's leftover budget is kept in the
+    size cache (`HeldWalk`: the bytes counted so far and the directories
+    still to read). The next sweep sizes every other held folder first, then
+    resumes that walk where it stopped instead of starting over, so the big
+    tree gets its figure after a few sweeps and no sweep's budget is spent
+    re-reading what an earlier one already counted.
+  - The walk restarts from scratch if the folder's newest mtime moved. A
+    finished resumed walk is cached as of the sweep it began in, so the
+    hourly re-walk counts from the oldest directory it read.
+  - The sweep summary's unsized count says how many of those walks resume
+    next sweep (`N held folder(s) not sized this sweep (M walk(s) resume
+    next sweep)`).
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.26.
+
 ## 0.31.25
 
 - **Held-folder sizing no longer competes with removals, and its cache
