@@ -17,6 +17,13 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     `core.hooksPath` via `-c` / `--config-env` / `git config`,
     `GIT_CONFIG_NOSYSTEM`). The reason says to record findings in the review
     instead. Fails open.
+  - Review round 1 (PR #196): the guard also denies pushes by API — a non-GET
+    `gh api` on `…/git/(refs|commits|trees|blobs|tags)` or `…/contents/…`,
+    `gh pr update-branch` and `…/update-branch`, the GraphQL ref and commit
+    mutations, and a `gh api graphql` query it cannot read (`-F
+    query=@file`, `--input`, `$VAR`) — and a `git config alias.<x>` write
+    that runs a push. The pre-push header and the README name the gap both
+    layers share: a `--no-verify` push the guard cannot read in the command.
   - **`docker/claude/git-hooks/pre-push`** refuses every push, installed as
     every repository's hook by `git config --system core.hooksPath
     /usr/local/share/alissa/git-hooks` (Dockerfile).

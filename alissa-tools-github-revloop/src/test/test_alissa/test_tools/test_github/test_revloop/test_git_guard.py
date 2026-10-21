@@ -169,6 +169,61 @@ def test_every_merge_is_denied(command):
     denied(command)
 
 
+# -- every push by API (PR #196 round 1) -------------------------------------------
+
+API_PUSHES = [
+    # REST ref writes: force-move, create, delete a branch
+    "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc -F force=true",
+    "gh api --method=patch /repos/o/r/git/refs/heads/main -f sha=abc",
+    "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
+    "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
+    "gh api -X DELETE repos/o/r/git/refs/heads/main",
+    "gh api -XDELETE https://api.github.com/repos/o/r/git/refs/tags/v1",
+    'gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$SHA"',
+    "gh api repos/{owner}/{repo}/git/refs -f ref=refs/heads/x -f sha=abc",
+    # the incident's sequence: trees → commits → refs
+    "gh api repos/o/r/git/trees -f 'tree[][path]=x'",
+    "gh api -X POST repos/o/r/git/commits -f message=m -f tree=abc",
+    "gh api repos/o/r/git/blobs -f content=x",
+    "gh api repos/o/r/git/tags -f tag=v1 -f object=abc -f type=commit",
+    "gh api repos/o/r/git/trees --input tree.json",
+    # a file committed to (or removed from) a branch
+    "gh api repos/o/r/contents/x -X PUT -f message=m -f content=eA==",
+    "gh api -X PUT repos/o/r/contents/docs/a.md -f message=m -f content=eA== -f branch=main",
+    "gh api -X DELETE repos/o/r/contents/x -f message=m -f sha=abc",
+    # a merge commit onto the PR's branch
+    "gh pr update-branch 7",
+    "gh pr update-branch 7 --rebase",
+    "gh api -X PUT repos/o/r/pulls/7/update-branch",
+    # GraphQL ref and commit mutations
+    "gh api graphql -f query='mutation { updateRef(input: {refId: \"x\", oid: \"y\", force: true}) { ref { name } } }'",
+    "gh api graphql -f query='mutation { updateRefs(input: {repositoryId: \"x\"}) { clientMutationId } }'",
+    "gh api graphql -f query='mutation { createRef(input: {}) { ref { name } } }'",
+    "gh api graphql -f query='mutation { deleteRef(input: {refId: \"x\"}) { clientMutationId } }'",
+    "gh api graphql -f query='mutation($i: X!) { createCommitOnBranch(input: $i) { commit { oid } } }'",
+    "gh api graphql -f query='mutation { updatePullRequestBranch(input: {}) { clientMutationId } }'",
+    # GraphQL whose query text never reaches the guard
+    "gh api graphql -F query=@q.graphql",
+    "gh api graphql --field=query=@q.graphql",
+    "gh api graphql -F query=@- < q.graphql",
+    "gh api graphql --input body.json",
+    'gh api graphql -f query="$Q"',
+    'gh api graphql -f query="$(cat q.graphql)"',
+]
+
+
+@pytest.mark.parametrize("command", API_PUSHES)
+def test_every_push_by_api_is_denied(command):
+    denied(command)
+
+
+def test_the_api_push_reason_names_the_path():
+    reason = denied("gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc")
+    assert "`gh api -X PATCH repos/o/r/git/refs/heads/main` writes git objects or refs" in reason, reason
+    reason = denied("gh api graphql -F query=@q.graphql")
+    assert "cannot read" in reason and "-f query='…'" in reason, reason
+
+
 # -- hook bypasses ---------------------------------------------------------------
 
 BYPASSES = [
@@ -184,6 +239,13 @@ BYPASSES = [
     "git --config-env core.hooksPath=HOOKS fetch",
     "git -c alias.p=push p",
     "git -c 'alias.ship=!git push origin HEAD' ship",
+    # the persistent alias (PR #196 round 1)
+    "git config --global alias.p 'push --no-verify'",
+    "git config alias.p push",
+    "git config --local alias.ship '!git push origin HEAD'",
+    "git config set --global alias.p push",
+    "git config --add alias.sp send-pack",
+    "git config --global ALIAS.P 'push -f'",
     "git config core.hooksPath /dev/null",
     "git config core.hooksPath",
     "git config --global core.hooksPath /tmp/h",
@@ -265,6 +327,22 @@ PASSES = [
     "gh api repos/acme/app/pulls/7/comments --paginate",
     "gh api -X POST repos/acme/app/issues/7/comments -f body='do not merge yet'",
     "gh api graphql -f query='query { repository(owner: \"a\", name: \"b\") { pullRequest(number: 7) { merged } } }'",
+    # reads of what the API-push rows write (PR #196 round 1)
+    "gh api -X POST repos/acme/app/pulls/7/reviews -f event=REQUEST_CHANGES -f body=x",
+    "gh api repos/acme/app/pulls/7/reviews --input review.json",
+    "gh api repos/acme/app/git/refs/heads/main",
+    "gh api repos/acme/app/git/ref/heads/main --jq .object.sha",
+    "gh api repos/acme/app/git/commits/abc",
+    "gh api repos/acme/app/git/trees/abc?recursive=1",
+    "gh api repos/acme/app/contents/README.md",
+    "gh api -X GET repos/acme/app/contents/docs -f ref=TASK-1-x",
+    "gh api graphql -f query='query($n: Int!) { node(id: $n) { id } }' -F n=7",
+    "gh api graphql -F owner=a -f query='query($owner: String!) { repositoryOwner(login: $owner) { id } }'",
+    "gh pr view 7 --json headRefName",
+    "git config --get-regexp alias",
+    "git config --global --get alias.p",
+    "git config alias.p",
+    "git config --global alias.st status",
     'echo "git push --force"',
     "grep -rn 'git push' docs/",
     "grep -rn 'gh pr merge' .",

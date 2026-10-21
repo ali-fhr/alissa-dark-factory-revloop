@@ -20,7 +20,10 @@
 # config (husky's `prepare` sets one) wins over this system one, and
 # GIT_CONFIG_NOSYSTEM drops the system config — guard-git.py refuses both
 # shapes in a command; `git push --no-verify` skips every pre-push hook, and
-# guard-git.py refuses every `git push` anyway.
+# guard-git.py refuses it only where it can read it in the Bash command: a
+# push it cannot see (`echo 'git push --no-verify' | sh`, `watch git push
+# --no-verify`, a `python3 -c` string, a script) passes both layers. Pushes
+# through the GitHub API never reach git at all; only guard-git.py sees them.
 #
 # Exercised by docker/claude/tests-hooks-guard.sh (section 5).
 # =============================================================================

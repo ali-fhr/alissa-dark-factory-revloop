@@ -19,6 +19,13 @@ inside `sh -c` / `bash -c` / `eval` strings):
   * every push: `git push` in any form, and the other git verbs that write a
     remote's refs or objects — `send-pack`, `http-push`, `subtree push`,
     `lfs push` — plus `gh repo sync` (it moves a branch on GitHub);
+  * every push by API (round 1 of PR #196): a non-GET `gh api` on
+    `…/git/(refs|commits|trees|blobs|tags)` or `…/contents/…`, `gh pr
+    update-branch` and a non-GET `…/pulls/<n>/update-branch`, the GraphQL
+    ref and commit mutations (`createRef`, `updateRef(s)`, `deleteRef`,
+    `createCommitOnBranch`, `updatePullRequestBranch`), and any `gh api
+    graphql` call whose query the guard cannot read (`-F query=@file`,
+    `--input`, a query from `$VAR` / `$(…)`);
   * every merge: `gh pr merge`, `gh api … /merges`, a non-GET `gh api` on
     `…/pulls/<n>/merge` (`-X PUT`, or a POST implied by `-f`/`-F`/`--input`)
     or `…/merge-upstream`, and a `gh api graphql` call naming the
@@ -26,7 +33,8 @@ inside `sh -c` / `bash -c` / `eval` strings):
     mutations;
   * hook bypass: `git commit --no-verify` (any abbreviation, `-n` in a short
     cluster), `-c core.hooksPath=…` / `--config-env=core.hooksPath=…` on any
-    git command, `-c alias.<x>=…` that runs a push, any `git config` naming
+    git command, an alias that runs a push (`-c alias.<x>=…` or a `git
+    config` write of `alias.<x>`), any `git config` naming
     `core.hooksPath` except an explicit read (`--get`, `get`, `--list`, …),
     and an assignment of `GIT_CONFIG_NOSYSTEM` / `GIT_CONFIG_SYSTEM` (they
     switch the system pre-push off) or of a `GIT_CONFIG_*` value carrying
@@ -34,12 +42,16 @@ inside `sh -c` / `bash -c` / `eval` strings):
 
 WHAT IT LETS THROUGH. Everything else — `git fetch`, `git worktree add
 ../REVIEW-x <sha>`, `git log`, `git diff`, `gh pr review`, `gh pr view`,
-`gh api …/pulls/<n>/reviews`, `echo "git push"`, `git commit -m "no push"`.
+`gh api …/pulls/<n>/reviews`, `gh api …/contents/<path>` (a read), GraphQL
+queries, `echo "git push"`, `git commit -m "no push"`.
 
 The system pre-push hook (docker/claude/git-hooks/pre-push, every
 repository's hook via `git config --system core.hooksPath`) refuses every
 push again at git level, for pushes this guard cannot see (a script, a test
-suite); the GitHub API merges have no git-level backstop.
+suite); the GitHub API merges and ref writes have no git-level backstop.
+Neither layer is airtight: this guard reads only the Bash command text, so a
+push it cannot see (`… | sh`, `watch git push`, a `python3 -c` string, a
+script) that also passes `--no-verify` skips the pre-push too.
 
 FAIL-OPEN, like guard-shell: malformed stdin, a non-Bash tool, a missing
 guard-shell.py, or ANY exception → exit 0 with no stdout and one line on
@@ -70,6 +82,7 @@ REASON_TAIL = (
 TRIGGER = re.compile(r"\b(git|gh|GIT_CONFIG\w*)\b")
 
 PUSH_VERBS = ("push", "send-pack", "http-push")
+PUSH_IN_ALIAS = re.compile(r"\b(push|send-pack|http-push)\b")
 PUSH_SUBVERBS = {"subtree": "push", "lfs": "push"}  # `git subtree push`, `git lfs push`
 NO_VERIFY = "--no-verify"
 # `git commit` short options that consume the rest of their cluster (or the
@@ -98,6 +111,14 @@ GH_API_OPT_ARGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H",
                    "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview")
 GH_API_BODY = ("-f", "--raw-field", "-F", "--field", "--input")
 GH_MERGE_MUTATIONS = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b")
+# GraphQL mutations that write a ref or a commit: pushes by another name.
+GH_REF_MUTATIONS = re.compile(
+    r"\b(createRef|updateRef|updateRefs|deleteRef|createCommitOnBranch|updatePullRequestBranch)\b")
+# REST paths whose non-GET methods write git objects or refs (`git/trees` →
+# `git/commits` → `PATCH git/refs` lands a commit on a branch with no git push),
+# or commit a file to a branch (`PUT …/contents/<path>`).
+GH_GIT_WRITE_PATH = re.compile(r"(^|/)git/(refs|commits|trees|blobs|tags)(/|$)|(^|/)contents(/|$)")
+GH_FIELD = ("-F", "--field")  # the typed field: `@file` reads its value from a file
 GH_PR_OPT_ARGS = ("-R", "--repo")
 
 
@@ -241,7 +262,7 @@ class GitGuard:
         key = key.lower()
         if key == HOOKS_PATH:
             return self.reason("`-c core.hooksPath=…` bypasses the seat's git hooks")
-        if key.startswith("alias.") and re.search(r"\b(push|send-pack|http-push)\b", value):
+        if key.startswith("alias.") and PUSH_IN_ALIAS.search(value):
             return self.reason(f"`-c {key}=…` runs a push")
         return None
 
@@ -266,10 +287,15 @@ class GitGuard:
         return None
 
     def check_config(self, args):
-        lowered = [w.text.lower() for w in args]
-        if not any(t == HOOKS_PATH or t.startswith(HOOKS_PATH + "=") for t in lowered):
-            return None
         if any(w.text in CONFIG_READS for w in args):
+            return None
+        lowered = [w.text.lower() for w in args]
+        for k, t in enumerate(lowered):
+            # `git config --global alias.p 'push --no-verify'`: the persistent
+            # form of `-c alias.p=push`; a bare `git config alias.p` is a read.
+            if t.startswith("alias.") and any(PUSH_IN_ALIAS.search(v) for v in lowered[k + 1:]):
+                return self.reason(f"`git config {args[k].text} …` makes an alias that runs a push")
+        if not any(t == HOOKS_PATH or t.startswith(HOOKS_PATH + "=") for t in lowered):
             return None
         return self.reason("`git config core.hooksPath` changes the seat's git hooks")
 
@@ -282,6 +308,8 @@ class GitGuard:
             positional = self._positional(args[1:], GH_PR_OPT_ARGS)
             if positional[:1] == ["merge"]:
                 return self.reason("`gh pr merge` merges a pull request")
+            if positional[:1] == ["update-branch"]:
+                return self.reason("`gh pr update-branch` writes a commit onto the pull request's branch")
             return None
         if sub == "repo":
             if self._positional(args[1:], ())[:1] == ["sync"]:
@@ -309,9 +337,11 @@ class GitGuard:
         body = False
         endpoint = None
         texts = []
+        unread_query = False  # a GraphQL query whose text the guard cannot see
         j, n = 0, len(args)
         while j < n:
-            t = args[j].text
+            w = args[j]
+            t = w.text
             texts.append(t)
             name, eq, attached = t.partition("=")
             if t.startswith("-X") and len(t) > 2:
@@ -319,15 +349,18 @@ class GitGuard:
             elif name == "--method" and eq:
                 method = attached
             elif t in GH_API_OPT_ARGS:
-                value = args[j + 1].text if j + 1 < n else ""
+                nxt = args[j + 1] if j + 1 < n else None
+                value = nxt.text if nxt else ""
                 texts.append(value)
                 if t in ("-X", "--method"):
                     method = value
                 if t in GH_API_BODY:
                     body = True
+                    unread_query |= self._unread_query(t, value, nxt)
                 j += 1
             elif name in GH_API_BODY and eq:
                 body = True
+                unread_query |= self._unread_query(name, attached, w)
             elif not t.startswith("-") and endpoint is None:
                 endpoint = t
             j += 1
@@ -338,6 +371,11 @@ class GitGuard:
         if path == "graphql":
             if any(GH_MERGE_MUTATIONS.search(t) for t in texts):
                 return self.reason("a GraphQL merge mutation merges a pull request")
+            if any(GH_REF_MUTATIONS.search(t) for t in texts):
+                return self.reason("a GraphQL ref or commit mutation writes to a branch")
+            if unread_query:
+                return self.reason("a GraphQL query the guard cannot read (`@file`, `--input`, `$…`) may "
+                                   "write a branch; inline it with `-f query='…'`")
             return None
         if path == "merges" or path.endswith("/merges"):
             return self.reason("`gh api …/merges` merges a branch")
@@ -346,7 +384,28 @@ class GitGuard:
                 return self.reason(f"`gh api -X {method} …/merge` merges a pull request")
             if path.endswith("/merge-upstream"):
                 return self.reason("`gh api …/merge-upstream` pushes a branch")
+            if re.search(r"(^|/)pulls/[^/]+/update-branch$", path):
+                return self.reason("`gh api …/update-branch` writes a commit onto the pull request's branch")
+            if GH_GIT_WRITE_PATH.search(path):
+                return self.reason(f"`gh api -X {method} {path}` writes git objects or refs (a push by another name)")
         return None
+
+    def _unread_query(self, opt, value, word):
+        """True when this body option hides a GraphQL query's text: `--input`
+        (the whole body from a file or stdin), `-F query=@file`, or a query
+        value built from a `$VAR` / `$(…)` expansion. The tokenizer flags a
+        single-quoted `$` too (GraphQL's own `$var`), so a variable is told
+        by content: every operation the guard can read carries a `{`."""
+        if opt == "--input":
+            return True
+        key, eq, val = value.partition("=")
+        if key != "query" or not eq:
+            return False
+        if opt in GH_FIELD and val.startswith("@"):
+            return True
+        if word is not None and self.gs.F_SUBST in word.flags:
+            return True
+        return "{" not in val
 
     # -- the walk ---------------------------------------------------------------
     def check(self, command):
