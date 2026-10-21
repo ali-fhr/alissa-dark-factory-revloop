@@ -26,6 +26,16 @@ inside `sh -c` / `bash -c` / `eval` strings):
     `createCommitOnBranch`, `updatePullRequestBranch`), and any `gh api
     graphql` call whose query the guard cannot read (`-F query=@file`,
     `--input`, a query from `$VAR` / `$(…)`);
+  * the same API writes sent with `curl` / `wget` to a literal
+    `api.github.com` URL (round 2): a non-GET method — explicit, or implied
+    by a body (`-d`, `--json`, `-F`, `-T`, `--post-data`, …) — on the paths
+    above, a GraphQL ref or merge mutation in the body, or a GraphQL body
+    read from a file (`@…`) or built by `$(…)`;
+  * every gh form, whatever flags come before the subcommand (round 2): gh
+    is a cobra CLI and finds `pr merge` in `gh -R o/r pr merge 7` and `api`
+    in `gh -X PUT api …`, so the guard looks the subcommand up the same way;
+    and a `gh alias set` whose expansion is one of the commands above, or
+    any `gh alias import` (its aliases come from a file);
   * every merge: `gh pr merge`, `gh api … /merges`, a non-GET `gh api` on
     `…/pulls/<n>/merge` (`-X PUT`, or a POST implied by `-f`/`-F`/`--input`)
     or `…/merge-upstream`, and a `gh api graphql` call naming the
@@ -51,7 +61,9 @@ push again at git level, for pushes this guard cannot see (a script, a test
 suite); the GitHub API merges and ref writes have no git-level backstop.
 Neither layer is airtight: this guard reads only the Bash command text, so a
 push it cannot see (`… | sh`, `watch git push`, a `python3 -c` string, a
-script) that also passes `--no-verify` skips the pre-push too.
+script) that also passes `--no-verify` skips the pre-push too. The same
+holds for API writes the command does not spell out: a URL in a variable, a
+`curl -K` config file, another HTTP client (httpie, a `python3 -c` request).
 
 FAIL-OPEN, like guard-shell: malformed stdin, a non-Bash tool, a missing
 guard-shell.py, or ANY exception → exit 0 with no stdout and one line on
@@ -79,7 +91,7 @@ REASON_TAIL = (
 )
 
 # The quick prefilter: a command that names none of these is never parsed.
-TRIGGER = re.compile(r"\b(git|gh|GIT_CONFIG\w*)\b")
+TRIGGER = re.compile(r"\b(git|gh|GIT_CONFIG\w*)\b|api\.github\.com")
 
 PUSH_VERBS = ("push", "send-pack", "http-push")
 PUSH_IN_ALIAS = re.compile(r"\b(push|send-pack|http-push)\b")
@@ -119,7 +131,24 @@ GH_REF_MUTATIONS = re.compile(
 # or commit a file to a branch (`PUT …/contents/<path>`).
 GH_GIT_WRITE_PATH = re.compile(r"(^|/)git/(refs|commits|trees|blobs|tags)(/|$)|(^|/)contents(/|$)")
 GH_FIELD = ("-F", "--field")  # the typed field: `@file` reads its value from a file
-GH_PR_OPT_ARGS = ("-R", "--repo")
+# gh (cobra) words that never take the next word as a value while it looks
+# up a subcommand; any other `--flag` (no `=`) or two-letter `-x` does.
+COBRA_BOOL = ("-h", "--help", "--version")
+
+# curl / wget straight to the REST or GraphQL API (round 2 of PR #196).
+GH_API_URL = re.compile(r"(https?://)?api\.github\.com(:\d+)?(/|$)")
+CURL_BODY = ("--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode", "--json", "--form",
+             "--form-string")
+# curl long options whose value is the NEXT word.
+CURL_LONG_ARGS = CURL_BODY + ("--request", "--upload-file", "--header", "--url", "--user", "--output", "--config",
+                              "--user-agent", "--referer", "--cookie", "--cookie-jar", "--max-time",
+                              "--connect-timeout", "--retry", "--proxy", "--cacert", "--cert", "--key",
+                              "--write-out", "--oauth2-bearer", "--resolve", "--connect-to", "--range",
+                              "--dump-header", "--limit-rate", "--max-filesize")
+# curl short options that take a value (the rest of the cluster, else the next word).
+CURL_ARG_SHORTS = "XdFTHouAbceKxwrmCEyYzDUQPt"
+WGET_BODY = ("--post-data", "--post-file", "--body-data", "--body-file")
+WGET_OPT_ARGS = WGET_BODY + ("--method", "--header", "--output-document", "--user", "--password")
 
 
 def _load_shell_guard():
@@ -158,6 +187,27 @@ def _assignment(text):
     return None
 
 
+def _cobra_subcommand(args):
+    """The index of the subcommand gh (cobra) runs, or None. Cobra skips
+    flags while it looks the subcommand up: a `--flag` without `=` or a
+    two-letter `-x` takes the next word as its value (unless it is a known
+    boolean such as `--help`), and `--` ends the lookup. So `gh -R o/r pr
+    merge`, `gh -X PUT api …` and `gh --jq .x api …` all reach their
+    subcommand — checked against gh 2.102."""
+    i, n = 0, len(args)
+    while i < n:
+        t = args[i].text
+        if t == "--":
+            return None
+        if t and not t.startswith("-"):
+            return i
+        if "=" not in t and t not in COBRA_BOOL and (t.startswith("--") or len(t) == 2):
+            i += 2
+        else:
+            i += 1
+    return None
+
+
 def _endpoint_path(text):
     """`/repos/o/r/pulls/1/merge?x=1` → `repos/o/r/pulls/1/merge`."""
     path = text.split("?", 1)[0].strip("/")
@@ -193,7 +243,7 @@ class GitGuard:
         args = cmd[1:]
         if head == "xargs":  # `… | xargs git push`: judge the command it runs
             for k, w in enumerate(args):
-                if posixpath.basename(w.text) in ("git", "gh"):
+                if posixpath.basename(w.text) in ("git", "gh", "curl", "wget"):
                     return self.check_segment(args[k:])
             return None
         if head in SHELLS:  # `bash -c 'git push'`, `sh -ec "…"`
@@ -207,6 +257,8 @@ class GitGuard:
             return self.check_git(args)
         if head == "gh":
             return self.check_gh(args)
+        if head in ("curl", "wget"):
+            return self.check_http(head, args)
         return None
 
     def _inner(self, command):
@@ -301,38 +353,58 @@ class GitGuard:
 
     # -- gh ---------------------------------------------------------------------
     def check_gh(self, args):
-        if not args:
+        # gh (cobra) finds each subcommand past any flags written before it —
+        # `gh -R o/r pr merge 7`, `gh -X PUT api …` — so the subcommand is the
+        # first positional by cobra's rule, never simply the first word.
+        k = _cobra_subcommand(args)
+        if k is None:
             return None
-        sub = args[0].text
+        sub, lead, rest = args[k].text, args[:k], args[k + 1:]
         if sub == "pr":
-            positional = self._positional(args[1:], GH_PR_OPT_ARGS)
-            if positional[:1] == ["merge"]:
+            j = _cobra_subcommand(rest)
+            verb = rest[j].text if j is not None else None
+            if verb == "merge":
                 return self.reason("`gh pr merge` merges a pull request")
-            if positional[:1] == ["update-branch"]:
+            if verb == "update-branch":
                 return self.reason("`gh pr update-branch` writes a commit onto the pull request's branch")
             return None
         if sub == "repo":
-            if self._positional(args[1:], ())[:1] == ["sync"]:
+            j = _cobra_subcommand(rest)
+            if j is not None and rest[j].text == "sync":
                 return self.reason("`gh repo sync` pushes a branch")
             return None
         if sub == "api":
-            return self.check_gh_api(args[1:])
+            # the leading words are flags and their values: never the endpoint
+            return self.check_gh_api(list(lead) + list(rest), lead=len(lead))
+        if sub == "alias":
+            return self.check_gh_alias(rest)
         return None
 
-    @staticmethod
-    def _positional(args, opt_args):
-        out = []
-        skip = False
-        for w in args:
-            if skip:
-                skip = False
-            elif w.text in opt_args:
-                skip = True
-            elif not w.text.startswith("-"):
-                out.append(w.text)
-        return out
+    def check_gh_alias(self, args):
+        """`gh alias set m 'pr merge'` then `gh m 7`: the persistent form of a
+        denied command. Judge the expansion as the command it stands for; an
+        `import` reads its aliases from a file the guard cannot see."""
+        j = _cobra_subcommand(args)
+        if j is None:
+            return None
+        verb, rest = args[j].text, args[j + 1:]
+        if verb == "import":
+            return self.reason("`gh alias import` defines aliases the guard cannot read")
+        if verb != "set":
+            return None
+        shell = any(w.text in ("-s", "--shell") for w in rest)
+        positional = [w.text for w in rest if not w.text.startswith("-")]
+        if len(positional) < 2:
+            return None
+        expansion = positional[1]
+        if expansion.startswith("!"):
+            shell, expansion = True, expansion[1:]
+        hit = self._inner(expansion if shell else "gh " + expansion)
+        if hit:
+            return self.reason(f"`gh alias set {positional[0]} …` makes an alias that runs a denied command")
+        return None
 
-    def check_gh_api(self, args):
+    def check_gh_api(self, args, lead=0):
         method = None
         body = False
         endpoint = None
@@ -361,34 +433,121 @@ class GitGuard:
             elif name in GH_API_BODY and eq:
                 body = True
                 unread_query |= self._unread_query(name, attached, w)
-            elif not t.startswith("-") and endpoint is None:
+            elif not t.startswith("-") and endpoint is None and j >= lead:
                 endpoint = t
             j += 1
         if endpoint is None:
             return None
         method = (method or ("POST" if body else "GET")).upper()
-        path = _endpoint_path(endpoint)
+        return self.judge_api("gh api", method, _endpoint_path(endpoint), texts, unread_query)
+
+    def judge_api(self, tool, method, path, texts, unread_query):
+        """The deny reason for one GitHub API call (`gh api`, or curl / wget
+        to api.github.com), or None."""
         if path == "graphql":
             if any(GH_MERGE_MUTATIONS.search(t) for t in texts):
                 return self.reason("a GraphQL merge mutation merges a pull request")
             if any(GH_REF_MUTATIONS.search(t) for t in texts):
                 return self.reason("a GraphQL ref or commit mutation writes to a branch")
             if unread_query:
+                hint = "`-f query='…'`" if tool == "gh api" else "the request body"
                 return self.reason("a GraphQL query the guard cannot read (`@file`, `--input`, `$…`) may "
-                                   "write a branch; inline it with `-f query='…'`")
+                                   f"write a branch; inline it with {hint}")
             return None
         if path == "merges" or path.endswith("/merges"):
-            return self.reason("`gh api …/merges` merges a branch")
-        if method != "GET":
+            return self.reason(f"`{tool} …/merges` merges a branch")
+        if method not in ("GET", "HEAD"):
             if re.search(r"(^|/)pulls/[^/]+/merge$", path):
-                return self.reason(f"`gh api -X {method} …/merge` merges a pull request")
+                return self.reason(f"`{tool} -X {method} …/merge` merges a pull request")
             if path.endswith("/merge-upstream"):
-                return self.reason("`gh api …/merge-upstream` pushes a branch")
+                return self.reason(f"`{tool} …/merge-upstream` pushes a branch")
             if re.search(r"(^|/)pulls/[^/]+/update-branch$", path):
-                return self.reason("`gh api …/update-branch` writes a commit onto the pull request's branch")
+                return self.reason(f"`{tool} …/update-branch` writes a commit onto the pull request's branch")
             if GH_GIT_WRITE_PATH.search(path):
-                return self.reason(f"`gh api -X {method} {path}` writes git objects or refs (a push by another name)")
+                return self.reason(f"`{tool} -X {method} {path}` writes git objects or refs (a push by another name)")
         return None
+
+    # -- curl / wget to the GitHub API ------------------------------------------
+    def check_http(self, head, args):
+        """The same REST and GraphQL writes sent straight to api.github.com.
+        Only a URL spelled out in the command is seen (a URL in a variable or
+        a `curl -K` config file is not)."""
+        urls = [w.text for w in args if GH_API_URL.match(w.text)]
+        if not urls:
+            return None
+        method = None
+        body = False
+        get = False
+        unread = False
+        texts = [w.text for w in args]
+        j, n = 0, len(args)
+        while j < n:
+            w = args[j]
+            t = w.text
+            nxt = args[j + 1] if j + 1 < n else None
+            name, eq, attached = t.partition("=")
+            if t.startswith("--"):
+                if head == "wget":
+                    value = attached if eq else (nxt.text if nxt and name in WGET_OPT_ARGS else "")
+                    used = nxt if not eq else w
+                    if name == "--method":
+                        method = value
+                    elif name in WGET_BODY:
+                        body = True
+                        unread |= name.endswith("-file") or self._unread_body(value, used)
+                else:
+                    value = attached if eq else (nxt.text if nxt and name in CURL_LONG_ARGS else "")
+                    used = nxt if not eq else w
+                    if name == "--request":
+                        method = value
+                    elif name in ("--get",):
+                        get = True
+                    elif name == "--head":
+                        method = method or "HEAD"
+                    elif name == "--upload-file":
+                        method, body = method or "PUT", True
+                    elif name in CURL_BODY:
+                        body = True
+                        unread |= self._unread_body(value, used)
+                if not eq and name in (WGET_OPT_ARGS if head == "wget" else CURL_LONG_ARGS):
+                    j += 1
+            elif head == "curl" and t.startswith("-") and len(t) > 1:
+                # a short cluster: `-sX PATCH`, `-XPATCH`, `-d @body.json`
+                for k, ch in enumerate(t[1:], start=1):
+                    if ch == "G":
+                        get = True
+                    elif ch == "I":
+                        method = method or "HEAD"
+                    if ch not in CURL_ARG_SHORTS:
+                        continue
+                    tail = t[k + 1:]
+                    value, used = (tail, w) if tail else ((nxt.text, nxt) if nxt else ("", None))
+                    if ch == "X":
+                        method = value
+                    elif ch == "T":
+                        method, body = method or "PUT", True
+                    elif ch in "dF":
+                        body = True
+                        unread |= self._unread_body(value, used)
+                    if not tail:
+                        j += 1
+                    break
+            j += 1
+        if not method:
+            method = "GET" if get or not body else "POST"
+        for url in urls:
+            hit = self.judge_api(head, method.upper(), _endpoint_path(url), texts, unread)
+            if hit:
+                return hit
+        return None
+
+    def _unread_body(self, value, word):
+        """True when a request body hides its text: read from a file (`@…`)
+        or built by a `$(…)` expansion. A readable GraphQL body always
+        carries a `{` (JSON, and the query inside it)."""
+        if value.startswith("@") or (word is not None and self.gs.F_SUBST in word.flags):
+            return True
+        return "{" not in value
 
     def _unread_query(self, opt, value, word):
         """True when this body option hides a GraphQL query's text: `--input`

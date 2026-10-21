@@ -24,6 +24,11 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     query=@file`, `--input`, `$VAR`) — and a `git config alias.<x>` write
     that runs a push. The pre-push header and the README name the gap both
     layers share: a `--no-verify` push the guard cannot read in the command.
+  - Review round 2 (PR #196): gh's flags may come before the subcommand
+    (`gh -R o/r pr merge 7`, `gh -X PUT api …`), so the guard finds the
+    subcommand the way gh (cobra) does; a `gh alias set` standing for a
+    denied command and `gh alias import` are denied; and the API writes are
+    denied when sent by `curl` / `wget` to a literal `api.github.com` URL.
   - **`docker/claude/git-hooks/pre-push`** refuses every push, installed as
     every repository's hook by `git config --system core.hooksPath
     /usr/local/share/alissa/git-hooks` (Dockerfile).
