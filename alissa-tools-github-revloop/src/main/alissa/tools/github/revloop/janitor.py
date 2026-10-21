@@ -132,12 +132,18 @@ class HeldWalk:
     newest mtime when the walk began, the sweep `now` it began at, the bytes
     counted so far, and the directories still to read. A resumed walk's
     total may count a directory removed since it was read; it never counts a
-    directory twice."""
+    directory twice.
+
+    `advanced` is the sweep `now` the walk last read a directory (issue
+    #191), 0 until it has. Kept walks resume least-recently-advanced first,
+    so two walks that each need several sweeps take turns: the one that just
+    had the leftover budget waits behind the one that did not."""
 
     mtime: float
     started: float
     total: int
     stack: "list[str]"
+    advanced: float = 0.0
 
 
 # One held folder's cached size, by path: either a finished walk, as
@@ -751,16 +757,26 @@ def _size_held(
     resumed walk is cached as of the sweep it began in, so the hourly
     re-walk counts from the oldest directory it read.
 
+    Kept walks go least-recently-advanced first, not oldest first (issue
+    #191). Otherwise a walk that needs more than SIZE_CACHE_SECONDS of
+    sweeps -- whose figure has expired by the sweep after it lands, so it
+    starts over -- takes every sweep's leftover budget, and a younger kept
+    walk never reads a directory.
+
     `sizes` is then re-keyed to this sweep's held folders: entries for gone
     folders drop out, and so do unsized folders whose walk never began."""
     previous = sizes or {}
 
-    def cut_short(item: "tuple[float, Candidate, str]") -> bool:
-        return isinstance(previous.get(item[1].path), HeldWalk)
+    def turn(item: "tuple[float, Candidate, str]") -> "tuple[bool, float]":
+        kept = previous.get(item[1].path)
+        if isinstance(kept, HeldWalk):
+            return True, kept.advanced
+        return False, 0.0
 
     seen: SizeCache = {}
-    # Stable: oldest first within each group, as the sweep queued them.
-    for mtime, candidate, key in sorted(queue, key=cut_short):
+    # Stable: oldest first among the folders not cut short and among kept
+    # walks that last advanced in the same sweep, as the sweep queued them.
+    for mtime, candidate, key in sorted(queue, key=turn):
         cached = previous.get(candidate.path)
         if (isinstance(cached, tuple) and cached[0] == mtime
                 and now - cached[2] < SIZE_CACHE_SECONDS):
@@ -773,9 +789,11 @@ def _size_held(
         if isinstance(cached, HeldWalk) and cached.mtime == mtime:
             progress = cached
         else:
-            progress = HeldWalk(mtime, now, 0, [os.fspath(candidate.path)])
+            progress = HeldWalk(mtime, now, 0, [os.fspath(candidate.path)],
+                                cached.advanced if isinstance(cached, HeldWalk) else 0.0)
         walked = None
         if not out_of_time():
+            progress.advanced = now
             walked = held_bytes_of(candidate.path, out_of_time, progress)
             resumable = resumable or walked is None
         if walked is None:
