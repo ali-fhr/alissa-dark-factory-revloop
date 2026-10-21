@@ -27,15 +27,20 @@ inside `sh -c` / `bash -c` / `eval` strings):
     graphql` call whose query the guard cannot read (`-F query=@file`,
     `--input`, a query from `$VAR` / `$(…)`);
   * the same API writes sent with `curl` / `wget` to a literal
-    `api.github.com` URL (round 2): a non-GET method — explicit, or implied
+    `api.github.com` URL (round 2) — any case, with or without a scheme,
+    with userinfo (`https://x:$TOKEN@api.github.com/…`) or a port, as a
+    word or `--url=` (issue #201): a non-GET method — explicit, or implied
     by a body (`-d`, `--json`, `-F`, `-T`, `--post-data`, …) — on the paths
     above, a GraphQL ref or merge mutation in the body, or a GraphQL body
     read from a file (`@…`) or built by `$(…)`;
   * every gh form, whatever flags come before the subcommand (round 2): gh
     is a cobra CLI and finds `pr merge` in `gh -R o/r pr merge 7` and `api`
     in `gh -X PUT api …`, so the guard looks the subcommand up the same way;
-    and a `gh alias set` whose expansion is one of the commands above, or
-    any `gh alias import` (its aliases come from a file);
+    and every `gh alias set` / `gh alias import` (issue #201): gh appends
+    the call's own words to an alias's expansion, so `gh alias set m pr`
+    then `gh m merge 7` rebuilds a denied command from two harmless-looking
+    ones, and `gh alias set s -` reads the expansion from stdin. A reviewer
+    has no need to define aliases; `gh alias list` / `delete` pass;
   * every merge: `gh pr merge`, `gh api … /merges`, a non-GET `gh api` on
     `…/pulls/<n>/merge` (`-X PUT`, or a POST implied by `-f`/`-F`/`--input`)
     or `…/merge-upstream`, and a `gh api graphql` call naming the
@@ -53,7 +58,7 @@ inside `sh -c` / `bash -c` / `eval` strings):
 WHAT IT LETS THROUGH. Everything else — `git fetch`, `git worktree add
 ../REVIEW-x <sha>`, `git log`, `git diff`, `gh pr review`, `gh pr view`,
 `gh api …/pulls/<n>/reviews`, `gh api …/contents/<path>` (a read), GraphQL
-queries, `echo "git push"`, `git commit -m "no push"`.
+queries, `gh alias list`, `echo "git push"`, `git commit -m "no push"`.
 
 The system pre-push hook (docker/claude/git-hooks/pre-push, every
 repository's hook via `git config --system core.hooksPath`) refuses every
@@ -91,7 +96,7 @@ REASON_TAIL = (
 )
 
 # The quick prefilter: a command that names none of these is never parsed.
-TRIGGER = re.compile(r"\b(git|gh|GIT_CONFIG\w*)\b|api\.github\.com")
+TRIGGER = re.compile(r"\b(git|gh|GIT_CONFIG\w*)\b|(?i:api\.github\.com)")
 
 PUSH_VERBS = ("push", "send-pack", "http-push")
 PUSH_IN_ALIAS = re.compile(r"\b(push|send-pack|http-push)\b")
@@ -136,7 +141,9 @@ GH_FIELD = ("-F", "--field")  # the typed field: `@file` reads its value from a 
 COBRA_BOOL = ("-h", "--help", "--version")
 
 # curl / wget straight to the REST or GraphQL API (round 2 of PR #196).
-GH_API_URL = re.compile(r"(https?://)?api\.github\.com(:\d+)?(/|$)")
+# Hostnames are case-insensitive, and curl sends a URL's userinfo
+# (`https://x:$TOKEN@api.github.com/…`) as Basic auth (issue #201).
+GH_API_URL = re.compile(r"(https?://)?([^/\s]*@)?api\.github\.com\.?(:\d+)?(/|$)", re.I)
 CURL_BODY = ("--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode", "--json", "--form",
              "--form-string")
 # curl long options whose value is the NEXT word.
@@ -206,6 +213,19 @@ def _cobra_subcommand(args):
         else:
             i += 1
     return None
+
+
+def _api_url_path(text):
+    """The API path of a curl / wget word naming api.github.com (bare, or
+    as `--url=…`), or None. The host comes off whether or not a scheme is
+    written, so `api.github.com/graphql` is judged as `graphql`; lower-cased,
+    since the guard's paths are."""
+    if text.startswith("--url="):
+        text = text[len("--url="):]
+    m = GH_API_URL.match(text)
+    if not m:
+        return None
+    return _endpoint_path(text[m.end():].split("#", 1)[0]).lower()
 
 
 def _endpoint_path(text):
@@ -381,27 +401,21 @@ class GitGuard:
         return None
 
     def check_gh_alias(self, args):
-        """`gh alias set m 'pr merge'` then `gh m 7`: the persistent form of a
-        denied command. Judge the expansion as the command it stands for; an
-        `import` reads its aliases from a file the guard cannot see."""
+        """Every `gh alias set` and `gh alias import` (issue #201). gh appends
+        the call's words to the expansion, so no expansion can be judged on
+        its own: `gh alias set m pr` then `gh m merge 7` is `gh pr merge 7`,
+        `gh alias set a api` then `gh a -X PUT …/merge` a merge, and
+        `gh alias set s -` reads the expansion from stdin. `list` and
+        `delete` pass."""
         j = _cobra_subcommand(args)
         if j is None:
             return None
-        verb, rest = args[j].text, args[j + 1:]
+        verb = args[j].text
         if verb == "import":
             return self.reason("`gh alias import` defines aliases the guard cannot read")
-        if verb != "set":
-            return None
-        shell = any(w.text in ("-s", "--shell") for w in rest)
-        positional = [w.text for w in rest if not w.text.startswith("-")]
-        if len(positional) < 2:
-            return None
-        expansion = positional[1]
-        if expansion.startswith("!"):
-            shell, expansion = True, expansion[1:]
-        hit = self._inner(expansion if shell else "gh " + expansion)
-        if hit:
-            return self.reason(f"`gh alias set {positional[0]} …` makes an alias that runs a denied command")
+        if verb == "set":
+            return self.reason("`gh alias set` defines an alias the call's own words can turn into a "
+                               "denied command (gh appends them to the expansion)")
         return None
 
     def check_gh_api(self, args, lead=0):
@@ -472,8 +486,8 @@ class GitGuard:
         """The same REST and GraphQL writes sent straight to api.github.com.
         Only a URL spelled out in the command is seen (a URL in a variable or
         a `curl -K` config file is not)."""
-        urls = [w.text for w in args if GH_API_URL.match(w.text)]
-        if not urls:
+        paths = [p for p in (_api_url_path(w.text) for w in args) if p is not None]
+        if not paths:
             return None
         method = None
         body = False
@@ -535,8 +549,8 @@ class GitGuard:
             j += 1
         if not method:
             method = "GET" if get or not body else "POST"
-        for url in urls:
-            hit = self.judge_api(head, method.upper(), _endpoint_path(url), texts, unread)
+        for path in paths:
+            hit = self.judge_api(head, method.upper(), path, texts, unread)
             if hit:
                 return hit
         return None
