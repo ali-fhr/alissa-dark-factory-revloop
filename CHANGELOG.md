@@ -4,6 +4,16 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.23
+
+- **The package README covers integration-check PRs** (issue #183, the
+  approving-round minor of PR #182; origin TASK-1750048544, implementation
+  TASK-1865261244). `alissa-tools-github-revloop/README.md` is the PyPI
+  `long_description`; it gains an *Integration-check PRs are not reviewed*
+  section beside the discovery one, naming the `integration_check_review`
+  flag. Documentation only — no behaviour change.
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.23.
+
 ## 0.31.22
 
 - **No review round on integration-check PRs** (issue #181; Alissa Build
