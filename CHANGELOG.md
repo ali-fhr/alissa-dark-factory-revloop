@@ -4,6 +4,28 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.24
+
+- **The janitor no longer holds a whole hub for a round with no review-task
+  ref** (issue #185; origin TASK-1698733224, implementation TASK-1008949501).
+  On 2026-10-21 the fleet's 46 GB volume hit 100%: every fresh round starts
+  with no task ref, and such a round held every `REVIEW-*` checkout in its
+  hub, so with studio reviews running near-continuously 78 dead checkouts
+  (~44 GB) were "held by a live round" forever.
+  - `Guard.hold(..., since=)` carries the round's spawn time (the ledger's
+    `spawned_at`); a round with no task ref now holds only the checkouts in
+    its hub whose newest mtime is at or after that time less a 5-minute
+    skew. A roster session with no ledger row (the CLI reports no start
+    time) keeps the old hub-wide hold.
+  - **Backstop**: at or above 95% used, a hub-wide hold is void for
+    checkouts older than the stale-round window (90 min), and one WARNING
+    per sweep names how many it released and the reasons holding the most
+    bytes. Known-ref and PR-number holds are never voided.
+  - The sweep summary now states the bytes held, per hub and reason
+    (largest ten), from a per-process size cache re-walked only when a held
+    folder's mtime changes; sizing stops at the sweep's time budget.
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.24.
+
 ## 0.31.23
 
 - **The package README covers integration-check PRs** (issue #183, the

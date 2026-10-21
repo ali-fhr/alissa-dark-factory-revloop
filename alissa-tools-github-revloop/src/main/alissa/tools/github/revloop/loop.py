@@ -2847,6 +2847,9 @@ class ReviewWatcher:
         # under the line closes it. In memory, so a restart under pressure
         # opens (and reports) a new episode.
         self._janitor_pressure_since: "float | None" = None
+        # Held folders' sizes from the last sweep, path -> (mtime, bytes)
+        # (issue #185): the held-bytes summary re-walks only what changed.
+        self._janitor_sizes: "dict[Path, tuple[float, int]]" = {}
         # The (repo, number, round) whose alive session the stale-round probe
         # just killed as `wedged:first-run-dialog` (issue #136), so the
         # respawn site logs its re-enqueue at INFO instead of a second
@@ -8363,8 +8366,9 @@ class ReviewWatcher:
         stamp = time.time() if now is None else now
         pct = self._volume_used_pct()
         pressed = pct is not None and pct >= self.config.janitor_warn_pct
+        backstop = pct is not None and pct >= janitor_mod.BACKSTOP_PCT
         try:
-            result = self._sweep_workspace(stamp, pressed=pressed)
+            result = self._sweep_workspace(stamp, pressed=pressed, backstop=backstop)
         except Exception as exc:
             log.warning(
                 "janitor: sweep failed unexpectedly (%s: %s) — nothing more is "
@@ -8391,7 +8395,7 @@ class ReviewWatcher:
         return pct is not None and pct >= self.config.janitor_warn_pct
 
     def _sweep_workspace(
-        self, now: float, *, pressed: bool = False
+        self, now: float, *, pressed: bool = False, backstop: bool = False
     ) -> "janitor_mod.SweepResult | None":
         if not janitor_mod.layout_supported(
             self.config.hub_for, self.config.workspace_root
@@ -8426,7 +8430,17 @@ class ReviewWatcher:
                 self.config.janitor_pressure_grace_minutes * 60 if pressed else None
             ),
             under_pressure=self._volume_pressed if pressed else None,
+            stale_round_seconds=STALE_ROUND_SECONDS if backstop else None,
+            sizes=self._janitor_sizes,
         )
+        if result.backstop:
+            log.warning(
+                "janitor: volume at or above %d%% — hub-wide holds are void for "
+                "checkouts older than %d minute(s); %d released; %s held%s",
+                int(janitor_mod.BACKSTOP_PCT), STALE_ROUND_SECONDS // 60,
+                result.backstop_released, janitor_mod.human(result.held_total),
+                janitor_mod.held_reasons(result.top_held()),
+            )
         if result.pressure:
             log.info(
                 "janitor: volume at or above %d%% — the grace dropped to %d "
@@ -8439,20 +8453,22 @@ class ReviewWatcher:
         if self.config.dry_run:
             log.info(
                 "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
-                "hub(s); %d held by a live round, %d inside the grace, %d "
-                "deferred to the next interval",
+                "hub(s); %d held by a live round (%s), %d inside the grace, %d "
+                "deferred to the next interval%s",
                 len(result.would_remove),
                 janitor_mod.human(sum(size for _, size in result.would_remove)),
-                result.hubs, len(result.held), result.fresh, result.deferred,
+                result.hubs, len(result.held), janitor_mod.human(result.held_total),
+                result.fresh, result.deferred, janitor_mod.held_summary(result),
             )
         else:
             log.info(
                 "janitor: removed %d folder(s), freed %s across %d hub(s); "
-                "%d held by a live round, %d inside the grace, %d failed, %d "
-                "deferred to the next interval",
+                "%d held by a live round (%s), %d inside the grace, %d failed, %d "
+                "deferred to the next interval%s",
                 len(result.removed), janitor_mod.human(result.freed),
-                result.hubs, len(result.held), result.fresh, len(result.failed),
-                result.deferred,
+                result.hubs, len(result.held), janitor_mod.human(result.held_total),
+                result.fresh, len(result.failed), result.deferred,
+                janitor_mod.held_summary(result),
             )
         return result
 
@@ -8465,7 +8481,11 @@ class ReviewWatcher:
         Open rounds are the ledger's own definition (`in_flight_repos`): a
         spawn younger than the stale-round window whose session was not
         reaped, and a verdict post still owed. The roster is the pass's
-        post-reap listing when the sweep produced one."""
+        post-reap listing when the sweep produced one.
+
+        Every hold carries its round's spawn time (issue #185), so a round
+        whose review-task ref is not known yet holds only the checkouts in
+        its hub made since it spawned."""
         sessions = self._pass_roster
         if sessions is None:
             try:
@@ -8480,17 +8500,22 @@ class ReviewWatcher:
                 continue
             row = self.state.find_spawn_by_session(ses.name)
             if row is not None:
-                guard.hold(str(row["repo"]), int(row["number"]), row["task_ref"])
+                guard.hold(
+                    str(row["repo"]), int(row["number"]), row["task_ref"],
+                    since=row["spawned_at"],
+                )
             else:
                 # No ledger row (a skill-shaped `review-pr-<n>`): the name is
                 # the only evidence, and a name without a repo holds its PR
-                # number in every hub.
+                # number in every hub. The roster reports no start time, so
+                # its hold on the hub's checkouts stays unbounded (issue
+                # #185); the >=95% backstop is what reaches past it.
                 guard.hold(ref.repo, ref.number)
         for spawn_row in self.state.read_spawns(since=now - STALE_ROUND_SECONDS):
             if not self.state.is_reaped(str(spawn_row["session"])):
                 guard.hold(
                     str(spawn_row["repo"]), int(spawn_row["number"]),
-                    spawn_row["task_ref"],
+                    spawn_row["task_ref"], since=spawn_row["spawned_at"],
                 )
         for post in self.state.read_verdict_posts():
             if post["posted_at"] is None and post["abandoned_at"] is None:
@@ -8500,6 +8525,7 @@ class ReviewWatcher:
                 guard.hold(
                     str(post["repo"]), int(post["number"]),
                     spawn["task_ref"] if spawn is not None else None,
+                    since=spawn["spawned_at"] if spawn is not None else None,
                 )
         return guard
 
