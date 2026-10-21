@@ -42,6 +42,9 @@ Three properties everything here is written around:
   and the grace is a day by default. A held folder is kept whatever its age.
   Under disk PRESSURE (issue #177) the grace drops -- to two hours by default
   -- oldest first, only while the volume is still at or above its warn line.
+  A round that names no review task yet holds only its hub's checkouts made
+  since it spawned (issue #185), and at or above `BACKSTOP_PCT` no such
+  hub-wide hold reaches a checkout older than the stale-round window.
 * **Nothing raises past its own concern.** A folder that vanishes mid-sweep,
   an unreadable hub, a failed removal: logged and skipped, because this runs
   at the end of a poll pass that must complete.
@@ -104,6 +107,20 @@ SUPPORTED_TEMPLATE = "{root}/{repo}/main"
 _PROBE_OWNERS = ("janitor-probe-owner-a", "janitor-probe-owner-b")
 _PROBE_REPO = "janitor-probe-repo"
 
+# How far before a round's spawn time a checkout may be stamped and still
+# be held by that round when its review-task ref is unknown (issue #185):
+# clock skew between the ledger's stamp and the filesystem's.
+HOLD_SKEW_SECONDS = 5 * 60
+
+# The volume used percentage at or above which the pressure backstop applies
+# (issue #185): a hub-wide hold is void for checkouts older than the stale-
+# round window, and one WARNING names what holds the most bytes.
+BACKSTOP_PCT = 95.0
+
+# The two reasons a hub-wide hold gives, so the sweep summary groups them.
+HUB_HOLD_BOUNDED = "a live round in this hub names no review task and spawned before this checkout"
+HUB_HOLD_UNBOUNDED = "a live round in this hub names no review task or spawn time"
+
 Runner = Callable[..., str]
 
 
@@ -138,25 +155,43 @@ class Guard:
     `review-pr-<n>` session names no repo, and holds its PR number anywhere.
 
     A round whose review-task ref is unknown cannot be mapped to a single
-    REVIEW- checkout, so it holds every checkout in its hub (`all_checkouts`).
+    REVIEW- checkout -- every fresh round starts that way, since the reviewer
+    creates its review task after it spawns. Such a round holds the checkouts
+    in its hub that are NEWER than its spawn time less `HOLD_SKEW_SECONDS`
+    (issue #185): a checkout older than every unknown-ref round in the hub
+    cannot belong to any of them. `all_checkouts` keeps, per hub, the
+    earliest such bound; None there means a round whose spawn time is not
+    known either, and holds every checkout in the hub, as before issue #185
+    -- the hold that, with studio reviews running near-continuously, kept 78
+    dead checkouts (~44 GB) and filled the fleet's volume on 2026-10-21.
     """
 
     numbers: "dict[str | None, set[int]]" = field(default_factory=dict)
     tasks: "dict[str | None, set[str]]" = field(default_factory=dict)
-    all_checkouts: "set[str | None]" = field(default_factory=set)
+    all_checkouts: "dict[str | None, float | None]" = field(default_factory=dict)
 
     def hold(
-        self, repo: "str | None", number: int, task_ref: "str | None" = None
+        self,
+        repo: "str | None",
+        number: int,
+        task_ref: "str | None" = None,
+        since: "float | None" = None,
     ) -> None:
         """Hold PR `number` of `repo` (`owner/name`, a bare name, or a
-        session-name slug; None = any hub) and the checkout its task names."""
+        session-name slug; None = any hub) and the checkout its task names.
+        With no task ref, `since` (the round's spawn time, epoch seconds)
+        bounds the checkouts held in the hub; without it, every one is."""
         slug = None if repo is None else session_repo_slug(repo.rpartition("/")[2])
         self.numbers.setdefault(slug, set()).add(int(number))
         ref = (task_ref or "").strip()
         if ref:
             self.tasks.setdefault(slug, set()).add(ref)
-        else:
-            self.all_checkouts.add(slug)
+            return
+        bound = None if since is None else float(since) - HOLD_SKEW_SECONDS
+        if slug in self.all_checkouts:
+            prev = self.all_checkouts[slug]
+            bound = None if prev is None or bound is None else min(prev, bound)
+        self.all_checkouts[slug] = bound
 
     def _in(self, table: "dict[str | None, set]", slug: str, value: object) -> bool:
         return value in table.get(slug, ()) or value in table.get(None, ())
@@ -164,8 +199,19 @@ class Guard:
     def _any(self, slug: str) -> bool:
         return bool(self.numbers.get(slug) or self.numbers.get(None))
 
-    def holds(self, candidate: Candidate) -> "str | None":
-        """Why `candidate` must stay, or None when nothing holds it."""
+    def holds(
+        self,
+        candidate: Candidate,
+        mtime: "float | None" = None,
+        void_before: "float | None" = None,
+    ) -> "str | None":
+        """Why `candidate` must stay, or None when nothing holds it.
+
+        `mtime` is the candidate's age stamp (`newest_mtime`); a review
+        checkout with none is held by every hub-wide hold, bounded or not.
+        `void_before` is the pressure backstop (issue #185): a hub-wide hold
+        does not reach a checkout whose stamp is older than it. A known task
+        ref's hold and a scratch folder's are never voided."""
         slug = candidate.hub_slug
         if candidate.kind == KIND_SCRATCH:
             if candidate.number is None:
@@ -173,10 +219,18 @@ class Guard:
             if self._in(self.numbers, slug, candidate.number):
                 return f"PR #{candidate.number} has a live session or open round"
             return None
-        if slug in self.all_checkouts or None in self.all_checkouts:
-            return "a live round in this hub names no review task"
         if candidate.task_ref and self._in(self.tasks, slug, candidate.task_ref):
             return f"{candidate.task_ref} has a live session or open round"
+        if mtime is not None and void_before is not None and mtime < void_before:
+            return None
+        for key in (slug, None):
+            if key not in self.all_checkouts:
+                continue
+            bound = self.all_checkouts[key]
+            if bound is None:
+                return HUB_HOLD_UNBOUNDED
+            if mtime is None or mtime >= bound:
+                return HUB_HOLD_BOUNDED
         return None
 
 
@@ -199,16 +253,55 @@ class SweepResult:
     # in a dry run, would-be removals) only that shorter grace allowed.
     pressure: bool = False
     pressure_removed: int = 0
+    # Issue #185: bytes held per "<hub slug>: <reason>", so held growth is
+    # visible before it fills the disk; held folders not sized because the
+    # sweep's time budget ran out; and, when the backstop applied, how many
+    # checkouts only it released from a hub-wide hold.
+    held_bytes: "dict[str, int]" = field(default_factory=dict)
+    held_unsized: int = 0
+    backstop: bool = False
+    backstop_released: int = 0
 
     @property
     def freed(self) -> int:
         return sum(size for _, size in self.removed)
 
     @property
+    def held_total(self) -> int:
+        return sum(self.held_bytes.values())
+
+    def top_held(self, limit: int = 5) -> "list[tuple[str, int]]":
+        """The reasons holding the most bytes, largest first."""
+        return sorted(self.held_bytes.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+    @property
     def left(self) -> int:
         """Candidate folders still on disk after a live sweep: inside the
         grace, held, deferred, or failed."""
         return self.fresh + len(self.held) + self.deferred + len(self.failed)
+
+
+def held_reasons(pairs: "Iterable[tuple[str, int]]") -> str:
+    """`; <hub>: <reason> = <size>, ...` for the log lines, or '' when none."""
+    parts = [f"{key} = {human(size)}" for key, size in pairs]
+    return ("; " + ", ".join(parts)) if parts else ""
+
+
+# How many held reasons the sweep summary names before folding the rest.
+HELD_REASONS_LOGGED = 10
+
+
+def held_summary(result: SweepResult) -> str:
+    """The sweep summary's held-bytes tail (issue #185): every hub/reason
+    holding bytes, largest first, at most HELD_REASONS_LOGGED of them, and
+    how many held folders went unsized."""
+    tail = held_reasons(result.top_held(HELD_REASONS_LOGGED))
+    rest = len(result.held_bytes) - HELD_REASONS_LOGGED
+    if rest > 0:
+        tail += f", +{rest} more reason(s)"
+    if result.held_unsized:
+        tail += f"; {result.held_unsized} held folder(s) not sized this sweep"
+    return tail
 
 
 def layout_supported(
@@ -434,6 +527,8 @@ def sweep(
     clock: "Callable[[], float]" = time.monotonic,
     pressure_grace_seconds: "float | None" = None,
     under_pressure: "Callable[[], bool] | None" = None,
+    stale_round_seconds: "float | None" = None,
+    sizes: "dict[Path, tuple[float, int]] | None" = None,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
     `guard` does not hold, oldest first, then prune each hub's worktree
@@ -456,7 +551,18 @@ def sweep(
     Dry-run removes nothing and prunes nothing: it logs each folder it WOULD
     remove (with its size) and reports them in `would_remove`, under the
     same bound -- so it reports what one live sweep would do (a dry run frees
-    nothing, so under pressure it reports every pressure-eligible folder)."""
+    nothing, so under pressure it reports every pressure-eligible folder).
+
+    The pressure backstop (issue #185): when `stale_round_seconds` is given
+    (the caller passes STALE_ROUND_SECONDS at or above `BACKSTOP_PCT`), a
+    hub-wide hold -- a round with no review-task ref -- is void for a
+    checkout older than that window: no live round can own a checkout older
+    than the stale window. `backstop_released` counts what only it freed.
+
+    Every held folder is sized into `held_bytes` per hub and reason. `sizes`
+    (path -> (mtime, bytes)), when given, caches those walks across sweeps
+    and is re-keyed to this sweep's held folders; sizing stops at the time
+    budget too, and what was left unsized is counted in `held_unsized`."""
     result = SweepResult()
     started = clock()
     bounded = False
@@ -466,6 +572,11 @@ def sweep(
         result.pressure = under_pressure()
         if result.pressure:
             shrunk = min(grace_seconds, pressure_grace_seconds)
+    void_before = None
+    if stale_round_seconds is not None:
+        result.backstop = True
+        void_before = now - stale_round_seconds
+    seen_sizes: "dict[Path, tuple[float, int]]" = {}
     aged: "list[tuple[float, Candidate]]" = []
     for hub in hub_list:
         result.hubs += 1
@@ -480,10 +591,29 @@ def sweep(
         if age < shrunk:
             result.fresh += 1
             continue
-        why = guard.holds(candidate)
+        why = guard.holds(candidate, mtime)
+        if why is not None and void_before is not None:
+            if guard.holds(candidate, mtime, void_before) is None:
+                result.backstop_released += 1
+                log.info(
+                    "janitor: backstop releases %s (%.1f h old) from a hub-wide "
+                    "hold — %s", candidate.path, age / 3600, why,
+                )
+                why = None
         if why is not None:
             log.debug("janitor: keeping %s — %s", candidate.path, why)
             result.held.append((candidate.path, why))
+            key = f"{candidate.hub_slug}: {why}"
+            cached = (sizes or {}).get(candidate.path)
+            if cached is not None and cached[0] == mtime:
+                size = cached[1]
+            elif clock() - started >= max_seconds:
+                result.held_unsized += 1
+                continue
+            else:
+                size = dir_bytes(candidate.path)
+            seen_sizes[candidate.path] = (mtime, size)
+            result.held_bytes[key] = result.held_bytes.get(key, 0) + size
             continue
         early = age < grace_seconds
         if early and not dry_run and not (under_pressure and under_pressure()):
@@ -520,6 +650,9 @@ def sweep(
         result.removed.append((candidate.path, size))
         if early:
             result.pressure_removed += 1
+    if sizes is not None:
+        sizes.clear()
+        sizes.update(seen_sizes)
     if dry_run:
         return result
     for hub in hub_list:

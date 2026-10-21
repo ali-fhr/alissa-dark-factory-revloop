@@ -1101,3 +1101,172 @@ def test_a_failed_ledger_write_leaves_the_episode_unopened(ws, monkeypatch, capl
     w._janitor_last -= 10 * 60
     w._run_janitor(now=time.time())
     assert len(volume_pings(w)) == 1, "the next sweep records it"
+
+
+# -- an unknown-ref round's hold is bounded by its spawn time (issue #185) ----
+
+STALE = 90 * 60  # config.STALE_ROUND_SECONDS
+
+
+def test_an_unknown_ref_round_holds_only_checkouts_made_after_its_spawn(tmp_path):
+    hub = make_hub(tmp_path)
+    spawned = NOW - 3 * DAY
+    after = folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    within_skew = folder(hub / "main" / "REVIEW-TASK-82",
+                         age=3 * DAY + janitor_mod.HOLD_SKEW_SECONDS - 60)
+    before = folder(hub / "REVIEW-TASK-83", age=4 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, None, since=spawned)
+
+    result = run_sweep([hub], guard)
+
+    assert after.is_dir() and within_skew.is_dir()
+    assert not before.exists(), "older than the round: it cannot be the round's"
+    assert {p for p, _ in result.held} == {after, within_skew}
+    assert all(why == janitor_mod.HUB_HOLD_BOUNDED for _, why in result.held)
+
+
+def test_the_earliest_unknown_ref_round_bounds_the_hub_and_an_unknown_spawn_holds_all(tmp_path):
+    hub = make_hub(tmp_path)
+    mid = folder(hub / "REVIEW-TASK-81", age=3 * DAY)
+    old = folder(hub / "REVIEW-TASK-82", age=5 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, None, since=NOW - 2 * DAY)
+    guard.hold("acme/widgets", 8, None, since=NOW - 4 * DAY)
+
+    run_sweep([hub], guard)
+
+    assert mid.is_dir() and not old.exists()
+
+    guard.hold("acme/widgets", 9, None)  # no spawn time: today's hub-wide hold
+    older = folder(hub / "REVIEW-TASK-83", age=6 * DAY)
+    result = run_sweep([hub], guard)
+    assert older.is_dir() and mid.is_dir()
+    assert janitor_mod.HUB_HOLD_UNBOUNDED in {why for _, why in result.held}
+
+
+def test_a_known_ref_hold_is_unchanged_by_the_spawn_bound(tmp_path):
+    hub = make_hub(tmp_path)
+    mine = folder(hub / "REVIEW-TASK-70", age=5 * DAY)
+    other = folder(hub / "REVIEW-TASK-80", age=5 * DAY)
+    scratch = folder(hub / "main" / ".review-scratch-pr7-r1", age=5 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70", since=NOW - DAY)
+
+    result = run_sweep([hub], guard)
+
+    assert mine.is_dir(), "a known ref holds its checkout whatever its age"
+    assert scratch.is_dir()
+    assert not other.exists(), "a known ref never holds the rest of the hub"
+    assert guard.all_checkouts == {}
+    assert len(result.held) == 2
+
+
+def test_the_backstop_voids_a_hub_wide_hold_on_checkouts_older_than_the_stale_window(tmp_path):
+    hub = make_hub(tmp_path)
+    stale_checkout = folder(hub / "REVIEW-TASK-81", age=STALE + 60)
+    young_one = folder(hub / "main" / "REVIEW-TASK-82", age=STALE - 60)
+    known = folder(hub / "REVIEW-TASK-70", age=3 * DAY)
+    scratch = folder(hub / "main" / ".review-scratch-pr7-r1", age=3 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    guard.hold("acme/widgets", 8, None)  # hub-wide, no spawn time
+
+    without = sweep([hub], guard, grace_seconds=60, now=NOW, runner=Runner())
+    assert stale_checkout.is_dir() and young_one.is_dir()
+    assert without.backstop is False and without.backstop_released == 0
+
+    result = sweep([hub], guard, grace_seconds=60, now=NOW, runner=Runner(),
+                   stale_round_seconds=STALE)
+
+    assert result.backstop is True and result.backstop_released == 1
+    assert not stale_checkout.exists()
+    assert young_one.is_dir(), "inside the stale window a live round may own it"
+    assert known.is_dir() and scratch.is_dir(), "known-ref and PR holds are never voided"
+
+
+def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypatch):
+    hub = make_hub(tmp_path)
+    folder(hub / "REVIEW-TASK-70", age=3 * DAY, files=("a", "b"))
+    folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    guard.hold("acme/widgets", 8, None, since=NOW - 3 * DAY)
+    sizes: dict = {}
+    walks = []
+    real = janitor_mod.dir_bytes
+    monkeypatch.setattr(janitor_mod, "dir_bytes", lambda p: walks.append(p) or real(p))
+
+    first = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
+
+    assert set(first.held_bytes) == {
+        "widgets: TASK-70 has a live session or open round",
+        f"widgets: {janitor_mod.HUB_HOLD_BOUNDED}",
+    }
+    assert all(size > 0 for size in first.held_bytes.values())
+    assert first.top_held(1)[0][0].startswith("widgets: TASK-70"), "two files outweigh one"
+    assert len(walks) == 2 and len(sizes) == 2
+
+    second = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
+    assert second.held_bytes == first.held_bytes
+    assert len(walks) == 2, "an unchanged held folder is not walked again"
+    assert "widgets: TASK-70" in janitor_mod.held_summary(second)
+
+
+def test_held_folders_past_the_time_budget_go_unsized(tmp_path):
+    hub = make_hub(tmp_path)
+    folder(hub / "REVIEW-TASK-70", age=3 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+
+    result = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                   max_seconds=0.0)
+
+    assert len(result.held) == 1 and result.held_unsized == 1 and result.held_bytes == {}
+    assert "1 held folder(s) not sized" in janitor_mod.held_summary(result)
+
+
+def test_the_watcher_bounds_a_ledger_round_without_a_task_ref_by_its_spawn(ws, caplog):
+    w, alissa, hub = ws
+    session = "review-widgets-pr7-r1-abc123"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
+                         session=session, task_ref=None)
+    spawned = int(time.time()) - 3 * DAY
+    w.state._db.execute("UPDATE spawns SET spawned_at = ?", (spawned,))
+    w.state._db.commit()
+    alissa.sessions = [ManagedSession(name=session, status="busy")]
+    newer = young_checkout(hub, "REVIEW-TASK-81", hours=2 * 24)
+    older = young_checkout(hub, "REVIEW-TASK-82", hours=4 * 24)
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert newer.is_dir(), "made after the round spawned: it may be the round's"
+    assert not older.exists(), "older than the round's spawn: reclaimed"
+    assert result is not None and result.held_total > 0
+    summary = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("janitor: removed 1 folder(s)")]
+    assert summary and f"widgets: {janitor_mod.HUB_HOLD_BOUNDED} = " in summary[0]
+
+
+@pytest.mark.parametrize("pct, released", [(94.9, False), (95.0, True)])
+def test_the_watcher_backstop_releases_a_rowless_sessions_hub_wide_hold(
+    ws, caplog, monkeypatch, pct, released
+):
+    w, alissa, hub = ws
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: pct)
+    alissa.sessions = [ManagedSession(name="review-pr-7", status="busy")]
+    scratch, review = stale_pair(hub, 7, "TASK-70")
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert scratch.is_dir(), "the PR's own scratch stays held"
+    assert review.exists() is not released
+    assert result is not None and result.backstop is released
+    warns = [r for r in caplog.records if "hub-wide holds are void" in r.getMessage()]
+    assert len(warns) == (1 if released else 0)
+    if released:
+        assert warns[0].levelno == logging.WARNING
+        assert "1 released" in warns[0].getMessage()
+        assert "PR #7 has a live session or open round = " in warns[0].getMessage()
