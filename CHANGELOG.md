@@ -4,6 +4,23 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.30
+
+- **A finished long walk restarts at the back of the held-sizing queue**
+  (issue #197, the `[minor]` finding left on PR #192's approve; origin
+  TASK-1769748153, implementation TASK-791106161).
+  - A finished held walk's cache entry now also records the sweep it
+    finished in: `(mtime, bytes, started, finished)`. One that started
+    before the sweep it finished in was cut short at least once, and when
+    its figure expires (or its mtime moves) its restart sorts with the kept
+    walks, as last advanced in the sweep it finished in, instead of ahead of
+    every folder never cut short. Without budget, the restart is kept as a
+    `HeldWalk` rather than dropped. Before, since every kept walk finishes
+    in turn (issue #191), each finish cost the younger folders one sweep an
+    hour later: on the review's probe a small held folder went unsized on 7
+    of 40 sweeps, now on 3 (the first three, before any walk is known to be
+    long).
+
 ## 0.31.29
 
 - **Push safety: reviewers never push or merge** (issue #195, MDF M7 GP-3;

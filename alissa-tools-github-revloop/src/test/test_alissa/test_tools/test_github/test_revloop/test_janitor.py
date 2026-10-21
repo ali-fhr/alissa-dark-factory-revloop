@@ -1377,7 +1377,7 @@ def test_an_abandoned_held_walk_no_longer_starves_the_folders_behind_it(tmp_path
     done = sweeps[-1]
     assert done.held_bytes[big_key] == janitor_mod.dir_bytes(big)
     assert done.held_unsized == 0 and done.held_resuming == 0
-    assert sizes[big] == (NOW - 4 * DAY, janitor_mod.dir_bytes(big), NOW)
+    assert sizes[big] == (NOW - 4 * DAY, janitor_mod.dir_bytes(big), NOW, NOW)
     assert all(sw.held_bytes.get(small_key) for sw in sweeps[1:]), \
         "small stays sized (from the cache) on every sweep after the first"
 
@@ -1430,6 +1430,78 @@ def test_kept_walks_go_least_recently_advanced_first(tmp_path, monkeypatch):
     assert sizes[old].advanced == sizes[new].advanced == NOW
 
 
+def test_a_finished_long_walk_restarts_behind_the_folders_never_cut_short(tmp_path):
+    # Issue #197, the review probe of PR #192: every kept walk now finishes
+    # in turn, and its figure expires an hour on. Its restart must not sort
+    # to the front and take the leftover budget from the small folder `d`.
+    hub = make_hub(tmp_path)
+    folder(tree(hub / "REVIEW-TASK-70", 60), age=4 * DAY)
+    folder(tree(hub / "REVIEW-TASK-71", 40), age=3 * DAY)
+    folder(tree(hub / "REVIEW-TASK-72", 20), age=2 * DAY)
+    d = folder(hub / "REVIEW-TASK-73", age=1 * DAY)
+    guard = Guard()
+    for number, ref in enumerate(("TASK-70", "TASK-71", "TASK-72", "TASK-73"), 1):
+        guard.hold("acme/widgets", number, ref)
+    d_key = "widgets: TASK-73 has a live session or open round"
+    sizes: dict = {}
+    clock = Ticks()
+    sweeps = [sweep([hub], guard, grace_seconds=GRACE, now=NOW + 600 * i, runner=Runner(),
+                    max_seconds=10.0, clock=clock, sizes=sizes) for i in range(40)]
+
+    unsized = [i for i, sw in enumerate(sweeps) if not sw.held_bytes.get(d_key)]
+    # The first three sweeps each walk one big tree before any is known to be
+    # long; at PR #192's head d was also unsized on sweeps 9, 16, 29 and 36.
+    assert unsized == [0, 1, 2]
+    assert sweeps[-1].held_bytes[d_key] == janitor_mod.dir_bytes(d)
+    for ref in ("TASK-70", "TASK-71", "TASK-72"):
+        key = f"widgets: {ref} has a live session or open round"
+        size = janitor_mod.dir_bytes(hub / f"REVIEW-{ref}")
+        assert any(sw.held_bytes.get(key) == size for sw in sweeps), f"{ref}'s walk still finishes"
+
+
+def test_an_expired_figure_from_a_walk_cut_short_keeps_a_kept_walks_place(tmp_path, monkeypatch):
+    hub = make_hub(tmp_path)
+    long_one = folder(hub / "REVIEW-TASK-70", age=4 * DAY)
+    quick = folder(hub / "REVIEW-TASK-71", age=3 * DAY)
+    young = folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    guard = Guard()
+    for number, ref in enumerate(("TASK-70", "TASK-71", "TASK-81"), 1):
+        guard.hold("acme/widgets", number, ref)
+    expired = NOW - janitor_mod.SIZE_CACHE_SECONDS - 1
+    sizes: dict = {
+        # began three sweeps before the one it finished in: cut short
+        long_one: (NOW - 4 * DAY, 4096, expired - 1800, expired),
+        # began and finished in one sweep: never cut short
+        quick: (NOW - 3 * DAY, 4096, expired, expired),
+    }
+    walked = []
+    monkeypatch.setattr(janitor_mod, "held_bytes_of",
+                        lambda p, stop, progress=None: walked.append(p.name) or 4096)
+
+    sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(), sizes=sizes)
+
+    assert walked == ["REVIEW-TASK-71", "REVIEW-TASK-81", "REVIEW-TASK-70"], \
+        "the long walk's restart goes behind the folders never cut short"
+    assert sizes[long_one] == (NOW - 4 * DAY, 4096, NOW, NOW), "finished in one sweep this time"
+
+
+def test_a_restart_of_a_walk_cut_short_is_kept_when_no_budget_is_left(tmp_path):
+    hub = make_hub(tmp_path)
+    big = folder(hub / "REVIEW-TASK-70", age=4 * DAY)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+    expired = NOW - janitor_mod.SIZE_CACHE_SECONDS - 1
+    sizes: dict = {big: (NOW - 4 * DAY, 4096, expired - 1800, expired)}
+
+    starved = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                    max_seconds=0.0, sizes=sizes)
+
+    assert starved.held_unsized == 1 and starved.held_resuming == 1
+    kept = sizes[big]
+    assert isinstance(kept, janitor_mod.HeldWalk), "it stays at the back, not dropped to the front"
+    assert kept.total == 0 and kept.stack == [os.fspath(big)] and kept.advanced == expired
+
+
 def test_a_held_walk_cut_short_restarts_when_its_folder_mtime_moves(tmp_path):
     hub = make_hub(tmp_path)
     big = folder(tree(hub / "REVIEW-TASK-70", 30), age=4 * DAY)
@@ -1446,7 +1518,7 @@ def test_a_held_walk_cut_short_restarts_when_its_folder_mtime_moves(tmp_path):
                   sizes=sizes)
 
     assert later.held_total == janitor_mod.dir_bytes(big)
-    assert sizes[big] == (NOW - 3 * DAY, janitor_mod.dir_bytes(big), NOW + 60)
+    assert sizes[big] == (NOW - 3 * DAY, janitor_mod.dir_bytes(big), NOW + 60, NOW + 60)
 
 
 def test_a_held_walk_cut_short_is_kept_when_no_budget_is_left_to_resume_it(tmp_path):

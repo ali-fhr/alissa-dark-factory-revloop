@@ -147,9 +147,11 @@ class HeldWalk:
 
 
 # One held folder's cached size, by path: either a finished walk, as
-# (newest mtime, bytes, the sweep `now` the walk began at), or a `HeldWalk`
-# that the time budget cut short (issue #189).
-SizeCache = dict[Path, "tuple[float, int, float] | HeldWalk"]
+# (newest mtime, bytes, the sweep `now` the walk began at, the sweep `now` it
+# finished in), or a `HeldWalk` that the time budget cut short (issue #189).
+# A finished walk that began before the sweep it finished in was cut short
+# at least once (issue #197): its folder keeps a kept walk's place in line.
+SizeCache = dict[Path, "tuple[float, int, float, float] | HeldWalk"]
 
 # The two reasons a hub-wide hold gives, so the sweep summary groups them.
 HUB_HOLD_BOUNDED = "a live round in this hub names no review task and spawned before this checkout"
@@ -763,6 +765,12 @@ def _size_held(
     starts over -- takes every sweep's leftover budget, and a younger kept
     walk never reads a directory.
 
+    A finished walk that was cut short keeps that place once its figure
+    expires (issue #197): it sorts with the kept walks, as last advanced in
+    the sweep it finished in, not ahead of the folders never cut short. Else
+    every kept walk's finish, an hour on, would buy one sweep in which its
+    restart takes the leftover budget from the younger folders in front.
+
     `sizes` is then re-keyed to this sweep's held folders: entries for gone
     folders drop out, and so do unsized folders whose walk never began."""
     previous = sizes or {}
@@ -771,6 +779,8 @@ def _size_held(
         kept = previous.get(item[1].path)
         if isinstance(kept, HeldWalk):
             return True, kept.advanced
+        if kept is not None and kept[2] < kept[3]:
+            return True, kept[3]  # cut short, then finished (issue #197)
         return False, 0.0
 
     seen: SizeCache = {}
@@ -785,12 +795,12 @@ def _size_held(
             result.held_cached += 1
             result.held_bytes[key] = result.held_bytes.get(key, 0) + size
             continue
-        resumable = isinstance(cached, HeldWalk)
+        long_walk, advanced = turn((mtime, candidate, key))
+        resumable = long_walk
         if isinstance(cached, HeldWalk) and cached.mtime == mtime:
             progress = cached
         else:
-            progress = HeldWalk(mtime, now, 0, [os.fspath(candidate.path)],
-                                cached.advanced if isinstance(cached, HeldWalk) else 0.0)
+            progress = HeldWalk(mtime, now, 0, [os.fspath(candidate.path)], advanced)
         walked = None
         if not out_of_time():
             progress.advanced = now
@@ -802,7 +812,7 @@ def _size_held(
                 seen[candidate.path] = progress
                 result.held_resuming += 1
             continue
-        seen[candidate.path] = (mtime, walked, progress.started)
+        seen[candidate.path] = (mtime, walked, progress.started, now)
         result.held_bytes[key] = result.held_bytes.get(key, 0) + walked
     if sizes is not None:
         sizes.clear()
