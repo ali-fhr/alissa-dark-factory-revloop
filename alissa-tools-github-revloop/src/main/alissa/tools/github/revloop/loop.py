@@ -2847,9 +2847,10 @@ class ReviewWatcher:
         # under the line closes it. In memory, so a restart under pressure
         # opens (and reports) a new episode.
         self._janitor_pressure_since: "float | None" = None
-        # Held folders' sizes from the last sweep, path -> (mtime, bytes)
-        # (issue #185): the held-bytes summary re-walks only what changed.
-        self._janitor_sizes: "dict[Path, tuple[float, int]]" = {}
+        # Held folders' sizes from the last sweep, path -> (mtime, bytes,
+        # sized at) (issues #185, #187): the held-bytes summary re-walks only
+        # what changed or is older than janitor_mod.SIZE_CACHE_SECONDS.
+        self._janitor_sizes: "janitor_mod.SizeCache" = {}
         # The (repo, number, round) whose alive session the stale-round probe
         # just killed as `wedged:first-run-dialog` (issue #136), so the
         # respawn site logs its re-enqueue at INFO instead of a second

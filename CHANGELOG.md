@@ -4,6 +4,24 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.25
+
+- **Held-folder sizing no longer competes with removals, and its cache
+  ages out** (issue #187, the two `[minor]` findings left on PR #186's
+  approve; origin TASK-1331742477, implementation TASK-196835529).
+  - The janitor sizes held folders AFTER its removal loop, on whatever is
+    left of the sweep's 120 s budget, so an old known-ref checkout or another
+    hub's unbounded hold no longer spends budget a removable folder needed.
+    A held walk is also abandoned mid-tree once the budget is spent; that
+    folder counts as unsized, never as a partial figure.
+  - A cached held size is reused only while the folder's newest mtime is
+    unchanged AND the entry is under an hour old (`SIZE_CACHE_SECONDS`):
+    that mtime does not see writes deeper in the tree (`node_modules`,
+    `dist/`), so a growing checkout is re-walked at least hourly.
+  - The sweep summary says how many held sizes came from the cache and how
+    old they may be (`N held size(s) cached, up to 60 min old`).
+- **Version**: `version` and `ARG REVLOOP_VERSION` move to 0.31.25.
+
 ## 0.31.24
 
 - **The janitor no longer holds a whole hub for a round with no review-task
