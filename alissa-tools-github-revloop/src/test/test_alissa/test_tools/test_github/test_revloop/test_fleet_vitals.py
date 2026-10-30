@@ -36,8 +36,10 @@ from alissa.tools.github.revloop.alissa_client import (
     NOT_ACTIVATED,
     AlissaAuthError,
     AlissaClient,
+    AlissaError,
     AlissaTransient,
 )
+from alissa.tools.github.revloop import ghclient
 from alissa.tools.github.revloop.config import (
     FLEET_VITALS_ENV,
     LOOP_EVENTS_ENV,
@@ -57,6 +59,7 @@ from alissa.tools.github.revloop.fleet_vitals import (
     fit_body,
     iso_utc,
 )
+from alissa.tools.github.revloop.ghclient import GitHub
 from alissa.tools.github.revloop.loop import ReviewWatcher
 from alissa.tools.github.revloop.loop_events import LoopEventsEmitter
 from alissa.tools.github.revloop.proc import CommandError
@@ -219,8 +222,12 @@ def test_console_fixtures_build_the_exact_contract_body(
              "ageS": None, "cpu": None, "rssBytes": None, "live": False,
              "managed": True, "url": f"https://github.com/{REPO}/pull/8"},
         ],
+        # `used` off the same read; `login` and the call count (issue #205)
+        # were not passed -- the console's push -- so null.
         "rate": {"remaining": 4300, "limit": 5000,
-                 "resetAt": "2023-11-14T22:13:20Z"},
+                 "resetAt": "2023-11-14T22:13:20Z", "used": 700,
+                 "login": None},
+        "ghCallsLastHour": None,
         "memory": {"residentBytes": 1000, "reclaimableBytes": 6500,
                    "limitBytes": 4294967296},
         "queueDepth": 2,
@@ -252,7 +259,8 @@ def test_console_fixtures_build_the_exact_contract_body(
     assert set(snapshot) == {
         "schemaVersion", "seat", "asOf", "heartbeatAt", "pollIntervalS",
         "version", "drift", "pollDurationsMs", "sessions", "sessionList",
-        "rate", "memory", "queueDepth", "kpis", "inbox", "diskUsedPct", "idle",
+        "rate", "ghCallsLastHour", "memory", "queueDepth", "kpis", "inbox",
+        "diskUsedPct", "idle",
     }
 
 
@@ -722,6 +730,198 @@ def test_the_in_daemon_sources_run_gh_under_the_reviewer_credential(
     with pytest.raises(CommandError):
         fleet_vitals._console_runner(Unset())(["gh", "api", "rate_limit"])
     assert fleet_vitals._console_runner(object())(["gh", "x"]) == "{}"
+
+
+# -- the GitHub identity view: rate.used, rate.login, ghCallsLastHour (#205) --
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def test_gh_calls_last_hour_counts_every_client_call_over_a_rolling_hour(
+    monkeypatch
+):
+    """Every `gh` call the client places counts -- reads, `token_login`, the
+    comment path, and a call that fails -- and drops out an hour later."""
+    monkeypatch.setattr(ghclient, "run", lambda argv, **kw: "alissa-app\n")
+
+    def run_json(argv, **kw):
+        if "boom" in argv:
+            raise CommandError(argv, 1, "HTTP 404")
+        return {}
+
+    monkeypatch.setattr(ghclient, "run_json", run_json)
+    clock = _Clock()
+    gh = GitHub(clock=clock)
+    assert gh.calls_last_hour() == 0
+    gh.verify_identity()
+    gh._api("repos/acme/widgets")
+    clock.now += 1800
+    gh.comment("acme", "widgets", 7, "hi")
+    with pytest.raises(CommandError):
+        gh._api("boom")
+    assert gh.calls_last_hour() == 4
+    clock.now += 1800  # the first two are exactly an hour old: out
+    assert gh.calls_last_hour() == 2
+    clock.now += 3600
+    assert gh.calls_last_hour() == 0
+
+
+def test_the_rate_read_runs_under_the_reviewer_token_not_gh_token(
+    tmp_path, monkeypatch
+):
+    """End to end over the daemon's own pusher: the `rate_limit` read runs
+    under the token `reviewer_token_env` names, never the container's
+    GH_TOKEN, and the snapshot carries that bucket's `used`, the login the
+    boot identity check asserted, and the client's own call count -- the
+    rate read itself is not one of the client's calls."""
+    monkeypatch.setenv("GH_TOKEN", "container-dev-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "container-dev-token")
+    monkeypatch.setenv("REVIEWER_GH_TOKEN", "reviewer-token")
+    login_envs = []
+
+    def token_run(argv, *, env=None, **kw):
+        login_envs.append(env["GH_TOKEN"])
+        return "alissa-app\n"
+
+    monkeypatch.setattr(ghclient, "run", token_run)
+    rate_envs = []
+
+    def fake_run(argv, *, timeout=60, env=None, **kw):
+        if argv[:3] == ["gh", "api", "rate_limit"]:
+            rate_envs.append((env["GH_TOKEN"], env["GITHUB_TOKEN"]))
+            return json.dumps(RATE)
+        raise CommandError(argv, 1, "not faked")
+
+    monkeypatch.setattr(fleet_vitals, "proc_run", fake_run)
+    config = _config(tmp_path, reviewer_token_env="REVIEWER_GH_TOKEN")
+    gh = GitHub(token_env="REVIEWER_GH_TOKEN")
+    gh.verify_identity()  # the boot check: one call, and the login asserted
+    pusher = fleet_vitals.build_pusher(config, github=gh)
+    snapshot = pusher.build(heartbeat_at=WALL, queue_depth=0)
+
+    assert rate_envs == [("reviewer-token", "reviewer-token")]
+    assert login_envs == ["reviewer-token"]
+    assert snapshot["rate"]["used"] == 700
+    assert snapshot["rate"]["login"] == "alissa-app"
+    assert snapshot["ghCallsLastHour"] == 1
+    # Building again reads no login and places no call of the client's.
+    pusher.build(heartbeat_at=WALL, queue_depth=0)
+    assert login_envs == ["reviewer-token"]
+    assert gh.calls_last_hour() == 1
+
+
+class _IdentityGh:
+    asserted_login = "alissa-app"
+
+    def __init__(self, calls=12):
+        self.calls = calls
+
+    def calls_last_hour(self):
+        return self.calls
+
+
+class _RatedSources(FakeSources):
+    def rate_limit(self):
+        return {"limit": 5000, "remaining": 4300, "used": 700,
+                "reset": 1_700_000_000}
+
+
+def test_the_pushed_snapshot_carries_the_reviewer_rate_identity(tmp_path):
+    client = FakeVitalsClient()
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client,
+                               clock=lambda: float(WALL), github=_IdentityGh())
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    (sent,) = client.snapshots
+    assert sent["rate"] == {"remaining": 4300, "limit": 5000,
+                            "resetAt": "2023-11-14T22:13:20Z", "used": 700,
+                            "login": "alissa-app"}
+    assert sent["ghCallsLastHour"] == 12
+
+
+def test_the_console_pusher_sends_login_and_count_as_null(tmp_path):
+    client = FakeVitalsClient()
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client)
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    (sent,) = client.snapshots
+    assert sent["rate"]["used"] == 700
+    assert sent["rate"]["login"] is None
+    assert sent["ghCallsLastHour"] is None
+
+
+def test_a_failing_identity_read_costs_the_field_not_the_snapshot(
+    tmp_path, caplog
+):
+    class Broken(_IdentityGh):
+        def calls_last_hour(self):
+            raise RuntimeError("boom")
+
+    client = FakeVitalsClient()
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client,
+                               github=Broken())
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    (sent,) = client.snapshots
+    assert sent["ghCallsLastHour"] is None
+    assert sent["rate"]["login"] == "alissa-app"
+    assert any("calls_last_hour" in r.getMessage() for r in caplog.records)
+
+
+class _RefusingIdentity(FakeVitalsClient):
+    def __init__(self, detail):
+        super().__init__()
+        self.detail = detail
+
+    def post_fleet_vitals(self, snapshot):
+        rate = snapshot.get("rate") or {}
+        if "ghCallsLastHour" in snapshot or "used" in rate or "login" in rate:
+            self.calls.append("refused")
+            raise AlissaError(400, self.detail)
+        return super().post_fleet_vitals(snapshot)
+
+
+@pytest.mark.parametrize("detail", [
+    {"error": "Unrecognized key(s) in object: 'ghCallsLastHour'"},
+    {"error": "invalid_body", "message": "unknown key: rate.used"},
+    "Unrecognized key(s) in object: 'used', 'login'",
+])
+def test_a_400_naming_a_new_field_drops_all_three_and_retries_once(
+    tmp_path, caplog, detail
+):
+    clock = _Clock(float(WALL))
+    client = _RefusingIdentity(detail)
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client,
+                               clock=clock, github=_IdentityGh())
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    assert client.calls == ["refused", "vitals"]
+    (sent,) = client.snapshots
+    assert "ghCallsLastHour" not in sent
+    assert sent["rate"] == {"remaining": 4300, "limit": 5000,
+                            "resetAt": "2023-11-14T22:13:20Z"}
+    assert any("`ghCallsLastHour`" in r.getMessage() for r in caplog.records)
+
+    # Left out for the reprobe window -- no second refusal -- then offered.
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    assert client.calls == ["refused", "vitals", "vitals"]
+    clock.now += fleet_vitals.BLOCK_REPROBE_S
+    pusher.push_once(heartbeat_at=WALL)
+    assert client.calls[-2:] == ["refused", "vitals"]
+
+
+def test_a_400_that_merely_says_used_is_not_a_refusal_of_the_fields(tmp_path):
+    client = FakeVitalsClient(
+        fail_with=AlissaError(400, "the body used an unknown schemaVersion")
+    )
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client,
+                               github=_IdentityGh())
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_FAILED
+    assert client.calls == ["vitals"]
 
 
 def test_one_post_per_pass_after_the_loop_events_push(tmp_path, monkeypatch):
