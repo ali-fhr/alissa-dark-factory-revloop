@@ -4,6 +4,25 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.34
+
+- **Fleet vitals carry the reviewer identity's `rate.used` and
+  `rate.login`, and `ghCallsLastHour`** (issue #205, GI-1r; origin
+  TASK-235408228, implementation TASK-1081456907). Studio's
+  fleet-github-identity design watches the reviewer like every other user.
+  - `rate.used` comes off the same cached `gh api rate_limit` read as the
+    rest of `rate` (free, under the `reviewer_token_env` token, never
+    `GH_TOKEN`); `rate.login` is the login the boot identity check
+    asserted (`GitHub.asserted_login`). No new GitHub call.
+  - `ghCallsLastHour` is `GitHub.calls_last_hour()`: every `gh` call the
+    client places (`_api`, `token_login`, `comment`, failed ones included)
+    over a rolling 60-minute in-memory window.
+  - The console's out-of-pass push holds no GitHub client and sends
+    `rate.login` and `ghCallsLastHour` as `null`.
+  - A Studio 400 naming `ghCallsLastHour`, `rate.used`/`rate.login` or a
+    quoted `'used'`/`'login'` drops all three and resends once, then leaves
+    them out for an hour — the `diskUsedPct` treatment.
+
 ## 0.31.33
 
 - **The reviewer seat's git guard reads a scheme of one to three slashes**

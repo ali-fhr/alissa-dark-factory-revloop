@@ -75,6 +75,18 @@ the seat's report that a version would not start and was rolled back: sent
 once, on the next snapshot after the rollback, and treated like the other
 optional blocks by a Studio that refuses it. The console's pusher has no
 upgrader: it reads the answer and acts on nothing.
+
+The GitHub identity view (issue #205, Studio's fleet-github-identity design
+§6.1) adds `rate.used`, `rate.login` and `ghCallsLastHour`. `used` rides on
+the same cached `rate_limit` read as the rest of `rate` -- a free call, run
+under the REVIEWER identity's token (`_console_runner`), never the
+container's `GH_TOKEN` -- and `login` is the login the boot identity check
+asserted (`GitHub.asserted_login`), so neither costs a call. The count is the
+daemon's GitHub client's own rolling hour (`GitHub.calls_last_hour`). The
+console's pusher holds no client, so it sends `login` and the count as null.
+A Studio that refuses any of the three gets the optional-block treatment for
+all three together: resent without them, offered again after
+BLOCK_REPROBE_S.
 """
 
 from __future__ import annotations
@@ -134,6 +146,17 @@ VITALS_FAILED = "failed"
 # which Studio's schema may not carry yet. `upgradeFailed` (issue #193, the
 # fleet auto-upgrade report) joins them for the same reason.
 OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct", "upgradeFailed")
+
+# The identity fields (issue #205): the top-level count and the two keys it
+# adds inside `rate`. One group -- a Studio that knows one knows all three --
+# keyed in the refusal bookkeeping by the top-level name. A 400 names a nested
+# key either by its path (`rate.used`) or quoted (`'login'`, an unrecognized-
+# key list); a bare word is not enough, since `used` is plain English.
+IDENTITY_KEY = "ghCallsLastHour"
+RATE_IDENTITY_FIELDS = ("used", "login")
+_IDENTITY_REFUSED = re.compile(
+    r"\bghCallsLastHour\b|\brate\.(?:used|login)\b|['\"`](?:used|login)['\"`]"
+)
 
 # How long a snapshot leaves an optional block out after Studio refused it as
 # an unknown key, before it offers the block again. An hour: one extra POST
@@ -269,10 +292,11 @@ def _inbox_row(item: dict) -> dict:
     }
 
 
-def _rate(raw: "dict | None") -> "dict | None":
+def _rate(raw: "dict | None", login: "str | None" = None) -> "dict | None":
     """The console's cached `gh api rate_limit` read in the contract's shape,
     or None when the read failed or came back without the two numbers the
-    Factory meter needs."""
+    Factory meter needs. `used` is the same read's, `login` the identity the
+    read ran under (None when the caller cannot say)."""
     if not isinstance(raw, dict):
         return None
     remaining = _int_or_none(raw.get("remaining"))
@@ -284,6 +308,8 @@ def _rate(raw: "dict | None") -> "dict | None":
         "remaining": remaining,
         "limit": limit,
         "resetAt": iso_utc(reset) if reset is not None else None,
+        "used": _int_or_none(raw.get("used")),
+        "login": login or None,
     }
 
 
@@ -313,6 +339,8 @@ def build_snapshot(
     now: "int | float | None" = None,
     config: "Mapping | None" = None,
     disk_used_pct: "float | None" = None,
+    rate_login: "str | None" = None,
+    gh_calls_last_hour: "int | None" = None,
 ) -> dict:
     """The contract body for this pass, off the console's builders.
 
@@ -334,6 +362,10 @@ def build_snapshot(
 
     `diskUsedPct` (issue #167) is the workspace volume's used percent, null
     when it could not be read.
+
+    `rate_login` is the reviewer identity the rate read ran under, and
+    `gh_calls_last_hour` the daemon's own `gh` call count (issue #205); each
+    is null when the caller cannot say.
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -380,7 +412,8 @@ def build_snapshot(
         "pollDurationsMs": durations or None,
         "sessions": sessions,
         "sessionList": session_list,
-        "rate": _rate(sources.rate_limit()),
+        "rate": _rate(sources.rate_limit(), rate_login),
+        IDENTITY_KEY: _int_or_none(gh_calls_last_hour),
         "memory": _memory(sources.memory()),
         "queueDepth": _int_or_none(queue_depth),
         "kpis": None,
@@ -456,6 +489,18 @@ def config_block(
     return block
 
 
+def without(snapshot: "Mapping", keys: "Sequence[str]") -> dict:
+    """`snapshot` minus the optional blocks `keys` names. IDENTITY_KEY takes
+    its two `rate` fields with it."""
+    body = {k: v for k, v in snapshot.items() if k not in keys}
+    rate = body.get("rate")
+    if IDENTITY_KEY in keys and isinstance(rate, dict):
+        body["rate"] = {
+            k: v for k, v in rate.items() if k not in RATE_IDENTITY_FIELDS
+        }
+    return body
+
+
 def body_bytes(snapshot: dict) -> int:
     """The wire size of `snapshot`, encoded exactly as the client sends it."""
     return len(json.dumps(snapshot).encode("utf-8"))
@@ -514,6 +559,7 @@ class FleetVitalsPusher:
         clock: Callable[[], float] = time.time,
         config_reader: "Callable[[], Mapping | None] | None" = None,
         upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
+        github: object = None,
     ):
         self.config = config
         self._sources = sources
@@ -536,6 +582,10 @@ class FleetVitalsPusher:
         # The last `upgrade` block a vitals answer carried (issue #193), kept
         # across answers that lack one.
         self.upgrade: "self_upgrade_mod.UpgradeAnswer | None" = None
+        # The daemon's GitHub client (issue #205): the asserted reviewer login
+        # and its rolling call count. None -- the console's pusher -- sends
+        # both as null.
+        self._github = github
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
@@ -548,7 +598,20 @@ class FleetVitalsPusher:
             now=self._clock(),
             config=self._config(),
             disk_used_pct=volume_used_pct(self.config.workspace_root),
+            rate_login=self._github_read("asserted_login"),
+            gh_calls_last_hour=self._github_read("calls_last_hour"),
         ))
+
+    def _github_read(self, name: str) -> Any:
+        """One identity read off the daemon's GitHub client, or None: no
+        client, an attribute it lacks, or a read that fails costs the field,
+        never the snapshot. Neither read places a `gh` call."""
+        value = getattr(self._github, name, None)
+        try:
+            return value() if callable(value) else value
+        except Exception as exc:
+            log.warning("fleet-vitals: could not read %s (%s)", name, exc)
+            return None
 
     def _config(self) -> "Mapping | None":
         """The `config` block, or None. A reader that fails costs the block,
@@ -591,9 +654,9 @@ class FleetVitalsPusher:
         if report is not None:
             snapshot["upgradeFailed"] = report
         now = self._clock()
-        for key, until in self._refused_until.items():
-            if now < until:
-                snapshot.pop(key, None)
+        snapshot = without(snapshot, [
+            key for key, until in self._refused_until.items() if now < until
+        ])
         if self.config.dry_run:
             log.info("[dry-run] would push fleet vitals (%s)", describe(snapshot))
             return VITALS_SKIPPED
@@ -647,10 +710,13 @@ class FleetVitalsPusher:
         if exc.status != 400:
             return []
         detail = str(exc.detail)
-        return [
+        refused = [
             key for key in OPTIONAL_BLOCKS
             if key in snapshot and re.search(rf"\b{key}\b", detail)
         ]
+        if IDENTITY_KEY in snapshot and _IDENTITY_REFUSED.search(detail):
+            refused.append(IDENTITY_KEY)
+        return refused
 
     def _post(self, snapshot: dict) -> str:
         try:
@@ -674,10 +740,7 @@ class FleetVitalsPusher:
                     ", ".join(f"`{k}`" for k in refused), exc.status,
                     exc.detail, int(BLOCK_REPROBE_S // 60),
                 )
-                trimmed = {
-                    k: v for k, v in snapshot.items() if k not in refused
-                }
-                return self._post(trimmed)
+                return self._post(without(snapshot, refused))
             self._warn_failed(exc)
             return VITALS_FAILED
         self._answered(result, snapshot)
@@ -761,8 +824,9 @@ def build_pusher(
     at construction, because a daemon must boot and poll whether or not
     vitals can authenticate. The import is local because `sources` imports
     `loop`, which imports this module. `config_reader` is the daemon's
-    `config` block source (issue #159), and `upgrader` its self-upgrade
-    state (issue #193); the console builds its own pusher without either.
+    `config` block source (issue #159), `upgrader` its self-upgrade state
+    (issue #193), and `github` also feeds `rate.login` and `ghCallsLastHour`
+    (issue #205); the console builds its own pusher without any of them.
     """
     from .version import version
     from .webui.sources import Sources
@@ -774,5 +838,5 @@ def build_pusher(
     )
     return FleetVitalsPusher(
         config, sources, AlissaClient(base=endpoint),
-        config_reader=config_reader, upgrader=upgrader,
+        config_reader=config_reader, upgrader=upgrader, github=github,
     )

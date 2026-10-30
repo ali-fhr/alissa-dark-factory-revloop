@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import time
+from collections import deque
 from dataclasses import dataclass
 
 from .proc import CommandError, run, run_json
@@ -77,6 +79,12 @@ TIMELINE_PAGE_LIMIT = 20
 # Hence: ONE request, and a full 300 means "cannot prove absence" (see
 # `compare_files`).
 COMPARE_FILE_PAGE = 300
+
+# The window `GitHub.calls_last_hour` counts over (issue #205): the fleet
+# vitals' `ghCallsLastHour`, every `gh` call this client placed in the last
+# hour. In memory and per process -- a restart starts the count at zero, which
+# is the honest reading of "calls THIS daemon made".
+GH_CALL_WINDOW_S = 3600.0
 
 # `per_page` only sizes the commits array, which no caller here reads, so it is
 # asked for the smallest legal value rather than for a page that matches the
@@ -525,9 +533,20 @@ class TruncatedListing(RuntimeError):
 
 
 class GitHub:
-    def __init__(self, login: str | None = None, token_env: str | None = None):
+    def __init__(
+        self,
+        login: str | None = None,
+        token_env: str | None = None,
+        *,
+        clock=time.monotonic,
+    ):
         self._login = login
         self._token_env = token_env
+        # The start time of every `gh` call this client placed within the
+        # last GH_CALL_WINDOW_S, oldest first (issue #205). Monotonic, so a
+        # wall-clock step can neither empty the window nor freeze it.
+        self._clock = clock
+        self._calls: "deque[float]" = deque()
         # The login this process ASSERTED at start (preflight). Distinct from
         # `_login`, which may be a configured-but-unverified value: only a
         # login that has been compared against `GET /user` lands here, and it
@@ -539,6 +558,32 @@ class GitHub:
     @property
     def token_env(self) -> str | None:
         return self._token_env
+
+    @property
+    def asserted_login(self) -> str | None:
+        """The login the boot identity check (`verify_identity`) asserted,
+        or None before it ran. Reading it costs no call."""
+        return self._asserted_login
+
+    # -- call accounting ---------------------------------------------------
+
+    def _note_call(self) -> None:
+        """Count one `gh` call, placed now. Every `gh` invocation of this
+        client goes through here before it runs, so a call that fails still
+        counts: GitHub may have billed it."""
+        now = self._clock()
+        self._calls.append(now)
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        horizon = now - GH_CALL_WINDOW_S
+        while self._calls and self._calls[0] <= horizon:
+            self._calls.popleft()
+
+    def calls_last_hour(self) -> int:
+        """How many `gh` calls this client placed in the last hour."""
+        self._prune(self._clock())
+        return len(self._calls)
 
     def _env(self) -> "dict[str, str] | None":
         """The environment every `gh` call of this client runs under.
@@ -572,7 +617,9 @@ class GitHub:
     def token_login(self) -> str:
         """Who the gh token actually belongs to. `gh api --jq` prints scalars
         raw (unquoted), so this is deliberately not parsed as JSON."""
-        return run(["gh", "api", "user", "--jq", ".login"], env=self._env()).strip()
+        env = self._env()
+        self._note_call()
+        return run(["gh", "api", "user", "--jq", ".login"], env=env).strip()
 
     @property
     def login(self) -> str:
@@ -674,8 +721,10 @@ class GitHub:
         if body is not None:
             argv += ["--input", "-"]
             stdin = json.dumps(body)
+        env = self._env()
+        self._note_call()
         try:
-            return run_json(argv, timeout=timeout, env=self._env(), stdin=stdin)
+            return run_json(argv, timeout=timeout, env=env, stdin=stdin)
         except CommandError as exc:
             blob = exc.stderr.lower()
             throttled = any(marker in blob for marker in RATE_LIMIT_MARKERS)
@@ -1288,6 +1337,8 @@ class GitHub:
         )
 
     def comment(self, owner: str, repo: str, number: int, body: str) -> None:
+        env = self._env()
+        self._note_call()
         run_json(
             [
                 "gh",
@@ -1296,7 +1347,7 @@ class GitHub:
                 "-f",
                 f"body={body}",
             ],
-            env=self._env(),
+            env=env,
         )
 
     def review_requested_at(
