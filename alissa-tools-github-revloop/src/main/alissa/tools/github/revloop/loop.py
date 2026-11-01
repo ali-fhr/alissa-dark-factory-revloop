@@ -735,9 +735,19 @@ _CLOSE_THE_ROUND = (
 # holding a worker slot. The daemon reaps it as a backstop, but the fast path is
 # the reviewer releasing its own slot as its very last action. {session} is the
 # reviewer's own managed session name, injected at spawn.
+# Issue #208: the kill raises SIGHUP on the reviewer's own pane, and the seat's
+# CLI dies on it before its end-of-session transcript upload runs (about 2% of
+# reviews reached Alissa). So the reviewer pushes its transcript itself, right
+# before the kill -- best-effort, because a failed upload must never hold the
+# slot -- and the kill stays the very last act. `alissa session logs --push`
+# reads ALISSA_SESSION_ID from the session's environment. Stopgap until the
+# CLI 0.3.1 -> loopwork 0.6.1 re-pin makes the CLI's own upload survive.
 _RELEASE_SLOT = (
     "FINALLY, and only once the round is fully closed above (review registered "
-    "AND verdict recorded), release your worker slot as your last action: run "
+    "AND verdict recorded), upload this review's conversation to Alissa: run "
+    "`alissa session logs --push`. It is best-effort: if it fails or has not "
+    "finished within about a minute, abandon it and continue — never retry it "
+    "and never debug it. Then release your worker slot as your last action: run "
     "`alissa tmux kill {session}`. Do nothing after it."
 )
 
