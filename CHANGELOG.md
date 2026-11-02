@@ -4,6 +4,27 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.36
+
+- **The seat image moves to loopwork base 0.6.1, which ships alissa CLI
+  0.3.1, and the image contract asserts that CLI floor** (issue #210; origin
+  TASK-1210078186, implementation TASK-1933796616). With CLI ≥ 0.3.1 a
+  reviewer's own `alissa tmux kill`, or the reaper's, reaches the CLI's
+  SIGHUP handler, which ends the session and uploads its transcript. The
+  0.2.3 base froze an older CLI that died on the signal first.
+  - `docker/claude/Dockerfile`: `FROM` re-pinned from
+    `0.2.3@sha256:9c20da05…` to `0.6.1@sha256:26af11fe…` (index digest,
+    read back from GHCR). The jump also brings loopwork 0.3–0.6: the
+    polyglot toolchains are only in the separate `-polyglot` tag, which is
+    not adopted here. 0.6.0 adds a pinned headless Chromium (Playwright
+    1.64.1, about +135 MB compressed) to the slim tag this image uses.
+    Snapshot: claude-code 2.1.316, codex 0.166.0, pi 0.73.1, alissa 0.3.1.
+  - `docker/claude/tests-image-contract.sh` prints `alissa --version` in
+    the image and fails below 0.3.1. An empty or unreadable answer also
+    fails.
+  - Deploying this image redeploys the revloop seat and kills live
+    sessions. The operator rolls it out at idle windows.
+
 ## 0.31.35
 
 - **A reviewer uploads its transcript right before its own self-kill**
