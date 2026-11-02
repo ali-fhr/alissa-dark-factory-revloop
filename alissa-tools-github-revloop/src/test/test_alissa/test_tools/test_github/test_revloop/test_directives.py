@@ -288,10 +288,11 @@ EXPECTED_PLAN_RUBRIC = (
 # directives is load-bearing, and a pin that only checked phrases would let
 # a clause be dropped silently. Re-pin deliberately, with the reason in the
 # commit, when a directive changes. (Issue #177: the reviewer rule now says
-# where a checkout goes -- beside `main/`, never inside it.)
+# where a checkout goes -- beside `main/`, never inside it. Issue #208: the
+# shared closing step pushes the transcript before the self-kill.)
 PLAN_TEMPLATE_SHA256 = {
-    "round-1": "d785634a01449599bacd5577b47963243c0f20e4acc640886e813adf11b52cf8",
-    "round-k": "e5ad788d5aca1f3916e9a9489903d3eda05319386591c9ae8911e4b0d2c0c0ec",
+    "round-1": "aec94161e2975696e198b4177a0ac818bef88ac451dc5f76bdf127671c974ab1",
+    "round-k": "ebc740bc56b911471c2e55646ae8f02a97ad478ceecd50c11e1073bd46f4d9f4",
 }
 
 
@@ -436,10 +437,11 @@ def test_the_code_directives_are_untouched_by_the_plan_lane():
 # Pinned by digest like the plan templates, and for the same reason: every
 # clause is load-bearing. The code directives are pinned beside it -- issue
 # #179 c5 is that the light lane leaves them byte for byte as they were.
-LIGHT_TEMPLATE_SHA256 = "9ce6fb314436a572d75b01b869e1b8042278b3995d203626cc8e559cda8c116e"
+# Re-pinned all three for issue #208 (the transcript push before the kill).
+LIGHT_TEMPLATE_SHA256 = "b9428ee0cbdc514fcaf73ecfc60777c358ef1b4767e932724337a928cc94da9a"
 CODE_TEMPLATE_SHA256 = {
-    "round-1": "4499f865268d5e34e3edc7051bcebaa1c22146c64cd93f053c11087486525be2",
-    "round-k": "865b1cd4c75e58a432148a70643ed3d2eb2e82e8b54dcd3c06fbabe3ee91d0f9",
+    "round-1": "707eca8cfe9c0b541ddef4cba1349b121473fb92f24bc7e3759c95d874b3acd5",
+    "round-k": "9dbc8c2260a90e5be77dc269930d36442618d34081955e020eeda1a0f96a12df",
 }
 
 
@@ -500,6 +502,29 @@ def test_the_light_directive_keeps_every_shared_clause():
     assert "CLOSE THE ROUND" in text
     assert "NEVER push commits, merge, or change PR state." in text
     assert "Do NOT create further ali-* sessions." in text
+    assert text.rstrip().endswith(
+        "run `alissa tmux kill review-plans-pr7-r2-abc123`. Do nothing after it."
+    )
+
+
+@pytest.mark.parametrize(
+    "template",
+    [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE, *PLAN_TEMPLATES, DISCOVERY_LIGHT_DIRECTIVE],
+)
+def test_every_directive_pushes_its_transcript_right_before_the_kill(template):
+    """Issue #208: the self-kill's SIGHUP takes the CLI down before its own
+    upload runs, so the reviewer pushes its transcript itself -- after the
+    round is closed, strictly before the kill, best-effort -- and the kill
+    stays the last act."""
+    text = render_plan(template)
+    push = text.index("run `alissa session logs --push`")
+    kill = text.index("run `alissa tmux kill review-plans-pr7-r2-abc123`")
+    assert text.index("CLOSE THE ROUND") < push < kill
+    assert text.count("alissa session logs --push") == 1
+    between = text[push:kill]
+    assert "best-effort" in between
+    assert "if it fails or has not finished within about a minute, abandon it and continue" in between
+    assert "never retry it" in between
     assert text.rstrip().endswith(
         "run `alissa tmux kill review-plans-pr7-r2-abc123`. Do nothing after it."
     )

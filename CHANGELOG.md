@@ -4,6 +4,20 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.35
+
+- **A reviewer uploads its transcript right before its own self-kill**
+  (issue #208; origin TASK-1332408435, implementation TASK-1532871162).
+  `alissa tmux kill {session}` raises SIGHUP on the reviewer's own pane and
+  the seat's CLI dies on it before its end-of-session upload runs, so only
+  about 2% of review transcripts reached Alissa. The shared closing step of
+  every review directive (code rounds 1 and k, plan rounds 1 and k, the
+  discovery light round) now runs `alissa session logs --push` once the round
+  is closed, best-effort — a failure or a hang past about a minute is
+  abandoned, never retried — and the kill stays the last act ("Do nothing
+  after it"). The five directive digests in `test_directives.py` are
+  re-pinned. Stopgap until the CLI 0.3.1 → loopwork 0.6.1 re-pin.
+
 ## 0.31.34
 
 - **Fleet vitals carry the reviewer identity's `rate.used` and
