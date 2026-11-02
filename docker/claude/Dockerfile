@@ -96,7 +96,19 @@
 # lives in the CLI, so only a base rebuilt after share.alissa.app republished
 # it can carry the fix. Base release: ali-fhr/alissa-loopwork#6. Inherited tool
 # versions are unasserted as before; tests-image-contract.sh prints them.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c26cefc718a67cde94195668dc9341c07e14b0fd
+#
+# 0.6.1 (issue #210) carries alissa CLI 0.3.1: the CLI forwards SIGHUP to its
+# finalize step, so a reviewer's own `alissa tmux kill` -- or the reaper's --
+# ends the session and uploads its transcript instead of killing the CLI first
+# (every CLI frozen into 0.2.3 predates that fix). The base build itself now
+# refuses a CLI below 0.3.1 (ALISSA_CLI_MIN), and tests-image-contract.sh
+# asserts the same floor inside this leaf. The jump also brings 0.3-0.6, all
+# inherited by the slim tag pinned here: the polyglot toolchains live only in
+# the separate `-polyglot` tag (not adopted -- an operator rollout decision),
+# and 0.6.0 adds a pinned headless Chromium (Playwright 1.64.1, ~+135 MB
+# compressed) to slim. Snapshot of this build: claude-code 2.1.316, codex
+# 0.166.0, pi 0.73.1, alissa 0.3.1. Base release: ali-fhr/alissa-loopwork#16.
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.6.1@sha256:26af11fe3f1fb8a730076d772fa0f456bd7beefd05c45ec8e26e96421bd00efe
 
 # Version of the daemon to install from PyPI. This default EQUALS the dist's
 # plain-text `version` file (alissa-tools-github-revloop/src/main/alissa/tools/
@@ -122,7 +134,7 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.3@sha256:9c20da0585b3f10e2cc8ae87c
 # start (the entrypoint's monitor logs it), so a pin below that sets
 # ALISSA_UI_HOST=0.0.0.0 — it does not move the floor. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
 # (capability-probed, not version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.31.35
+ARG REVLOOP_VERSION=0.31.36
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.

@@ -27,7 +27,11 @@
 #      `codex`, `pi` all resolvable on PATH — and `claude --version` is at least
 #      2.1.280, the first claude-code that knows `claude-opus-5-5`, the model
 #      the shared fleet pins (issue #140; base 0.2.2 ships 2.1.283). The
-#      version is printed so the CI log records what each build inherited. The last two are base-contract only:
+#      version is printed so the CI log records what each build inherited.
+#      `alissa --version` is likewise printed and held to a 0.3.1 floor, the
+#      first CLI whose SIGHUP handler finalizes the session and uploads its
+#      transcript when the pane is killed (issue #210; base 0.6.1 ships 0.3.1).
+#      The last two are base-contract only:
 #      this daemon never spawns them (base 0.2.0 made the base multi-agent), and
 #      they are asserted precisely BECAUSE nothing here would notice them going
 #      missing — which is the same reason every other inherited item is listed.
@@ -203,6 +207,23 @@ if [ -n "$cv" ] && [ "$(printf '%s\n' "$CLAUDE_FLOOR" "$cv" | sort -V | head -1)
   ok "claude --version = $cv (>= $CLAUDE_FLOOR, knows claude-opus-5-5)"
 else
   no "claude --version = '${cv:-<none>}' — below the $CLAUDE_FLOOR floor claude-opus-5-5 needs"
+fi
+
+# --- the inherited alissa CLI closes a killed session cleanly ---
+# A reviewer ends with `alissa tmux kill` on its own pane, and the reaper kills
+# stragglers the same way. Only a CLI >= 0.3.1 turns that SIGHUP into a
+# finalize (session closed, transcript uploaded); an older one dies first and
+# the session is left open with no transcript. Like claude-code above, the CLI
+# is a curl-installed snapshot of the base's build date, so the FROM bump is
+# the only thing that moves it. Resolved through the image PATH, which the
+# base extends with /home/alissa/.local/bin (where it installs the CLI). Fails
+# closed: an empty or unparseable `alissa --version` is a FAIL, never a pass.
+ALISSA_FLOOR=0.3.1
+av="$(alissa --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -n "$av" ] && [ "$(printf '%s\n' "$ALISSA_FLOOR" "$av" | sort -V | head -1)" = "$ALISSA_FLOOR" ]; then
+  ok "alissa --version = $av (>= $ALISSA_FLOOR, finalizes on SIGHUP)"
+else
+  no "alissa --version = '${av:-<none>}' — below the $ALISSA_FLOOR floor a clean close on tmux kill needs"
 fi
 
 # --- the non-root user ---
