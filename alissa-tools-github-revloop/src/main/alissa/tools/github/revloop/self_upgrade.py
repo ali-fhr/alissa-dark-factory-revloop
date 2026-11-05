@@ -64,6 +64,20 @@ This module reads it and acts on it in these steps:
    written once per version: a file that already records a rollback from
    the running version is the entrypoint's to finish, so a boot step that
    never ran, or a reinstall that failed, never loops drain → exit.
+7. **Retry a failed rollback** (issue #218). A boot that could not
+   reinstall the version it was going back to leaves ``rollback_failed``
+   and boots the version it meant to leave. Nothing restarts the container
+   on its own, so a self-hosted daemon (`autoUpgrade` on, not paused) still
+   running that version holds (`HOLD_RETRY`) once
+   ``ROLLBACK_RETRY_AFTER_S`` have passed since this process first saw the
+   state, and at idle writes ``state = rollback_retry`` with
+   ``rollbackRetries`` counted and exits; the entrypoint retries the
+   reinstall. At most ``ROLLBACK_RETRY_EXITS`` such exits per failed
+   rollback, then one WARNING and the seat stays where it is. A
+   Studio-asked rollback is retried only while Studio still names the
+   running version in ``rollback.from``. The boot step leaves no
+   ``upgradeFailed`` report while the reinstall has not landed: the seat
+   still runs that version, and a report would read as rolled back.
 
 Never while paused, never in managed mode, never with a live session: those
 three are checked here, at the moment of the exit, not only when the hold
@@ -83,8 +97,11 @@ neither can drop the other's state. Its keys:
   seconds its 10-minute window reads; ``firstBootAt`` the same as ISO-8601.
 * ``rollbackReason`` -- why the entrypoint rolled back, kept across the
   retries of a ``rollback_failed`` reinstall.
+* ``rollbackRetries`` -- the retry exits the daemon asked for this failed
+  rollback (step 7).
 * ``state`` -- ``requested`` (daemon), then ``installed``,
   ``install_failed``, ``rollback_failed`` (retried at the next boot),
+  ``rollback_retry`` (daemon: the retry exit of step 7),
   ``rolled_back`` or ``not_newer`` (a target not newer than the installed
   version, never installed) (entrypoint), then ``confirmed`` or
   ``unserved`` (daemon). A ``not_newer`` request this version wrote is
@@ -132,6 +149,14 @@ IDLE_POLLS = 2
 HOLD_DRAIN = "drain"
 HOLD_UPGRADE = "upgrade"
 HOLD_ROLLBACK = "rollback"
+HOLD_RETRY = "rollback_retry"
+
+# Issue #218: how long a daemon left on the version a rollback could not
+# leave keeps reviewing before it drains for a retry exit, and how many
+# such exits one failed rollback gets.
+ROLLBACK_RETRY_AFTER_S = 30 * 60
+ROLLBACK_RETRY_EXITS = 2
+RETRY_STATES = ("rollback_failed", "rollback_retry")
 
 # Studio's rollback reason, as far as the request file and the logs keep it.
 ROLLBACK_REASON_MAX = 240
@@ -361,6 +386,11 @@ class SelfUpgrader:
         # Running versions a rollback answer named but this seat could not
         # go back from (no confirmed upgrade names `previous`): warned once.
         self._no_previous: "set[str]" = set()
+        # Issue #218: when this process first saw a failed rollback it
+        # could retry, and the running versions it gave up retrying.
+        self._retry_seen: "float | None" = None
+        self._retry_given_up: "set[str]" = set()
+        self._retry_target: "str | None" = None
         self.exit_requested = False
 
     # -- reading the answer --
@@ -572,16 +602,77 @@ class SelfUpgrader:
             )
         return None
 
+    def retry_to(self) -> "str | None":
+        """The version a failed rollback should be retried to now, or None
+        (issue #218): the request file is ``rollback_failed`` (or a
+        ``rollback_retry`` the boot step never acted on) and names the
+        running version as the one to leave -- ``rollback.from`` for a
+        Studio-asked rollback, which Studio must still be asking for, the
+        target for an unconfirmed upgrade -- with a valid destination. A
+        self-hosted seat with `autoUpgrade` on and not paused only, after
+        ``ROLLBACK_RETRY_AFTER_S`` since this process first saw it, and at
+        most ``ROLLBACK_RETRY_EXITS`` times per failed rollback."""
+        a = self.answer
+        if a is None or a.mode != SELF_HOSTED or not a.auto_upgrade or a.paused:
+            return None
+        if self.running in self._unwritable or self.running in self._retry_given_up:
+            return None
+        data = read_request(self.path) or {}
+        if data.get("state") not in RETRY_STATES:
+            self._retry_seen = None
+            return None
+        record = _rollback_record(data)
+        if record is not None:
+            left, dest = record.get("from"), _target_version(data)
+            if a.rollback_from != self.running:
+                return None
+        else:
+            left, dest = _target_version(data), data.get("previous")
+        if (
+            left != self.running
+            or not isinstance(dest, str)
+            or version_key(dest) is None
+            or dest == self.running
+        ):
+            return None
+        retries = data.get("rollbackRetries")
+        retries = retries if isinstance(retries, int) and retries > 0 else 0
+        if retries >= ROLLBACK_RETRY_EXITS:
+            self._retry_given_up.add(self.running)
+            log.warning(
+                "self-upgrade: the rollback %s → %s still failed after %d retry "
+                "exit(s) (%s) — not retrying again; this seat keeps running %s "
+                "until it is restarted by hand", self.running, dest, retries,
+                data.get("lastError") or "no error recorded", self.running,
+            )
+            return None
+        now = self._clock()
+        if self._retry_seen is None:
+            self._retry_seen = now
+            log.info(
+                "self-upgrade: the rollback %s → %s failed at boot (%s) — "
+                "retrying it in %d min (retry %d of %d)", self.running, dest,
+                data.get("lastError") or "no error recorded",
+                ROLLBACK_RETRY_AFTER_S // 60, retries + 1, ROLLBACK_RETRY_EXITS,
+            )
+        if now - self._retry_seen < ROLLBACK_RETRY_AFTER_S:
+            return None
+        return dest
+
     def _move(self) -> "tuple[str | None, str | None]":
-        """(`HOLD_ROLLBACK`, previous), (`HOLD_UPGRADE`, target) or
-        (None, None). A rollback comes first: it leaves a version Studio
-        found broken."""
+        """(`HOLD_ROLLBACK`, previous), (`HOLD_UPGRADE`, target),
+        (`HOLD_RETRY`, previous) or (None, None). A rollback comes first: it
+        leaves a version Studio found broken. A newer target leaves the
+        version a failed rollback is stuck on too, so it beats the retry."""
         version = self.rollback_to()
         if version is not None:
             return HOLD_ROLLBACK, version
         version = self.wanted()
         if version is not None:
             return HOLD_UPGRADE, version
+        version = self.retry_to()
+        if version is not None:
+            return HOLD_RETRY, version
         return None, None
 
     def hold(self) -> "str | None":
@@ -604,6 +695,11 @@ class SelfUpgrader:
                 f"{self._rollback_target or '?'} on Studio's answer: "
                 f"{self._rollback_reason()}"
             )
+        if self._hold == HOLD_RETRY:
+            return (
+                f"draining to retry the failed rollback {self.running} → "
+                f"{self._retry_target or '?'}"
+            )
         return ""
 
     def _rollback_reason(self) -> str:
@@ -613,6 +709,7 @@ class SelfUpgrader:
     def _update_hold(self) -> None:
         kind, version = self._move()
         self._rollback_target = version if kind == HOLD_ROLLBACK else None
+        self._retry_target = version if kind == HOLD_RETRY else None
         new: "str | None" = kind
         if self.answer is not None and self.answer.drain:
             new = HOLD_DRAIN
@@ -656,7 +753,8 @@ class SelfUpgrader:
         if version is None or self.answer is None:
             self._idle_polls = 0
             return NONE
-        verb = "roll back" if kind == HOLD_ROLLBACK else "upgrade"
+        verb = {HOLD_ROLLBACK: "roll back", HOLD_RETRY: "retry the rollback"}.get(
+            kind or "", "upgrade")
         live = live_reviewer_sessions(roster)
         if live is None or live:
             if self._idle_polls:
@@ -693,17 +791,22 @@ class SelfUpgrader:
         try:
             if kind == HOLD_ROLLBACK:
                 self._rollback(version)
+            elif kind == HOLD_RETRY:
+                self._retry_rollback()
             else:
                 self._request(self.answer)
         except OSError as exc:
-            # A rollback that cannot be written puts the RUNNING version out
-            # of reach of `rollback_to`; an upgrade, its target.
-            self._unwritable.add(self.running if kind == HOLD_ROLLBACK else version)
+            # A rollback (or its retry) that cannot be written puts the
+            # RUNNING version out of reach of `rollback_to` and `retry_to`;
+            # an upgrade, its target.
+            self._unwritable.add(
+                self.running if kind in (HOLD_ROLLBACK, HOLD_RETRY) else version)
             log.warning(
                 "self-upgrade: could not write %s (%s) — NOT %s to %s; "
                 "the drain is lifted and this process will not try %s again",
                 self.path, exc,
-                "rolling back" if kind == HOLD_ROLLBACK else "upgrading",
+                {HOLD_ROLLBACK: "rolling back", HOLD_RETRY: "retrying the rollback"}.get(
+                    kind or "", "upgrading"),
                 version, version,
             )
             self._update_hold()
@@ -746,7 +849,7 @@ class SelfUpgrader:
         if self.running not in skip:
             skip.append(self.running)
         for key in ("confirmedAt", "firstBootTs", "firstBootAt", "lastError",
-                    "rollbackReason"):
+                    "rollbackReason", "rollbackRetries"):
             data.pop(key, None)
         data.update({
             "target": {"version": previous, "digest": None},
@@ -758,6 +861,17 @@ class SelfUpgrader:
             "skip": skip,
             "rollback": {"from": self.running, "reason": self._rollback_reason()},
         })
+        write_request(self.path, data)
+
+    def _retry_rollback(self) -> None:
+        """Ask the boot step to retry a failed rollback (issue #218): the
+        state becomes ``rollback_retry`` (the exit tail restarts the
+        container on it) and ``rollbackRetries`` counts the exit. Every
+        other key stays: the boot step's rollback branches read them."""
+        data = read_request(self.path) or {}
+        retries = data.get("rollbackRetries")
+        retries = retries if isinstance(retries, int) and retries > 0 else 0
+        data.update({"state": "rollback_retry", "rollbackRetries": retries + 1})
         write_request(self.path, data)
 
     # -- the failure report --

@@ -257,6 +257,14 @@ needs_recursive_chown() {
 #     though it is older -- the one downgrade this step makes -- and the
 #     failed version joins the skip list with the `upgradeFailed` report. A
 #     reinstall that fails is `rollback_failed`, retried at the next boot.
+#   * a `rollback_failed` boot (either kind) leaves NO `upgradeFailed`
+#     report (issue #218): the seat still runs the version it failed to
+#     leave, and Studio would read the report as a rollback that landed.
+#     The report is left when a retry lands. The daemon asks for that retry
+#     itself: after 30 min on the version it could not leave it drains and
+#     exits at idle with state `rollback_retry`, at most twice per failed
+#     rollback (self_upgrade.py, step 7); this step treats `rollback_retry`
+#     as `rollback_failed`.
 #
 # The daemon confirms the request after its first answered vitals poll on the
 # target. Both sides keep the keys they do not own (see self_upgrade.py).
@@ -324,6 +332,19 @@ def write(data):
     os.replace(tmp, path)
 
 
+def stuck(data, left, reason):
+    # Issue #218: the reinstall did not land, so the seat still runs `left`.
+    # Skipped, but NOT reported: an `upgradeFailed` for the version the seat
+    # runs reads to Studio as a rollback that happened. An undelivered
+    # report already in the file is kept.
+    skip = [v for v in data.get("skip") or [] if isinstance(v, str)]
+    if left not in skip:
+        skip.append(left)
+    data.update({"state": "rollback_failed", "skip": skip, "lastError": reason})
+    write(data)
+    log(f"{left} is now on the skip list (rollback_failed: {reason}); not reported until a retry lands")
+
+
 def fail(data, target, state, reason):
     skip = [v for v in data.get("skip") or [] if isinstance(v, str)]
     if target not in skip:
@@ -347,7 +368,9 @@ if not isinstance(data, dict):
     log(f"{path} is not a JSON object — booting the installed version")
     sys.exit(0)
 # rollback_failed: an earlier boot could not reinstall `previous`; retry it.
-if data.get("confirmed") or data.get("state") not in ("requested", "installed", "rollback_failed"):
+# rollback_retry: the daemon exited to ask for that retry (issue #218).
+RETRY_STATES = ("rollback_failed", "rollback_retry")
+if data.get("confirmed") or data.get("state") not in ("requested", "installed") + RETRY_STATES:
     sys.exit(0)
 
 target = (data.get("target") or {}).get("version") if isinstance(data.get("target"), dict) else None
@@ -380,13 +403,13 @@ if isinstance(rollback, dict):
         fail(data, failed, "rolled_back", f"rolled back to {target}: {why}")
     else:
         log(f"WARN: could not reinstall {target} ({err}) — booting {running}; the next boot retries")
-        fail(data, failed, "rollback_failed", f"could not reinstall {target} ({err}); {why}")
+        stuck(data, failed, f"could not reinstall {target} ({err}); {why}")
     sys.exit(0)
 
 boots = int(data.get("boots") or 0)
 first = data.get("firstBootTs")
 expired = isinstance(first, (int, float)) and now - first > WINDOW_S
-retry = data.get("state") == "rollback_failed"
+retry = data.get("state") in RETRY_STATES
 if retry or boots >= MAX_BOOTS or expired:
     if retry and isinstance(data.get("rollbackReason"), str):
         reason = data["rollbackReason"]
@@ -405,7 +428,7 @@ if retry or boots >= MAX_BOOTS or expired:
         # Not final: the next boot retries the reinstall. The target is
         # skipped already, so the daemon neither confirms nor re-requests it.
         log(f"WARN: could not reinstall {previous} ({err}) — booting {running}; the next boot retries")
-        fail(data, target, "rollback_failed", f"could not reinstall {previous} ({err}); {reason}")
+        stuck(data, target, f"could not reinstall {previous} ({err}); {reason}")
     sys.exit(0)
 
 if running != target:
@@ -1995,7 +2018,7 @@ wait "${DAEMON_PID}" || DAEMON_RC=$?
 # (EX_TEMPFAIL) instead: both "always" and "on failure" policies restart it.
 # >>> self_upgrade_exit
 if [ "${DAEMON_RC}" = "0" ] \
-   && grep -qs '"state": "requested"' "${ALISSA_UPGRADE_DIR:-/workspace/.alissa-upgrade}/revloop.json"; then
+   && grep -qsE '"state": "(requested|rollback_retry)"' "${ALISSA_UPGRADE_DIR:-/workspace/.alissa-upgrade}/revloop.json"; then
   log "alissa-revloop exited for a self-upgrade — restarting the container (exit 75) to install it"
   exit 75
 fi
