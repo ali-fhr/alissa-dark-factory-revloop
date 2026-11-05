@@ -134,7 +134,7 @@ FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.6.1@sha256:26af11fe3f1fb8a730076d772
 # start (the entrypoint's monitor logs it), so a pin below that sets
 # ALISSA_UI_HOST=0.0.0.0 — it does not move the floor. The bows arm (`repos_source`, since 0.29.0) is skew-guarded
 # (capability-probed, not version-pinned), so it does NOT move the floor.
-ARG REVLOOP_VERSION=0.31.37
+ARG REVLOOP_VERSION=0.31.38
 
 # --- The review daemon (from PyPI) -------------------------------------------
 # Installs the `alissa-revloop` console script into /usr/local/bin.

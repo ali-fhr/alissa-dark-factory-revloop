@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from . import ci as ci_mod
 from . import janitor as janitor_mod
 from . import parking as parking_mod
 from . import probes as probes_mod
@@ -87,6 +88,7 @@ from .ghclient import (
     PullRequest,
     RateLimited,
     Review,
+    ReviewRequest,
     TimelineTruncated,
     TruncatedListing,
     countable_rounds,
@@ -526,6 +528,42 @@ def readiness_trailer(envelope: "VerdictEnvelope | None") -> str:
     return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR} — {READINESS_MISSING_REASON}"
 
 
+def preexisting_lines(found: "tuple[ci_mod.PreExisting, ...]") -> str:
+    """One `[minor]` bullet per pre-existing red, for a review body."""
+    return "\n".join(
+        CHECKS_PREEXISTING_LINE.format(
+            name=_one_line(p.context.name),
+            conclusion=p.context.conclusion or "not concluded",
+            url=f" — {p.context.url}" if p.context.url else "",
+            where=p.where,
+            evidence=f": {p.evidence_url}" if p.evidence_url else "",
+        )
+        for p in found
+    )
+
+
+def _one_line(value: str) -> str:
+    """GitHub-controlled text flattened onto one line, without backticks,
+    so it cannot break the bullet or the trailer it sits in."""
+    return " ".join(value.replace("`", "").split())
+
+
+def preexisting_trailer(
+    trailer: str, judged: str, found: "tuple[ci_mod.PreExisting, ...]"
+) -> str:
+    """The readiness line for an APPROVE whose head carries pre-existing reds
+    (issue #214): an `auto` becomes an UNCLASSED `operator` naming them, so
+    the merge edge holds a head that is not fully green. An `operator` line
+    the envelope already wrote is kept as it is -- it holds anyway, and its
+    reason (and class) is the reviewer's."""
+    if trailer != f"{READINESS_TRAILER_LABEL} {READINESS_AUTO}":
+        return trailer
+    reason = PREEXISTING_READINESS_REASON.format(
+        sha=judged[:8], names=", ".join(_one_line(p.context.name) for p in found)
+    )
+    return f"{READINESS_TRAILER_LABEL} {READINESS_OPERATOR} — {reason}"
+
+
 # The Commit-Readiness trailer (issue #148; genloop design D8, §6.3): what a
 # PLAN PR's native APPROVE carries instead of Merge-Readiness. Same emitter
 # rules as readiness_trailer -- APPROVE events only, the envelope's reason
@@ -578,13 +616,36 @@ CHECKS_RED_LEAD = (
     "*reviewed AND green* — on 2026-07-29 (studio #323) a round approved 3.4 "
     "hours after CI had gone red, and the red sat unaddressed because the "
     "approve read as ready.\n\n"
-    "Fix (or re-run) the check(s) above and re-request review; the next round "
-    "can approve the same code on a green head. No label was touched.\n\n"
+    "Fix the check(s) above and push; the next round reviews the new head. "
+    "After a re-run that turns the same code green, an operator's re-request "
+    "lets the next round approve it — the PR author's re-request on an "
+    "unchanged head does not start a round. No label was touched.\n\n"
 )
 
 # One bullet per blocking context. The URL is what makes the finding walkable;
 # a check run without one (rare, and never for Actions) still names itself.
 CHECKS_FAILING_LINE = "- `{name}` — {conclusion}{url}"
+
+# Issue #214: the failing checks the daemon proved were red without this PR
+# (ci.py). Prepended to an approve whose ONLY reds are these, and appended to
+# the red lead when real reds sit beside them, so nobody reads them as the
+# PR's. `[minor]`, never `[blocker]`: they do not move the verdict.
+CHECKS_PREEXISTING_LEAD = (
+    "**`{sha}` is clean except for pre-existing CI reds.** These checks are "
+    "failing, but each was already red without this PR, and the diff does not "
+    "touch the workflow behind it:\n\n"
+    "{preexisting}\n\n"
+    "They do not block this verdict. The head is still not fully green, so the "
+    "merge is the operator's call.\n\n"
+)
+CHECKS_PREEXISTING_LINE = (
+    "- `[minor]` `{name}` — {conclusion}{url}: pre-existing failure, not caused "
+    "by this PR (already red at {where}{evidence})"
+)
+# The readiness reason an approve carrying pre-existing reds posts with, in
+# place of an envelope's `auto`. NO class (none of the rows fits): unclassed
+# is the hard hold, which is what a red head the operator must merge gets.
+PREEXISTING_READINESS_REASON = "pre-existing CI reds at {sha}, red on the base too: {names}"
 
 # Prepended when the gate held the approve for the whole wait bound and the
 # rollup still had not settled, so the verdict lands as a COMMENT.
@@ -1052,6 +1113,38 @@ CHECKS_AT_SPAWN_UNREADABLE = (
 # quotes mean something. Inside ⟦data⟧ the fence is the boundary.
 CHECKS_AT_SPAWN_FAILING = "{name} ({conclusion}){url}"
 
+# Issue #214: failing contexts the daemon proved were red WITHOUT this PR (see
+# ci.py). Appended after whichever clause above describes what is left, so it
+# overrides the CI GATE's request_changes rule for these contexts only. The
+# operator readiness line is what keeps an approve with a red rollup from
+# reading as auto-mergeable: a pre-existing red is not the PR's fault, but it
+# is still red, and the merge is the operator's call.
+CHECKS_AT_SPAWN_PREEXISTING = (
+    "PRE-EXISTING REDS — the daemon checked these failing contexts at `{sha}` "
+    "against the base branch: each was already red WITHOUT this PR, and the "
+    "diff does not touch the workflow behind it. " + UNTRUSTED_LEAD + ": "
+    "{preexisting}. For these contexts ONLY, the CI GATE's request_changes rule "
+    "above does not apply: report each as ONE `[minor]` finding, `pre-existing "
+    "failure, not caused by this PR`, linking the run where it already failed. "
+    "Never tag one `[blocker]` and never request_changes because of one. Any "
+    "OTHER failing context still blocks exactly as the CI GATE says. If the "
+    "diff is otherwise clean and nothing else is red, approve, say in your "
+    "verdict that the PR is clean except for pre-existing reds, and make your "
+    "Merge-Readiness line `operator — pre-existing CI reds, red on the base "
+    "too: <their names>` with NO class: the merge edge must hold a head that "
+    "is not fully green for the operator. "
+)
+# What the clause above opens with when the pre-existing reds are ALL that
+# failed and nothing is still running: CHECKS_AT_SPAWN_GREEN would claim a
+# green rollup that is not green.
+CHECKS_AT_SPAWN_ONLY_PREEXISTING = (
+    "At queue time the only failing contexts at `{sha}` were pre-existing "
+    "({total} context(s) in all, none still running) — re-read the rollup "
+    "before you submit anyway: a check can go red while you review. "
+)
+# One entry per pre-existing context inside the fence.
+CHECKS_AT_SPAWN_PREEXISTING_ITEM = "{name} ({conclusion}){url} — already red at {where}{evidence}"
+
 # What the list becomes once the count cap has bitten. Visible on purpose, like
 # the per-item marker beside the caps above: every truncation in this module has
 # to be readable in the directive, or a reviewer session cannot tell "these are
@@ -1112,6 +1205,22 @@ def directive_data(items: list[str]) -> str:
     if dropped > 0:
         text += DIRECTIVE_DATA_TRUNCATED.format(dropped=dropped)
     return f"{DATA_OPEN} {text} {DATA_CLOSE}"
+
+
+def preexisting_clause(sha: str, found: "tuple[ci_mod.PreExisting, ...]") -> str:
+    """The PRE-EXISTING REDS clause for a directive (issue #214), every item
+    fenced and bounded like the other GitHub-controlled data."""
+    items = directive_data([
+        CHECKS_AT_SPAWN_PREEXISTING_ITEM.format(
+            name=p.context.name,
+            conclusion=p.context.conclusion or "no conclusion",
+            url=f" — {p.context.url}" if p.context.url else "",
+            where=p.where,
+            evidence=f" — {p.evidence_url}" if p.evidence_url else "",
+        )
+        for p in found
+    ])
+    return CHECKS_AT_SPAWN_PREEXISTING.format(sha=sha, preexisting=items)
 
 
 # The shell rule (issue #138; devloop #125's `_SHELL_RULE`, word for word).
@@ -2639,6 +2748,10 @@ class ChecksGate:
     # operator page that follows a degraded verdict (see _page_unsettled_checks)
     # so the page and the review record cannot drift apart.
     detail: str = ""
+    # The failing contexts ci.py proved this PR inherited (issue #214). They
+    # neither block nor downgrade the approve; they are named in the lead,
+    # and an approve that carries any posts an operator readiness line.
+    preexisting: "tuple[ci_mod.PreExisting, ...]" = ()
 
 
 @dataclass(frozen=True)
@@ -2927,7 +3040,11 @@ class ReviewWatcher:
         # stamp, or None for never) -- the round-admission gate's one GitHub
         # read, memoised so a PR costs at most one timeline walk per pass
         # (issue #128). Cleared with the other per-pass memos in poll_once.
-        self._pass_requests: dict[tuple[str, int], str | None] = {}
+        self._pass_requests: "dict[tuple[str, int], ReviewRequest | None]" = {}
+        # (head, verdict) per PR whose author re-request on an unchanged head
+        # was already announced at INFO (issue #214) -- the same once-per
+        # episode dedupe as `_ignored_requests`.
+        self._unchanged_heads: "dict[tuple[str, int], tuple[str, float]]" = {}
         # (repo full name, PR number) -> (head, verdict epoch) of the last
         # stale request the gate announced at INFO for that PR, so the line
         # goes out once per ignored request and repeats at debug while the
@@ -3913,6 +4030,12 @@ class ReviewWatcher:
         (b) the issue timeline shows a `review_requested` event for the
             reviewer login NEWER than the last verdict on H.
 
+        Since issue #214, (b) does not hold when that request came from the
+        PR's own AUTHOR (`_self_rerequest`): the implementer re-requesting its
+        unchanged head is not new evidence, and 4R7e #102 got four identical
+        verdicts that way. A push, a request from anyone else, or one from an
+        `operators` login still re-arms.
+
         And inside `verdict_cooldown_s` of that verdict nothing is admitted on
         H at all, whatever the timeline says: the cooldown alone would have
         prevented #1243, and (b) is what makes the gate correct rather than
@@ -3968,17 +4091,20 @@ class ReviewWatcher:
                 ),
             )
 
-        requested = self._fresh_request_at(pr)
-        if requested is None:
+        newest = self._fresh_request(pr)
+        if newest is None:
             # The newest request could not be seen -- the timeline was
             # unreadable or longer than the bound (logged there). The snapshot
             # is all that is left, and past the cooldown it is the pre-#128
             # trigger: a wedged loop on every read failure is the worse trade.
             return None
+        requested = newest.at
         request_at = _epoch(requested)
         verdict_at = verdict.github_at if verdict.github_at is not None else verdict.at
         if request_at is not None and request_at > verdict_at:
-            return None
+            if not self._self_rerequest(pr, newest.actor):
+                return None
+            return self._refuse_unchanged_head(pr, round_, newest, verdict_at)
 
         self._waiting.pop(key, None)
         seen = (
@@ -4034,17 +4160,68 @@ class ReviewWatcher:
             return None
         return VerdictOfRecord(at=max(candidates), github_at=seen)
 
-    def _fresh_request_at(self, pr: PullRequest) -> str | None:
-        """When this login was most recently asked to review the PR, from the
-        issue timeline, memoised for the pass: one timeline walk per candidate
-        PR per poll, however many times the PR is evaluated. None when the
-        read failed (a RateLimited still propagates to run_forever's backoff,
-        exactly as every other read path lets it)."""
+    def _self_rerequest(self, pr: PullRequest, actor: str) -> bool:
+        """Whether a fresh request on an already-judged head came from the
+        PR's own author rather than from someone asking for another look
+        (issue #214).
+
+        The fleet's implementer is the PR author, and it re-requests review
+        as the last step of every fix round, whether or not it pushed. On an
+        UNCHANGED head that re-request carries no new evidence: 4R7e #102
+        collected four identical `CHANGES_REQUESTED` reviews on one head this
+        way. So a same-head request from the author does not start a round.
+        A request from anyone else is the explicit ask the issue keeps
+        (a teammate or an operator clicking "re-request"). So is one from a
+        login on `operators`, even when that login opened the PR by hand.
+        An event with no actor is not called the author's: the gate fails
+        open there, as it does on an unreadable timeline.
+        """
+        who = (actor or "").casefold()
+        if not who or who != (pr.author or "").casefold():
+            return False
+        return not self._is_operator(actor)
+
+    def _refuse_unchanged_head(
+        self, pr: PullRequest, round_: int, newest: "ReviewRequest", verdict_at: float
+    ) -> Decision:
+        """SKIPPED for a same-head re-request by the PR author, logged at INFO
+        once per (head, verdict) and at debug after that, like the stale
+        request below it."""
+        key = (pr.full_name, pr.number)
+        self._waiting.pop(key, None)
+        short = pr.head_sha[:8]
+        message = (
+            "%s round %d: head %s already has a verdict (%s) and nothing was "
+            "pushed since — %s's re-request at %s does not start a round on an "
+            "unchanged head; push, or have an operator re-request"
+        )
+        args = (pr.slug, round_, short, _stamp(verdict_at), newest.actor, newest.at)
+        if self._unchanged_heads.get(key) == (pr.head_sha, verdict_at):
+            log.debug(message, *args)
+        else:
+            self._unchanged_heads[key] = (pr.head_sha, verdict_at)
+            log.info(message, *args)
+        return Decision(
+            Action.SKIPPED,
+            f"head {short} is unchanged since its last verdict — the author's "
+            f"re-request does not start a round; push, or have an operator "
+            f"re-request",
+            round_,
+        )
+
+    def _fresh_request(self, pr: PullRequest) -> "ReviewRequest | None":
+        """The newest review request for this login, from the issue timeline,
+        memoised for the pass: one timeline walk per candidate PR per poll,
+        however many times the PR is evaluated. None when the read failed (a
+        RateLimited still propagates to run_forever's backoff, exactly as
+        every other read path lets it); a timeline with no request at all is
+        `ReviewRequest("")`."""
         key = (pr.full_name, pr.number)
         if key in self._pass_requests:
             return self._pass_requests[key]
+        requested: "ReviewRequest | None"
         try:
-            requested = self.github.review_requested_at(
+            requested = self.github.newest_review_request(
                 pr.owner, pr.repo, pr.number, self.github.login
             )
         except RateLimited:
@@ -4072,8 +4249,8 @@ class ReviewWatcher:
         else:
             # A timeline with no request at all is a real answer -- the
             # snapshot said "requested" and history says nobody did -- and it
-            # is memoised as the empty string so the miss is not re-read.
-            requested = requested or ""
+            # is memoised as an empty stamp so the miss is not re-read.
+            requested = requested or ReviewRequest(at="")
         self._pass_requests[key] = requested
         return requested
 
@@ -4413,6 +4590,28 @@ class ReviewWatcher:
             if held is not None:
                 return SpawnChecks(hold=held)
 
+        # Issue #214: the reds this PR inherited are taken out before the
+        # state is judged, and come back as their own clause on every path
+        # that queues. A hold carries no clause, so it needs none.
+        classified = ci_mod.classify(self.github, pr, rollup)
+        rollup = classified.rollup
+        checks = self._spawn_checks_clause(pr, round_, rollup)
+        if checks.hold is not None or not classified.preexisting:
+            return checks
+        if rollup.state == CHECKS_GREEN:
+            lead = CHECKS_AT_SPAWN_ONLY_PREEXISTING.format(sha=sha, total=rollup.total)
+        else:
+            lead = checks.clause
+        return SpawnChecks(
+            clause=lead + preexisting_clause(sha, classified.preexisting)
+        )
+
+    def _spawn_checks_clause(
+        self, pr: PullRequest, round_: int, rollup: CheckRollup
+    ) -> SpawnChecks:
+        """The pre-#214 decision on a rollup: hold, or the clause to queue
+        with. See `_gate_spawn_on_checks` for what each state does."""
+        sha, short = pr.head_sha, pr.head_sha[:8]
         if rollup.state == CHECKS_RED:
             failing = directive_data([
                 CHECKS_AT_SPAWN_FAILING.format(
@@ -4892,6 +5091,8 @@ class ReviewWatcher:
             trailer = commit_readiness_trailer(envelope)
         else:
             trailer = readiness_trailer(envelope)
+            if gate.preexisting:
+                trailer = preexisting_trailer(trailer, judged, gate.preexisting)
         body = gate.lead + NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
@@ -4930,6 +5131,11 @@ class ReviewWatcher:
             else f" — CI gate: the rollup at {judged[:8]} is {gate.state}, so the "
             f"{verdict} envelope did not post as an APPROVE"
         )
+        if gate.preexisting:
+            gate_note += (
+                f" — pre-existing CI reds (not blocking): "
+                f"{', '.join(p.context.name for p in gate.preexisting)}"
+            )
         self.state.record_verdict_post(
             pr.full_name, pr.number, round_, url, verdict=verdict
         )
@@ -5022,6 +5228,32 @@ class ReviewWatcher:
         comment, once per held round (checks_hold_kind).
         """
         rollup = self.github.check_rollup(pr.owner, pr.repo, judged)
+        # Issue #214: inherited reds are taken out before the state is judged
+        # -- classified against the JUDGED head, like the rollup itself.
+        classified = ci_mod.classify(
+            self.github, replace(pr, head_sha=judged), rollup
+        )
+        rollup = classified.rollup
+        found = classified.preexisting
+        noted = (
+            CHECKS_PREEXISTING_LEAD.format(
+                sha=judged[:8], preexisting=preexisting_lines(found)
+            )
+            if found
+            else ""
+        )
+
+        if rollup.state == CHECKS_GREEN and found:
+            log.info(
+                "%s round %d: the only failing checks at %s are pre-existing "
+                "(%s) — approving, with an operator readiness line",
+                pr.slug, round_, judged[:8],
+                ", ".join(p.context.name for p in found),
+            )
+            lead = noted
+            if rollup.via_actions_fallback:
+                lead += CHECKS_FALLBACK_LEAD.format(sha=judged[:8])
+            return ChecksGate(lead=lead, state=CHECKS_GREEN, preexisting=found)
 
         if rollup.state == CHECKS_GREEN:
             # `info`, not `debug`: this is the line an operator reads to find
@@ -5063,8 +5295,9 @@ class ReviewWatcher:
                 event=EVENT_REQUEST_CHANGES,
                 lead=CHECKS_RED_LEAD.format(
                     sha=judged[:8], failing=failing, verdict=VERDICT_APPROVE
-                ),
+                ) + noted,
                 state=CHECKS_RED,
+                preexisting=found,
             )
 
         # PENDING (checks still running) or UNKNOWN (the rollup could not be

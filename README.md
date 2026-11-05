@@ -953,7 +953,13 @@ head `H` is admitted only when
 - **(b)** the issue timeline (`GET /repos/{owner}/{repo}/issues/{n}/timeline`)
   shows a `review_requested` event for the reviewer login **newer than the
   last verdict on `H`** — the request that opened the finished round cannot be
-  the request for the next one.
+  the request for the next one;
+- **and, since 0.31.38 (issue #214),** that newer request was not made by the
+  PR's own author. The implementer re-requests as the last step of every fix
+  round, pushed or not, and on an unchanged head that is no new evidence:
+  4R7e #102 got four identical verdicts on one head that way. A push, a
+  request from anyone else, or one from an `operators` login re-arms. An event
+  with no `actor` admits, as an unreadable timeline does.
 
 And inside `verdict_cooldown_s` (default 120 s) of that verdict **nothing** is
 queued on `H`, whatever the timeline says. The cooldown alone would have

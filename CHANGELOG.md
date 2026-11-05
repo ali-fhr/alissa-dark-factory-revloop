@@ -4,6 +4,38 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.38
+
+- **No re-review of an unchanged head on the author's own re-request, and a
+  CI red the PR inherited is a `[minor]` note, not a blocker** (issue #214;
+  origin TASK-195848449, implementation TASK-1208425148). On 4R7e
+  `4r7-fhr/4r7-engine-workers#102` the PR only added a workflow. It got four
+  identical `CHANGES_REQUESTED` reviews on one head, each blocking on old
+  workflows that had been red for weeks.
+  - Round admission: on a head that already has a verdict, a fresh
+    `review_requested` event from the PR's own AUTHOR no longer starts a
+    round. The skip is logged once per (head, verdict). A push re-arms, and
+    so does a request from anyone else or from an `operators` login. The
+    timeline read now carries the event's `actor`
+    (`GitHub.newest_review_request`).
+  - New `ci.py`. A failing check is PRE-EXISTING when the base branch head
+    fails the same check name, or, for a `pull_request`-only workflow, when
+    the latest completed run of that workflow on an earlier PR (created
+    before this PR's first commit) failed the same job. In both cases the
+    diff must not touch the workflow file behind it. A check with no known
+    workflow file counts only when the diff touches nothing under
+    `.github/`. Any read failure leaves every red blocking.
+  - The spawn directive gets a PRE-EXISTING REDS clause: report each one as
+    a `[minor]` finding linking where it already failed, never as a blocker
+    or a reason to request changes. A PR that is otherwise clean is approved
+    with an unclassed `operator` Merge-Readiness line naming the reds. The
+    daemon's own verdict gate does the same: an approve whose only reds are
+    pre-existing posts as an APPROVE with a `[minor]` lead, and an `auto`
+    envelope line becomes `operator — pre-existing CI reds …`. Real new reds
+    still block.
+  - The red-head lead no longer says a same-head re-run plus re-request
+    reopens the round. It says to push, or to have an operator re-request.
+
 ## 0.31.37
 
 - **Boot probe R1: the seat reports, once per boot, whether a review can be
