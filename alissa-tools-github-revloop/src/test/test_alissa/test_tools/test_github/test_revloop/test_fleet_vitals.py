@@ -1217,3 +1217,24 @@ def test_sources_inbox_matches_the_dashboards_inbox(tmp_path, frozen_ledger_cloc
     assert [(i["kind"], i["number"]) for i in inbox["settled"]] == [
         ("stability-held", 21),
     ]
+
+
+def test_the_probes_block_is_sent_when_held_and_left_out_otherwise(tmp_path):
+    # Issue #212: the daemon's boot probe block rides on the snapshot; the
+    # console's pusher (no reader) and a daemon before its first completed
+    # pass (reader answers None) leave the key out.
+    block = {"version": "0.30.0", "at": iso_utc(WALL),
+             "results": [{"id": "R1", "state": "ok", "detail": "fine"}]}
+    held: list = [None]
+    client = FakeVitalsClient()
+    pusher = FleetVitalsPusher(_config(tmp_path), FakeSources(), client,
+                               probes_reader=lambda: held[0])
+    console = FleetVitalsPusher(_config(tmp_path), FakeSources(), client)
+    pusher.push_once(heartbeat_at=WALL)
+    held[0] = block
+    pusher.push_once(heartbeat_at=WALL)
+    console.push_once(heartbeat_at=WALL)
+    before, after, from_console = client.snapshots
+    assert "probes" not in before and "probes" not in from_console
+    assert after["probes"] == block
+    assert "probes" in fleet_vitals.OPTIONAL_BLOCKS

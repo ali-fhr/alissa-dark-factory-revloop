@@ -87,6 +87,14 @@ console's pusher holds no client, so it sends `login` and the count as null.
 A Studio that refuses any of the three gets the optional-block treatment for
 all three together: resent without them, offered again after
 BLOCK_REPROBE_S.
+
+The boot probes (issue #212, Studio's fleet-upgrade-safety design §2.2, lane
+UR-1) add the `probes` block: the seat's own read of its key path, run once
+per boot on the first completed poll (`probes.run_r1`) and carried on every
+post until the next boot. The pusher reads it through `probes_reader` (the
+daemon's held block, None before the set has run); the console's pusher has
+no reader and leaves it out. A Studio that refuses it gets the optional-block
+treatment.
 """
 
 from __future__ import annotations
@@ -145,7 +153,8 @@ VITALS_FAILED = "failed"
 # `diskUsedPct` (issue #167) joins them: the workspace volume's used percent,
 # which Studio's schema may not carry yet. `upgradeFailed` (issue #193, the
 # fleet auto-upgrade report) joins them for the same reason.
-OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct", "upgradeFailed")
+# `probes` (issue #212, the fleet-upgrade-safety boot probes) likewise.
+OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct", "upgradeFailed", "probes")
 
 # The identity fields (issue #205): the top-level count and the two keys it
 # adds inside `rate`. One group -- a Studio that knows one knows all three --
@@ -341,6 +350,7 @@ def build_snapshot(
     disk_used_pct: "float | None" = None,
     rate_login: "str | None" = None,
     gh_calls_last_hour: "int | None" = None,
+    probes: "Mapping | None" = None,
 ) -> dict:
     """The contract body for this pass, off the console's builders.
 
@@ -366,6 +376,9 @@ def build_snapshot(
     `rate_login` is the reviewer identity the rate read ran under, and
     `gh_calls_last_hour` the daemon's own `gh` call count (issue #205); each
     is null when the caller cannot say.
+
+    `probes` is the boot probe block (issue #212), or None to leave the key
+    out (the set has not run yet this boot, or the console's push).
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -423,6 +436,8 @@ def build_snapshot(
     }
     if config is not None:
         snapshot["config"] = dict(config)
+    if probes is not None:
+        snapshot["probes"] = dict(probes)
     return snapshot
 
 
@@ -560,6 +575,7 @@ class FleetVitalsPusher:
         config_reader: "Callable[[], Mapping | None] | None" = None,
         upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
         github: object = None,
+        probes_reader: "Callable[[], Mapping | None] | None" = None,
     ):
         self.config = config
         self._sources = sources
@@ -586,6 +602,9 @@ class FleetVitalsPusher:
         # and its rolling call count. None -- the console's pusher -- sends
         # both as null.
         self._github = github
+        # The daemon's boot probe block (issue #212), or None -- the
+        # console's pusher -- to leave it out.
+        self._probes_reader = probes_reader
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
@@ -600,7 +619,19 @@ class FleetVitalsPusher:
             disk_used_pct=volume_used_pct(self.config.workspace_root),
             rate_login=self._github_read("asserted_login"),
             gh_calls_last_hour=self._github_read("calls_last_hour"),
+            probes=self._probes(),
         ))
+
+    def _probes(self) -> "Mapping | None":
+        """The boot probe block, or None. A reader that fails costs the
+        block, never the snapshot."""
+        if self._probes_reader is None:
+            return None
+        try:
+            return self._probes_reader()
+        except Exception as exc:
+            log.warning("fleet-vitals: could not read the probes block (%s)", exc)
+            return None
 
     def _github_read(self, name: str) -> Any:
         """One identity read off the daemon's GitHub client, or None: no
@@ -813,6 +844,7 @@ def build_pusher(
     endpoint: "str | None" = None,
     config_reader: "Callable[[], Mapping | None] | None" = None,
     upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
+    probes_reader: "Callable[[], Mapping | None] | None" = None,
 ) -> FleetVitalsPusher:
     """The pusher the watcher wires in when `fleet_vitals_enabled` is on.
 
@@ -826,7 +858,8 @@ def build_pusher(
     `loop`, which imports this module. `config_reader` is the daemon's
     `config` block source (issue #159), `upgrader` its self-upgrade state
     (issue #193), and `github` also feeds `rate.login` and `ghCallsLastHour`
-    (issue #205); the console builds its own pusher without any of them.
+    (issue #205), and `probes_reader` its boot probe block (issue #212); the
+    console builds its own pusher without any of them.
     """
     from .version import version
     from .webui.sources import Sources
@@ -839,4 +872,5 @@ def build_pusher(
     return FleetVitalsPusher(
         config, sources, AlissaClient(base=endpoint),
         config_reader=config_reader, upgrader=upgrader, github=github,
+        probes_reader=probes_reader,
     )

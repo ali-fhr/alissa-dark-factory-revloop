@@ -26,6 +26,7 @@ from typing import Callable
 
 from . import janitor as janitor_mod
 from . import parking as parking_mod
+from . import probes as probes_mod
 from . import prompts as prompts_mod
 from . import self_upgrade as self_upgrade_mod
 from .alissa import (
@@ -2786,11 +2787,16 @@ class ReviewWatcher:
         self.self_upgrade = self_upgrade or self_upgrade_mod.SelfUpgrader(
             running_version.value, dry_run=config.dry_run,
         )
+        # The boot probe block (issue #212): None until the first completed
+        # pass runs the set, then held -- and sent on every vitals post --
+        # until the process ends. Per process IS per boot.
+        self._boot_probes: "dict | None" = None
         self._fleet_vitals: FleetVitalsPusher | None = (
             build_pusher(
                 config, github=self.github, endpoint=config.alissa_endpoint,
                 config_reader=self._vitals_config,
                 upgrader=self.self_upgrade,
+                probes_reader=lambda: self._boot_probes,
             )
             if config.fleet_vitals_enabled
             else None
@@ -8256,10 +8262,7 @@ class ReviewWatcher:
         # a repo enrolled this pass is searched this pass.
         self.refresh_repos()
         allowlist = self._search_allowlist()
-        if allowlist is None:
-            requests = []
-        else:
-            requests = self.github.review_requests(allowlist)
+        requests = self._review_requests(allowlist)
         log.info("%d PR(s) with a review pending from %s", len(requests), self.github.login)
 
         # Forget queue places belonging to PRs this pass cannot act on at all
@@ -8313,6 +8316,10 @@ class ReviewWatcher:
         duration_ms = int((time.monotonic() - started) * 1000)
         self._write_snapshot(results, reaped, duration_ms=duration_ms)
         self._emit_loop_events()
+        # The boot probes (issue #212): once per boot, on this first pass to
+        # get here -- a completed one -- and BEFORE the push, so the first
+        # snapshot already carries the block.
+        self._run_boot_probes(allowlist)
         # AFTER the loop-events push, and after the snapshot, so the vitals
         # heartbeat is the completion time of a pass whose exhaust is already
         # written and whose events are already on their way.
@@ -8333,6 +8340,35 @@ class ReviewWatcher:
             f"; upgrade: {upgrade}" if upgrade != self_upgrade_mod.NONE else "",
         )
         return results
+
+    def _review_requests(
+        self, allowlist: "tuple[str, ...] | None"
+    ) -> list[tuple[str, str, int]]:
+        """The review edge's discovery read: the review-requested search over
+        `allowlist`, or nothing when the pass must search nothing (None, see
+        `_search_allowlist`). The boot probe R1 calls THIS, so the probe
+        cannot pass while the edge's read fails (issue #212)."""
+        if allowlist is None:
+            return []
+        return self.github.review_requests(allowlist)
+
+    def _run_boot_probes(self, allowlist: "tuple[str, ...] | None") -> None:
+        """Run the boot probe set (R1) once per boot when vitals are on --
+        the block has nowhere else to go -- and hold its block for every
+        later push. Read-only, so it runs in dry-run too: the pusher then
+        logs what it WOULD send. Never raises."""
+        if self._fleet_vitals is None or self._boot_probes is not None:
+            return
+        try:
+            self._boot_probes = probes_mod.run_r1(
+                self.config,
+                allowlist=allowlist,
+                search=self._review_requests,
+                github=self.github,
+                version=running_version.value,
+            )
+        except Exception as exc:
+            log.warning("boot probes: the probe set failed unexpectedly (%s)", exc)
 
     def _after_pass_upgrade(self) -> str:
         """The pass's self-upgrade step (issue #193): `exit` once the seat
