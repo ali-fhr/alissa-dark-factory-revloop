@@ -1,0 +1,161 @@
+name: Release Train
+
+# THE TRAIN (issue #220; fleet upgrade safety design §4.2 item 3, in ali-fhr/studio.alissa.app
+# docs/design/fleet-upgrade-safety.md). A merge is not a release. Pull requests merge onto main
+# with a CHANGELOG.md line under `## Unreleased` and no version bump (check-version-bump.yaml), and
+# they publish nothing. Twice a day this workflow turns what `## Unreleased` lists into ONE
+# release pull request:
+#
+#   - on branch `release/X.Y.Z`, off main;
+#   - bumping the version file's patch number, or its minor number when an entry is a bullet that
+#     STARTS with `[minor]` (a `[minor]` in running text is review vocabulary, not a tag);
+#   - setting the Dockerfile's `ARG REVLOOP_VERSION` default to the same number
+#     (dockerfile-pin-sync);
+#   - moving the entries, as written, under `## X.Y.Z (YYYY-MM-DD)` and leaving `## Unreleased`
+#     empty.
+#
+# Nothing to release means no branch and no pull request. The release pull request is reviewed
+# like any other, with the configured reviewer requested. It is OPERATOR-HELD (design §6 Q9, at
+# acceptance on 2026-11-04): it is never made auto-mergeable here, and the operator's merge IS the
+# release. package-publish.yaml and image-publish.yaml see the version change, publish X.Y.Z to
+# PyPI and GHCR, and tag `vX.Y.Z`.
+#
+# At most one release pull request is open at a time. While one is open, the train adds nothing
+# and leaves it as it is. Entries merged meanwhile wait for the next train after it merges.
+#
+# CRITICAL FIXES (§4.2 item 4) do not ride the train. The operator cuts `release/X.Y.Z+1` from
+# the last release tag `vX.Y.Z` (`git push origin "vX.Y.Z^{commit}:refs/heads/release/X.Y.Z+1"`). The fix's
+# pull request targets that branch, carries the cherry-picked fix, the patch bump, the synced ARG
+# and its CHANGELOG line under `## X.Y.Z+1 (date)`, and the operator labels it `release:critical`.
+# Its merge publishes from the release branch, so only the fix ships, whatever main's
+# `## Unreleased` holds. A pull request from `release/X.Y.Z+1` then merges it back into main. That
+# merge publishes nothing new (the tag already exists), and its CHANGELOG conflict is resolved by
+# keeping both sides: main's `## Unreleased` entries above the released section. Until it is
+# merged back, the train refuses to cut a version whose branch or tag already exists, and it
+# fails loudly instead.
+#
+# TOKEN. GitHub starts no pull_request workflows for a pull request opened with GITHUB_TOKEN. With
+# the repository secret RELEASE_TRAIN_TOKEN set (a token that may push branches and open pull
+# requests), the release pull request runs its checks as usual. Without it the train still opens
+# the pull request, and says in its body that the checks must be started by hand (close and reopen
+# it). GITHUB_TOKEN can open pull requests only while the repository allows it (Settings ->
+# Actions -> "Allow GitHub Actions to create and approve pull requests").
+
+on:
+  schedule:
+    # 16:00Z and 23:00Z (design §6 Q8 default, one cron line per repo).
+    - cron: '0 16,23 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Two trains never race for the same release branch.
+concurrency:
+  group: release-train
+  cancel-in-progress: false
+
+env:
+  CHANGELOG: CHANGELOG.md
+  VERSION_FILE: alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version
+  DOCKERFILE: docker/claude/Dockerfile
+  VERSION_ARG: REVLOOP_VERSION
+  # The reviewer requested on the release pull request (the review daemon's seat).
+  REVIEWER: ${{ vars.RELEASE_TRAIN_REVIEWER || 'alissa-app' }}
+
+jobs:
+  train:
+    # A fork's schedule never cuts releases.
+    if: github.repository == 'ali-fhr/alissa-dark-factory-revloop'
+    name: Open release/X.Y.Z when ## Unreleased is non-empty
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TRAIN_TOKEN || github.token }}
+      TOKEN_KIND: ${{ secrets.RELEASE_TRAIN_TOKEN != '' && 'release-train' || 'github' }}
+    steps:
+      - name: Clone main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TRAIN_TOKEN || github.token }}
+
+      - name: Is a release pull request already open?
+        id: open
+        run: |
+          set -euo pipefail
+          open="$(gh pr list --state open --base main --limit 100 --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release/")) | "#\(.number) (\(.headRefName))"] | join(", ")')"
+          if [ -n "${open}" ]; then
+            echo "::notice::a release pull request is already open: ${open}. The train adds nothing until it merges."
+            echo "open=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "open=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Cut the release from ## Unreleased
+        id: cut
+        if: steps.open.outputs.open == 'false'
+        run: |
+          set -euo pipefail
+          date="$(date -u +%F)"
+          echo "date=${date}" >> "${GITHUB_OUTPUT}"
+          python3 .github/scripts/release_train.py cut \
+            --changelog "${CHANGELOG}" --version-file "${VERSION_FILE}" \
+            --dockerfile "${DOCKERFILE}" --arg "${VERSION_ARG}" --date "${date}"
+
+      - name: Open the release pull request
+        if: steps.cut.outputs.version != ''
+        env:
+          VERSION: ${{ steps.cut.outputs.version }}
+          PREVIOUS: ${{ steps.cut.outputs.previous }}
+          MOVED: ${{ steps.cut.outputs.moved }}
+          DATE: ${{ steps.cut.outputs.date }}
+        run: |
+          set -euo pipefail
+          branch="release/${VERSION}"
+          # A release branch or tag that already exists means a critical release of this number
+          # has not been merged back into main yet (or main's version file lags its tags). A cut
+          # on top of that would publish the number twice.
+          if git ls-remote --exit-code --heads origin "refs/heads/${branch}" >/dev/null \
+             || git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null; then
+            {
+              echo "## Release train stopped"
+              echo ""
+              echo "main's version file says ${PREVIOUS}, so the next release is ${VERSION}, but"
+              echo "\`${branch}\` or the tag \`v${VERSION}\` already exists on origin. A release:critical"
+              echo "release of ${VERSION} has not been merged back into main yet. Merge that release"
+              echo "branch back into main, and the next train cuts the version after it."
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo "::error::${branch} or v${VERSION} already exists — merge the critical release back into main first; no release pull request was opened."
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "${branch}"
+          git add -- "${CHANGELOG}" "${VERSION_FILE}" "${DOCKERFILE}"
+          git commit -q -m "Release ${VERSION}" \
+            -m "Release train (release-train.yaml): ${PREVIOUS} -> ${VERSION}. Moves ${MOVED} CHANGELOG.md line(s) from \"## Unreleased\" under \"## ${VERSION} (${DATE})\" and sets ARG ${VERSION_ARG}=${VERSION}."
+          git push origin "refs/heads/${branch}"
+
+          body="${RUNNER_TEMP}/release-body.md"
+          {
+            echo "Release train cut of **${VERSION}** (from ${PREVIOUS}), opened by \`release-train.yaml\`."
+            echo ""
+            echo "- moves ${MOVED} line(s) of \`CHANGELOG.md\` from \`## Unreleased\` under \`## ${VERSION} (${DATE})\`. The Files tab lists them."
+            echo "- sets the version file and the Dockerfile's \`ARG ${VERSION_ARG}\` to \`${VERSION}\`."
+            echo ""
+            echo "**Merging this pull request IS the release.** \`package-publish.yaml\` and \`image-publish.yaml\` publish ${VERSION} to PyPI and GHCR and tag \`v${VERSION}\`. It is operator-held: the operator merges it after review (fleet upgrade safety §6 Q9). It is never auto-merged."
+            if [ "${TOKEN_KIND}" != "release-train" ]; then
+              echo ""
+              echo "> Opened with GITHUB_TOKEN (no \`RELEASE_TRAIN_TOKEN\` secret), so GitHub started no checks on it. Close and reopen this pull request to run them."
+            fi
+          } > "${body}"
+          url="$(gh pr create --base main --head "${branch}" --title "Release ${VERSION}" --body-file "${body}")"
+          echo "::notice::opened ${url}"
+          if ! gh pr edit "${url}" --add-reviewer "${REVIEWER}"; then
+            echo "::warning::could not request ${REVIEWER} on ${url}; request the review by hand."
+          fi
+          echo "## Opened ${url}" >> "${GITHUB_STEP_SUMMARY}"

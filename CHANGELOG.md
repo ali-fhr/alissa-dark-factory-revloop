@@ -4,6 +4,29 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+A merge is not a release (issue #220). A pull request that changes the
+package or `docker/**` adds its line under `## Unreleased` and leaves the
+version alone. The release train (`.github/workflows/release-train.yaml`,
+16:00Z and 23:00Z) opens one `release/X.Y.Z` pull request that moves those
+lines under a dated heading. It bumps the patch number, or the minor number
+when a bullet starts with `[minor]`. Merging that pull request publishes the
+release. A `release:critical` fix is released from its own
+`release/X.Y.Z` branch cut from the last `vX.Y.Z` tag (see the workflow's
+header).
+
+## Unreleased
+
+- **A merge is no longer a release** (issue #220, fleet upgrade safety
+  UR-3, design §4.2; origin TASK-950356071, implementation TASK-810645209).
+  `check-version-bump.yaml` now requires a line here for a package or
+  `docker/**` change. It refuses a version change except from a
+  `release/X.Y.Z` branch or with the `release:critical` label, and still
+  refuses a version PyPI already has. `package-publish.yaml` and
+  `image-publish.yaml` publish only when the merge changes the version
+  file, also on `release/**` branches, and the package publish tags
+  `vX.Y.Z`. `release-train.yaml` opens the release pull request twice a
+  day.
+
 ## 0.31.40
 
 - **A seat whose rollback could not reinstall no longer reads as rolled
