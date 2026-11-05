@@ -76,6 +76,14 @@ once, on the next snapshot after the rollback, and treated like the other
 optional blocks by a Studio that refuses it. The console's pusher has no
 upgrader: it reads the answer and acts on nothing.
 
+Functional rollback (issue #216, fleet-upgrade-safety §3.2, Studio US-5): the
+answer's `upgrade` block may carry `rollback: {from, reason} | null`. It is
+parsed with the rest of the block (`UpgradeAnswer.rollback_from` /
+`rollback_reason`); a missing, null or malformed field is no rollback, and
+the rest of the block stands. The upgrader acts on it only when `from` is
+the running version (`SelfUpgrader.rollback_to`); the `upgradeFailed` report
+the rollback leaves rides the request side exactly like a boot-time one.
+
 The GitHub identity view (issue #205, Studio's fleet-github-identity design
 §6.1) adds `rate.used`, `rate.login` and `ghCallsLastHour`. `used` rides on
 the same cached `rate_limit` read as the rest of `rate` -- a free call, run

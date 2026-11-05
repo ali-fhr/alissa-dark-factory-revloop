@@ -250,7 +250,13 @@ needs_recursive_chown() {
 #     version and `previous` is never installed (state `not_newer`);
 #   * every boot on the target is counted. A request still unconfirmed after
 #     2 boots, or 10 min after its first boot, is ROLLED BACK: `previous` is
-#     reinstalled, the target joins the skip list and the report is left.
+#     reinstalled, the target joins the skip list and the report is left;
+#   * a ROLLBACK request (issue #216: the daemon left a version Studio's
+#     vitals answer named in `upgrade.rollback`) carries `rollback.from` and
+#     names the version to go back to as its target. It is installed even
+#     though it is older -- the one downgrade this step makes -- and the
+#     failed version joins the skip list with the `upgradeFailed` report. A
+#     reinstall that fails is `rollback_failed`, retried at the next boot.
 #
 # The daemon confirms the request after its first answered vitals poll on the
 # target. Both sides keep the keys they do not own (see self_upgrade.py).
@@ -352,6 +358,29 @@ if not isinstance(target, str) or not VERSION.match(target):
     log(f"the request names no X.Y.Z target ({target!r}) — ignoring it")
     data["state"] = "invalid"
     write(data)
+    sys.exit(0)
+
+rollback = data.get("rollback")
+if isinstance(rollback, dict):
+    # Issue #216: the daemon asked to go back to `target` (its `previous`)
+    # on Studio's answer. Checked before the never-a-downgrade guard below,
+    # which would refuse it as not newer.
+    failed = rollback.get("from")
+    why = " ".join(str(rollback.get("reason") or "Studio asked for a rollback").split())
+    if not isinstance(failed, str) or not VERSION.match(failed):
+        log(f"the rollback names no X.Y.Z version to leave ({failed!r}) — ignoring it")
+        data["state"] = "invalid"
+        write(data)
+        sys.exit(0)
+    ok, err = True, ""
+    if running != target:
+        log(f"rolling back {failed} → {target} on Studio's answer: {why}")
+        ok, err = pip_install(target)
+    if ok:
+        fail(data, failed, "rolled_back", f"rolled back to {target}: {why}")
+    else:
+        log(f"WARN: could not reinstall {target} ({err}) — booting {running}; the next boot retries")
+        fail(data, failed, "rollback_failed", f"could not reinstall {target} ({err}); {why}")
     sys.exit(0)
 
 boots = int(data.get("boots") or 0)
