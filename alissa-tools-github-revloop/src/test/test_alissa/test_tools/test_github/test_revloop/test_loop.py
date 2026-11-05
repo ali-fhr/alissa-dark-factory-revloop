@@ -77,6 +77,7 @@ from alissa.tools.github.revloop.ghclient import (
     PullRequest,
     RateLimited,
     Review,
+    ReviewRequest,
     ReviewerTokenUnset,
     TimelineTruncated,
     TruncatedListing,
@@ -351,8 +352,21 @@ class FakeGitHub:
             raise self.timeline_error
         if self.request_events is None:
             return FRESH_REQUEST_AT
-        mine = [at for who, at in self.request_events if who == login]
+        mine = [event[1] for event in self.request_events if event[0] == login]
         return max(mine) if mine else None
+
+    def newest_review_request(self, owner, repo, number, login):
+        """Mirrors GitHub.newest_review_request: the newest request with its
+        ACTOR (issue #214). An event may be (login, at) -- no actor, the
+        gate's fail-open reading -- or (login, at, actor)."""
+        at = self.review_requested_at(owner, repo, number, login)
+        if at is None:
+            return None
+        actors = [
+            event[2] for event in (self.request_events or [])
+            if event[0] == login and event[1] == at and len(event) > 2
+        ]
+        return ReviewRequest(at=at, actor=actors[0] if actors else "")
 
 
 class FakeAlissa:

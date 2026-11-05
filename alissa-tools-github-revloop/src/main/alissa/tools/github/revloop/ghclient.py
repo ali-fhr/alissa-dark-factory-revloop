@@ -223,6 +223,17 @@ class PullRequest:
     # and are never interpolated into one.
     head_ref: str = ""
     body: str = ""
+    # The BASE branch name and the base sha GitHub last recorded for the PR
+    # (issue #214): what the pre-existing-red classifier (ci.py) compares a
+    # failing check against. `base_sha` is NOT the base branch's current head
+    # -- GitHub moves it only when the PR is updated -- so ci.py reads the
+    # branch head itself and uses this only as the ref's fallback.
+    base_ref: str = ""
+    base_sha: str = ""
+    # When the PR was opened (ISO-8601, GitHub's clock). Unlike any commit
+    # date it cannot be rewritten, so ci.py's "before this PR" cut-off never
+    # moves later than this (PR #215 round 1).
+    created_at: str = ""
 
     @property
     def full_name(self) -> str:
@@ -363,6 +374,39 @@ class CheckRollup:
         if self.via_actions_fallback:
             return f"{base} [{ACTIONS_FALLBACK_NOTE}]"
         return base
+
+
+@dataclass(frozen=True)
+class ReviewRequest:
+    """The newest `review_requested` event for one login (issue #214).
+
+    `at` is the event's `created_at` (GitHub's clock) and `actor` the login
+    that made the request -- "" when the event carries none. The actor is what
+    tells an implementer re-requesting its own unchanged head from a person
+    asking for another look.
+    """
+
+    at: str
+    actor: str = ""
+
+
+@dataclass(frozen=True)
+class WorkflowJob:
+    """One Actions job on a commit, with the workflow behind it (issue #214).
+
+    What the pre-existing-red classifier needs and a CheckContext cannot
+    carry: which workflow FILE produced the job (so "the PR does not touch
+    it" is checkable), the workflow's id (so its earlier runs can be listed)
+    and the event that triggered the run (`pull_request`-only workflows never
+    run on the base branch, so the base head cannot vouch for them).
+    """
+
+    name: str
+    conclusion: str = ""
+    url: str = ""
+    workflow_id: "int | None" = None
+    workflow_path: str = ""
+    event: str = ""
 
 
 def check_names(contexts: "tuple[CheckContext, ...]") -> str:
@@ -784,6 +828,9 @@ class GitHub:
             ),
             head_ref=str((data.get("head") or {}).get("ref") or ""),
             body=str(data.get("body") or ""),
+            base_ref=str((data.get("base") or {}).get("ref") or ""),
+            base_sha=str((data.get("base") or {}).get("sha") or ""),
+            created_at=str(data.get("created_at") or ""),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:
@@ -906,6 +953,118 @@ class GitHub:
             if len(data) < PER_PAGE:
                 return out
             page += 1
+
+    # -- the pre-existing-red reads (issue #214) ---------------------------
+
+    def branch_head_sha(self, owner: str, repo: str, ref: str) -> str:
+        """The commit a branch points at NOW -- the base head a failing check
+        is compared against. Raises on any failure; ci.py fails closed."""
+        data = self._api(f"repos/{owner}/{repo}/branches/{ref}") or {}
+        sha = str((data.get("commit") or {}).get("sha") or "")
+        if not sha:
+            raise ValueError(f"{owner}/{repo} branch {ref} answered no commit sha")
+        return sha
+
+    def pull_request_first_commit_at(
+        self, owner: str, repo: str, number: int
+    ) -> str:
+        """The AUTHOR date of the PR's OLDEST commit (ISO-8601), or "".
+
+        One call: the commits listing is oldest first, so its first page of
+        one is the answer. "Before this PR's first commit" is the cut-off the
+        `pull_request`-only lane of ci.py lists earlier runs against. The
+        author date, not the committer date: a rebase or amend rewrites the
+        committer date to the time of the rewrite, which would move the
+        cut-off later and let a run from a PR opened AFTER this one count as
+        earlier (PR #215 round 1). ci.py also caps it at the PR's
+        `created_at`. The committer date is only the fallback."""
+        data = (
+            self._api(
+                "-X", "GET", f"repos/{owner}/{repo}/pulls/{number}/commits",
+                "-f", "per_page=1", "-f", "page=1",
+            )
+            or []
+        )
+        if not data:
+            return ""
+        commit = (data[0] or {}).get("commit") or {}
+        return str(
+            (commit.get("author") or {}).get("date")
+            or (commit.get("committer") or {}).get("date")
+            or ""
+        )
+
+    def workflow_jobs(self, owner: str, repo: str, sha: str) -> list[WorkflowJob]:
+        """Every Actions job on `sha`, with its workflow's id, file and event.
+
+        The same read `_actions_contexts` makes (latest run per workflow and
+        event, then its jobs), kept apart because the rollup's contexts must
+        stay the plain CheckContext every gate judges. Raises on failure."""
+        runs = self._rollup_listing(
+            f"repos/{owner}/{repo}/actions/runs",
+            "workflow_runs",
+            "workflow runs",
+            params=(f"head_sha={sha}",),
+        )
+        out: list[WorkflowJob] = []
+        for run_ in self._latest_run_per_workflow(runs):
+            raw_id = run_.get("workflow_id")
+            workflow_id = raw_id if isinstance(raw_id, int) else None
+            path = str(run_.get("path") or "")
+            event = str(run_.get("event") or "")
+            for context in self._run_contexts(owner, repo, run_):
+                out.append(
+                    WorkflowJob(
+                        name=context.name,
+                        conclusion=context.conclusion,
+                        url=context.url,
+                        workflow_id=workflow_id,
+                        workflow_path=path,
+                        event=event,
+                    )
+                )
+        return out
+
+    def prior_pull_request_run(
+        self,
+        owner: str,
+        repo: str,
+        workflow_id: int,
+        *,
+        before: str,
+        exclude_branch: str,
+        base_ref: str,
+    ) -> "tuple[str, list[CheckContext]] | None":
+        """The latest COMPLETED `pull_request` run of one workflow created
+        before `before`, on another PR into `base_ref`, as (run url, jobs) --
+        or None when there is none in the first page.
+
+        `pull_requests` on a run is how GitHub says which PR it served, but it
+        is EMPTY once that PR is closed (verified on this repo's own runs), so
+        an empty list is accepted and a non-empty one must name `base_ref`.
+        Runs on `exclude_branch` (this PR's own head branch) never count:
+        those are this PR's history, not the base's. Raises on failure."""
+        params = ["event=pull_request", "status=completed", f"per_page={PER_PAGE}"]
+        if before:
+            params.append(f"created=<{before}")
+        data = (
+            self._api(
+                "-X", "GET",
+                f"repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
+                *[arg for param in params for arg in ("-f", param)],
+                forbidden_is_rate_limit=False,
+            )
+            or {}
+        )
+        for run_ in data.get("workflow_runs") or []:
+            if str(run_.get("head_branch") or "") == exclude_branch:
+                continue
+            prs = run_.get("pull_requests") or []
+            bases = {str(((p or {}).get("base") or {}).get("ref") or "") for p in prs}
+            if prs and base_ref not in bases:
+                continue
+            return str(run_.get("html_url") or ""), self._run_contexts(owner, repo, run_)
+        return None
 
     # -- CI check rollup ---------------------------------------------------
 
@@ -1354,7 +1513,16 @@ class GitHub:
         self, owner: str, repo: str, number: int, login: str
     ) -> str | None:
         """When `login` was most recently asked to review the PR, as the
-        timeline's `created_at` (ISO-8601), or None if it never was.
+        timeline's `created_at` (ISO-8601), or None if it never was. The
+        timestamp half of `newest_review_request`."""
+        newest = self.newest_review_request(owner, repo, number, login)
+        return newest.at if newest is not None else None
+
+    def newest_review_request(
+        self, owner: str, repo: str, number: int, login: str
+    ) -> "ReviewRequest | None":
+        """The most recent request for `login` to review the PR, with WHO made
+        it (the event's `actor`, issue #214), or None if it never was asked.
 
         Read from `GET /repos/{owner}/{repo}/issues/{n}/timeline`, keeping only
         `review_requested` events whose `requested_reviewer` is `login` (a team
@@ -1372,6 +1540,7 @@ class GitHub:
         """
         wanted = login.casefold()
         newest: str | None = None
+        actor = ""
         for page in range(1, TIMELINE_PAGE_LIMIT + 2):
             data = self._timeline_page(owner, repo, number, page)
             if page > TIMELINE_PAGE_LIMIT:
@@ -1393,9 +1562,10 @@ class GitHub:
                 at = event.get("created_at") or ""
                 if at and (newest is None or at > newest):
                     newest = at
+                    actor = str((event.get("actor") or {}).get("login") or "")
             if len(data) < PER_PAGE:
                 break
-        return newest
+        return ReviewRequest(at=newest, actor=actor) if newest is not None else None
 
     def _timeline_page(self, owner: str, repo: str, number: int, page: int) -> list:
         return (
