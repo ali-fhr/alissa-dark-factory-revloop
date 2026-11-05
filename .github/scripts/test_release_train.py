@@ -38,11 +38,11 @@ def with_unreleased(*lines: str, base: str = BASE_CL) -> str:
 
 
 def guard(changed, *, head_ref='TASK-1-X', base_ref='main', same_repo=True, labels=(), head_version='0.31.40',
-          base_changelog=BASE_CL, head_changelog=BASE_CL, tag_exists=False):
+          base_changelog=BASE_CL, head_changelog=BASE_CL, tag_exists=False, tag_elsewhere=False):
     return rt.decide(changed, dist_prefix=DIST, test_prefix=TESTS, image_prefix='docker/',
                      version_file=VERSION_FILE, head_ref=head_ref, base_ref=base_ref, same_repo=same_repo,
                      labels=list(labels), head_version=head_version, base_changelog=base_changelog,
-                     head_changelog=head_changelog, tag_exists=tag_exists)
+                     head_changelog=head_changelog, tag_exists=tag_exists, tag_elsewhere=tag_elsewhere)
 
 
 class ChangelogTest(unittest.TestCase):
@@ -156,6 +156,13 @@ class GuardTest(unittest.TestCase):
         self.assertFalse(guard([SRC, VERSION_FILE, 'CHANGELOG.md'], tag_exists=True, **args)['pypi_check'])
         self.assertTrue(guard([SRC, VERSION_FILE, 'CHANGELOG.md'], tag_exists=False, **args)['pypi_check'])
 
+    def test_a_tag_the_head_does_not_descend_from_is_no_merge_back(self):
+        released = BASE_CL.replace('## 0.31.40', '## 0.31.41\n\n- x\n\n## 0.31.40')
+        args = dict(head_ref='release/0.31.41', head_version='0.31.41', head_changelog=released)
+        verdict = guard([SRC, VERSION_FILE, 'CHANGELOG.md'], tag_exists=False, tag_elsewhere=True, **args)
+        self.assertTrue(verdict['pypi_check'])
+        self.assertTrue(any('does not descend from' in n for n in verdict['notices']), verdict['notices'])
+
 
 class PublishGateTest(unittest.TestCase):
 
@@ -170,6 +177,23 @@ class PublishGateTest(unittest.TestCase):
 
     def test_tag_on_another_commit_publishes_nothing(self):
         self.assertFalse(rt.publish_decision('0.31.40', '0.31.41', 'def', 'abc')[0])
+
+    # Issue #222: a rebase merge of several commits whose bump is not in the last one.
+    def test_rebase_merge_bump_in_an_earlier_commit_publishes(self):
+        publish, why = rt.publish_decision('0.31.41', '0.31.41', None, 'abc', ('0.31.40', '0.31.41'))
+        self.assertTrue(publish)
+        self.assertIn('rebase merge', why)
+
+    def test_head_without_a_version_change_publishes_nothing(self):
+        publish, why = rt.publish_decision('0.31.41', '0.31.41', None, 'abc', ('0.31.41', '0.31.41'))
+        self.assertFalse(publish)
+        self.assertNotIn('first-parent comparison only', why)
+
+    def test_rebase_merge_of_an_already_tagged_version_publishes_nothing(self):
+        self.assertFalse(rt.publish_decision('0.31.41', '0.31.41', 'def', 'abc', ('0.31.40', '0.31.41'))[0])
+
+    def test_without_the_head_the_gate_says_what_it_assumes(self):
+        self.assertIn('first-parent comparison only', rt.publish_decision('0.31.40', '0.31.40', None, 'abc')[1])
 
 
 class CriticalReleaseScenarioTest(unittest.TestCase):
@@ -199,8 +223,9 @@ class CriticalReleaseScenarioTest(unittest.TestCase):
         os.unlink(out)
         return proc.returncode, values, proc.stdout
 
-    def gate(self, sha):
-        return self.run_cli('publish-gate', '--sha', sha, '--version-file', VERSION_FILE)[1]['publish']
+    def gate(self, sha, head=None):
+        extra = ('--head-sha', head) if head else ()
+        return self.run_cli('publish-gate', '--sha', sha, '--version-file', VERSION_FILE, *extra)[1]['publish']
 
     def guard_cli(self, base, head, head_ref, base_ref, labels='[]'):
         changed = os.path.join(self.tmp.name, 'changed.txt')
@@ -295,6 +320,65 @@ class CriticalReleaseScenarioTest(unittest.TestCase):
         self.assertEqual((rc, values['version']), (0, '1.0.2'))
         self.assertIn('ARG REVLOOP_VERSION=1.0.2', self.read('docker/claude/Dockerfile'))
         self.assertEqual(rt.entries(rt.section(self.read('CHANGELOG.md'), '1.0.2')), ['- feature'])
+
+    def bump(self, version):
+        self.write(VERSION_FILE, version + '\n')
+        self.write('docker/claude/Dockerfile', f'ARG REVLOOP_VERSION={version}\n')
+        self.write('CHANGELOG.md', self.read('CHANGELOG.md').replace(
+            '## Unreleased\n', f'## Unreleased\n\n## {version} (2026-11-05)\n\n- fix\n'))
+
+    def test_rebase_merge_with_the_bump_in_an_earlier_commit_publishes(self):
+        # Issue #222: release/1.0.1 carries the bump first and another commit after it.
+        self.git('switch', '-q', '-c', 'release/1.0.1')
+        self.bump('1.0.1')
+        self.commit('bump 1.0.1')
+        self.write(SRC, 'fixed\n')
+        head = self.commit('fix')
+        # main moves on meanwhile, so the rebase merge replays both commits onto a new tip.
+        self.git('switch', '-q', 'main')
+        self.write('README.md', 'readme\n')
+        self.commit('unrelated')
+        self.git('cherry-pick', 'release/1.0.1~1', 'release/1.0.1')  # what a rebase merge writes
+        merged = self.git('rev-parse', 'HEAD')
+        self.assertEqual(self.git('show', f'{merged}:{VERSION_FILE}'), '1.0.1')
+        self.assertEqual(self.gate(merged), 'false')  # the first-parent comparison alone misses it
+        self.assertEqual(self.gate(merged, head), 'true')
+        rc, values, out = self.run_cli('publish-gate', '--sha', merged, '--version-file', VERSION_FILE,
+                                       '--head-sha', '0' * 40)
+        self.assertEqual(values['publish'], 'false')
+        self.assertIn('::warning::', out)  # an unreadable head is said, not silent
+
+    def test_squash_and_merge_commit_with_the_head_publish_nothing_without_a_bump(self):
+        self.git('switch', '-q', '-c', 'feature')
+        self.write(SRC, 'feature\n')
+        head = self.commit('feature')
+        self.git('switch', '-q', 'main')
+        self.git('merge', '-q', '--squash', 'feature')
+        squashed = self.commit('feature (#1)')
+        self.assertEqual(self.gate(squashed, head), 'false')
+        # A release merged on main after the feature forked does not count as the feature's bump.
+        self.git('switch', '-q', '-c', 'feature2', 'HEAD~1')
+        self.write('README.md', 'two\n')
+        head2 = self.commit('feature2')
+        self.git('switch', '-q', 'main')
+        self.bump('1.0.1')
+        self.commit('release 1.0.1')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge feature2', 'feature2')
+        self.assertEqual(self.gate('HEAD', head2), 'false')
+
+    def test_reused_release_branch_not_descending_from_its_tag_keeps_the_pypi_check(self):
+        # v1.0.1 exists on a commit cut from v1.0.0; release/1.0.1 is then re-made off main.
+        self.git('switch', '-q', '-c', 'old', 'v1.0.0')
+        self.bump('1.0.1')
+        self.git('tag', 'v1.0.1', self.commit('the real 1.0.1'))
+        self.git('switch', '-q', '-c', 'release/1.0.1', 'main')
+        self.write(SRC, 'other tree\n')
+        self.bump('1.0.1')
+        head = self.commit('another 1.0.1')
+        rc, values, out = self.guard_cli('main', head, 'release/1.0.1', 'main')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(values['pypi_check'], 'true')
+        self.assertIn('does not descend from', out)
 
     def test_train_cli_changes_nothing_when_unreleased_is_empty(self):
         before = self.git('status', '--porcelain')

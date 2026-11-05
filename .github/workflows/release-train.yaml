@@ -20,6 +20,17 @@ name: Release Train
 # release. package-publish.yaml and image-publish.yaml see the version change, publish X.Y.Z to
 # PyPI and GHCR, and tag `vX.Y.Z`.
 #
+# WHAT SHIPS IS MAIN AT THE RELEASE PULL REQUEST'S MERGE, not the tree at the cut (issue #222).
+# The publish workflows build the merge commit: main's tip plus the release branch. A pull request
+# that merges onto main between the cut and the operator's merge ships in X.Y.Z too, but its
+# CHANGELOG.md line still sits under main's `## Unreleased` unless the 3-way merge carries it
+# below `## X.Y.Z`. A line appended at the end of `## Unreleased` usually does; one inserted
+# right under the heading conflicts with the cut's new `## X.Y.Z (date)` hunk. Left there, the
+# next train would announce code that already shipped. So before merging the release pull
+# request, the operator updates it from main and moves every `## Unreleased` entry under
+# `## X.Y.Z` (the release body repeats this). The code ships right either way; only the
+# changelog can misattribute.
+#
 # At most one release pull request is open at a time. While one is open, the train adds nothing
 # and leaves it as it is. Entries merged meanwhile wait for the next train after it merges.
 #
@@ -148,6 +159,8 @@ jobs:
             echo "- sets the version file and the Dockerfile's \`ARG ${VERSION_ARG}\` to \`${VERSION}\`."
             echo ""
             echo "**Merging this pull request IS the release.** \`package-publish.yaml\` and \`image-publish.yaml\` publish ${VERSION} to PyPI and GHCR and tag \`v${VERSION}\`. It is operator-held: the operator merges it after review (fleet upgrade safety §6 Q9). It is never auto-merged."
+            echo ""
+            echo "**What ships is main at this pull request's merge**, not the tree at the cut. Anything merged onto main after the cut ships in ${VERSION} too. Before merging, update this branch from main and move every line still under main's \`## Unreleased\` below \`## ${VERSION} (${DATE})\`, so the next train does not announce it again."
             if [ "${TOKEN_KIND}" != "release-train" ]; then
               echo ""
               echo "> Opened with GITHUB_TOKEN (no \`RELEASE_TRAIN_TOKEN\` secret), so GitHub started no checks on it. Close and reopen this pull request to run them."
