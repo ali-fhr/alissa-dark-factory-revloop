@@ -4,6 +4,34 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.39
+
+- **A self-hosted seat rolls back when Studio's vitals answer names its
+  running version in `upgrade.rollback`** (issue #216, fleet-upgrade-safety
+  UR-2, design §3.2; origin TASK-505232846, implementation TASK-1310229269).
+  Until now a self-hosted seat rolled back only when its upgrade was never
+  confirmed. A version that booted but broke a key path stayed.
+  - `self_upgrade.parse_upgrade` reads the new
+    `rollback: {from, reason} | null` field. When the field is absent, null
+    or malformed, there is no rollback and the rest of the block stands.
+    An older Studio therefore changes nothing.
+  - Rollback needs `from` equal to the running version, a self-hosted
+    seat, `autoUpgrade` on and the pause switch off. When all four hold,
+    the seat drains like an upgrade (hold `rollback`): no new reviewer
+    session starts, and running ones finish. At idle it rewrites the
+    request file with `target = previous`, where `previous` comes from the
+    confirmed upgrade to the running version. It also adds the running
+    version to `skip`, records `rollback: {from, reason}` and exits.
+  - A `rollback` naming another version is ignored, and so is one with no
+    confirmed upgrade to name `previous` (one WARNING). A rollback is
+    asked for once per version. If a boot step never served the request,
+    or a reinstall failed (`rollback_failed`, retried at the next boot),
+    the seat does not drain again.
+  - The entrypoint's boot step has a rollback branch ahead of the
+    never-a-downgrade guard. It installs `previous`, marks the failed
+    version skipped and leaves `upgradeFailed: {version, reason}`. The
+    daemon on `previous` sends that report on exactly one snapshot.
+
 ## 0.31.38
 
 - **No re-review of an unchanged head on the author's own re-request, and a

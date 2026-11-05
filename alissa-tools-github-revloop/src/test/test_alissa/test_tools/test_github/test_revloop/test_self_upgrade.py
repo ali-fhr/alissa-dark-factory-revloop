@@ -24,7 +24,13 @@ behave the same way. What is pinned:
   * the entrypoint's boot step (`self_upgrade_boot`, lifted between its
     marker lines and run under bash against a stub `pip`) -- install,
     count boots, roll back (retrying a reinstall that failed), skip -- and
-    its exit-75 tail.
+    its exit-75 tail;
+  * functional rollback (issue #216) -- `upgrade.rollback` is parsed (an
+    older Studio's answer without it changes nothing); naming the running
+    version, it drains, writes `target = previous` with the running
+    version skipped, exits at idle, the boot installs `previous` and the
+    daemon there reports `upgradeFailed` once; naming another version, or
+    with `autoUpgrade` off, nothing happens.
 """
 
 from __future__ import annotations
@@ -47,7 +53,8 @@ from alissa.tools.github.revloop.fleet_vitals import VITALS_PUSHED, FleetVitalsP
 from alissa.tools.github.revloop.loop import Action, ReviewWatcher, decision_owed
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.self_upgrade import (
-    EXIT, HOLD_DRAIN, HOLD_UPGRADE, NONE, WAIT, SelfUpgrader, parse_upgrade,
+    EXIT, HOLD_DRAIN, HOLD_ROLLBACK, HOLD_UPGRADE, NONE, WAIT, SelfUpgrader,
+    parse_upgrade,
 )
 from alissa.tools.github.revloop.state import State
 from alissa.tools.github.revloop.version import version as running_version
@@ -71,13 +78,19 @@ DIST = "alissa-tools-github-revloop"
 DIST_DIR = "alissa_tools_github_revloop"
 
 
+_ABSENT = object()
+
+
 def answer(mode="self_hosted", version=TARGET, *, auto=True, paused=False,
-           drain=False):
+           drain=False, rollback=_ABSENT):
     target = None if version is None else {"version": version, "digest": "sha256:ab"}
-    return {"seat": "revloop", "receivedAt": 1, "replaced": True, "upgrade": {
+    block = {
         "mode": mode, "target": target, "autoUpgrade": auto, "paused": paused,
         "drain": drain,
-    }}
+    }
+    if rollback is not _ABSENT:
+        block["rollback"] = rollback
+    return {"seat": "revloop", "receivedAt": 1, "replaced": True, "upgrade": block}
 
 
 def upgrader(tmp_path, running=RUNNING, **kw):
@@ -1116,3 +1129,337 @@ def test_the_upgrade_dir_is_exported_before_anything_reads_it():
     assert export < text.index('    self_upgrade_boot "${RUNTIME_USER}"'), "before step 0a"
     assert export < text.index("alissa-revloop --workspace-root"), "before the daemon starts"
     assert export < text.index("# >>> self_upgrade_exit"), "before the exit check"
+
+
+# -- functional rollback (issue #216, fleet-upgrade-safety §3.2) -------------------
+
+WHY = "smoke R1: review request probe refused 403"
+
+
+def rolled(version=RUNNING, reason=WHY):
+    """Studio's answer while it holds a failed smoke for `version`: the
+    target stays on the running version (Studio's `failedVersion` keeps
+    every mover off it), and `rollback` names it."""
+    return answer(version=RUNNING, rollback={"from": version, "reason": reason})
+
+
+def confirmed_upgrade(tmp_path, running=RUNNING, previous=PREVIOUS):
+    """The request file a confirmed upgrade previous → running leaves."""
+    write_file(tmp_path, {
+        "target": {"version": running, "digest": "sha256:ab"}, "previous": previous,
+        "requestedAt": "2027-01-15T08:00:00Z", "state": "confirmed",
+        "confirmed": True, "confirmedAt": "2027-01-15T08:05:00Z", "boots": 1,
+        "firstBootTs": 1_800_000_000, "skip": [],
+    })
+
+
+def test_the_rollback_field_is_parsed():
+    parsed = parse_upgrade(rolled(reason="smoke R1:\n  refused"))
+    assert parsed.rollback_from == RUNNING
+    assert parsed.rollback_reason == "smoke R1: refused"
+
+
+@pytest.mark.parametrize("rollback", [
+    _ABSENT, None, {}, {"from": 3}, {"from": "  "}, "0.31.28", [RUNNING],
+], ids=["absent", "null", "empty", "number", "blank", "string", "list"])
+def test_an_answer_without_a_usable_rollback_changes_nothing(tmp_path, rollback):
+    """An older Studio leaves the field out; a null or malformed one is no
+    rollback, and the rest of the block still stands."""
+    parsed = parse_upgrade(answer(rollback=rollback))
+    assert parsed is not None and parsed.target_version == TARGET
+    assert parsed.rollback_from is None and parsed.rollback_reason is None
+    confirmed_upgrade(tmp_path)
+    before = read_file(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(answer(version=RUNNING, rollback=rollback))
+    assert up.hold() is None
+    assert [up.after_pass([]) for _ in range(3)] == [NONE] * 3
+    assert read_file(tmp_path) == before
+
+
+def test_a_rollback_naming_the_running_version_drains_then_writes_previous_and_exits(
+        tmp_path, caplog):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    with caplog.at_level(logging.INFO):
+        up.observe(rolled())
+    assert up.hold() == HOLD_ROLLBACK
+    assert f"roll back {RUNNING} → {PREVIOUS}" in up.hold_detail() and WHY in up.hold_detail()
+    assert any("draining" in r.getMessage() and WHY in r.getMessage() for r in caplog.records)
+    assert up.after_pass(BUSY) == WAIT, "a live review holds the exit"
+    assert read_file(tmp_path)["state"] == "confirmed"
+    assert up.after_pass([]) == WAIT
+    assert up.after_pass([]) == EXIT and up.exit_requested
+    data = read_file(tmp_path)
+    assert data["target"] == {"version": PREVIOUS, "digest": None}
+    assert data["previous"] == RUNNING
+    assert data["state"] == "requested" and data["confirmed"] is False
+    assert data["skip"] == [RUNNING]
+    assert data["rollback"] == {"from": RUNNING, "reason": WHY}
+    assert data["boots"] == 0 and "firstBootTs" not in data and "confirmedAt" not in data
+    assert "upgradeFailed" not in data, "the boot step leaves the report, once it rolled back"
+
+
+def test_a_rollback_naming_another_version_is_ignored(tmp_path):
+    confirmed_upgrade(tmp_path)
+    before = read_file(tmp_path)
+    up = upgrader(tmp_path)
+    for other in (PREVIOUS, TARGET, "0.31.2"):
+        up.observe(rolled(version=other))
+        assert up.hold() is None
+        assert [up.after_pass([]) for _ in range(3)] == [NONE] * 3
+    assert read_file(tmp_path) == before and not up.exit_requested
+
+
+@pytest.mark.parametrize("kw", [{"auto": False}, {"paused": True}], ids=["auto-off", "paused"])
+def test_a_rollback_with_auto_upgrade_off_or_paused_does_nothing(tmp_path, kw):
+    confirmed_upgrade(tmp_path)
+    before = read_file(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(answer(version=RUNNING, rollback={"from": RUNNING, "reason": WHY}, **kw))
+    assert up.hold() is None
+    assert [up.after_pass([]) for _ in range(3)] == [NONE] * 3
+    assert read_file(tmp_path) == before and not up.exit_requested
+
+
+def test_managed_mode_never_rolls_itself_back(tmp_path):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(answer("managed", RUNNING, rollback={"from": RUNNING, "reason": WHY}))
+    assert up.hold() is None and up.after_pass([]) == NONE and up.after_pass([]) == NONE
+
+
+@pytest.mark.parametrize("data", [
+    None,  # never upgraded by this path: no file
+    {"target": {"version": TARGET}, "previous": PREVIOUS, "state": "confirmed"},
+    {"target": {"version": RUNNING}, "previous": PREVIOUS, "state": "rolled_back"},
+    {"target": {"version": RUNNING}, "previous": "junk", "state": "confirmed"},
+    {"target": {"version": RUNNING}, "previous": RUNNING, "state": "confirmed"},
+], ids=["no-file", "other-target", "not-confirmed", "bad-previous", "same-previous"])
+def test_a_rollback_with_no_confirmed_previous_warns_once_and_stays(tmp_path, caplog, data):
+    if data is not None:
+        write_file(tmp_path, data)
+    up = upgrader(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            up.observe(rolled())
+            assert up.hold() is None and up.after_pass([]) == NONE
+    warns = [r for r in caplog.records if "no confirmed upgrade" in r.getMessage()]
+    assert len(warns) == 1
+
+
+def test_a_rollback_comes_before_a_newer_target(tmp_path):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(answer(version=TARGET, rollback={"from": RUNNING, "reason": WHY}))
+    assert up.hold() == HOLD_ROLLBACK
+    up.after_pass([])
+    assert up.after_pass([]) == EXIT
+    assert read_file(tmp_path)["target"]["version"] == PREVIOUS
+
+
+def test_a_drain_answer_still_reads_as_drain_during_a_rollback(tmp_path):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(answer(version=RUNNING, drain=True, rollback={"from": RUNNING, "reason": WHY}))
+    assert up.hold() == HOLD_DRAIN
+
+
+def test_a_rollback_lifted_mid_drain_stops_the_exit(tmp_path):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(rolled())
+    assert up.after_pass([]) == WAIT
+    up.observe(answer(version=RUNNING, rollback=None))
+    assert up.hold() is None and up.after_pass([]) == NONE
+    assert read_file(tmp_path)["state"] == "confirmed"
+
+
+def test_dry_run_never_writes_a_rollback(tmp_path):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path, dry_run=True)
+    up.observe(rolled())
+    assert [up.after_pass([]) for _ in range(3)] == [WAIT] * 3
+    assert read_file(tmp_path)["state"] == "confirmed"
+
+
+def test_an_unwritable_rollback_lifts_the_drain(tmp_path, monkeypatch):
+    confirmed_upgrade(tmp_path)
+    up = upgrader(tmp_path)
+    up.observe(rolled())
+    up.after_pass([])
+
+    def refuse(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mod, "write_request", refuse)
+    assert up.after_pass([]) == NONE and not up.exit_requested
+    assert up.hold() is None
+    up.observe(rolled())
+    assert up.hold() is None, "this process does not try the rollback again"
+
+
+def test_a_rollback_the_boot_never_served_is_not_asked_again(tmp_path, caplog):
+    """No boot step ran (a non-container start): the same version comes
+    back to the pending rollback request. It is marked unserved, previous is
+    NOT skipped, nothing is reported, and the seat does not drain again on
+    the same answer."""
+    confirmed_upgrade(tmp_path)
+    first = upgrader(tmp_path)
+    first.observe(rolled())
+    first.after_pass([])
+    assert first.after_pass([]) == EXIT
+    nxt = upgrader(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        nxt.observe(rolled())
+    assert nxt.hold() is None
+    assert [nxt.after_pass([]) for _ in range(3)] == [NONE] * 3
+    data = read_file(tmp_path)
+    assert data["state"] == "unserved" and data["skip"] == [RUNNING]
+    assert PREVIOUS not in data["skip"]
+    assert "upgradeFailed" not in data and nxt.report() is None
+    assert any("rollback" in r.getMessage() and "never served" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_rollback_keeps_an_undelivered_report(tmp_path):
+    confirmed_upgrade(tmp_path)
+    data = read_file(tmp_path)
+    data.update(upgradeFailed={"version": "0.31.26", "reason": "x"}, upgradeFailedReported=False)
+    write_file(tmp_path, data)
+    up = upgrader(tmp_path)
+    up.observe(rolled())
+    up.after_pass([])
+    assert up.after_pass([]) == EXIT
+    assert read_file(tmp_path)["upgradeFailed"] == {"version": "0.31.26", "reason": "x"}
+
+
+def test_the_daemon_rolls_back_over_run_forever(tmp_path, monkeypatch):
+    """Over the real loop: a pusher whose every answer names the running
+    version in `rollback`; the second idle pass writes the request back to
+    `previous` and `run_forever` returns."""
+    w, _ = daemon(tmp_path)
+    up = w.self_upgrade
+    running = running_version.value
+    major, minor, patch = (int(p) for p in running.split("."))
+    previous = f"{major}.{minor}.{max(patch - 1, 0)}" if patch else f"{major}.{max(minor - 1, 0)}.9"
+    write_file(Path(up.path).parent, {
+        "target": {"version": running}, "previous": previous, "state": "confirmed",
+        "confirmed": True, "skip": [],
+    })
+
+    class RollbackPusher(AnsweringPusher):
+        def push_once(self, *, heartbeat_at, queue_depth=None):
+            self.upgrader.observe(answer(version=running, rollback={"from": running, "reason": WHY}))
+            return VITALS_PUSHED
+
+    w._fleet_vitals = RollbackPusher(up)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    w.run_forever()
+    assert up.exit_requested
+    data = json.loads(Path(up.path).read_text())
+    assert data["target"]["version"] == previous and data["skip"] == [running]
+
+
+@bash_only
+def test_the_full_rollback_cycle_request_boot_previous_installed_report_once(tmp_path):
+    """Issue #216's end-to-end pin, over the request file: Studio's
+    `rollback` names the running version → the daemon drains and, at idle,
+    writes `target = previous` with the version skipped and exits (the
+    container's exit check reads it as a self-upgrade) → the boot installs
+    `previous` → the daemon on `previous` reports `upgradeFailed {version,
+    reason}` on exactly one snapshot, and the same answer moves it no
+    further."""
+    seat = Seat(tmp_path, installed=RUNNING)
+    confirmed_upgrade(seat.dir)
+
+    failed = SelfUpgrader(RUNNING, directory=str(seat.dir))
+    failed.observe(rolled())
+    assert failed.hold() == HOLD_ROLLBACK
+    assert failed.after_pass([]) == WAIT
+    assert failed.after_pass([]) == EXIT
+
+    script = "log() { printf '[entrypoint] %s\\n' \"$*\" >&2; }\nDAEMON_RC=0\n"
+    script += lift("# >>> self_upgrade_exit", "# <<< self_upgrade_exit")
+    script += '\nexit "${DAEMON_RC}"\n'
+    exit_check = subprocess.run(["bash", "-c", script], env=seat.env(),
+                                capture_output=True, text=True, timeout=30)
+    assert exit_check.returncode == 75, "the container restarts to install previous"
+
+    proc = seat.boot()
+    assert proc.returncode == 0, proc.stderr
+    (call,) = seat.pip_calls()
+    assert call.endswith(f"{DIST}=={PREVIOUS}"), "previous is installed, older or not"
+    assert (seat.site / f"{DIST_DIR}-{PREVIOUS}.dist-info").exists()
+    data = seat.read()
+    assert data["state"] == "rolled_back"
+    assert data["skip"] == [RUNNING]
+    assert data["upgradeFailed"] == {"version": RUNNING, "reason": f"rolled back to {PREVIOUS}: {WHY}"}
+    assert data["upgradeFailedReported"] is False
+
+    # The daemon on `previous`: Studio still answers the rollback for a
+    # moment -- it names another version now, so nothing moves.
+    up_dir = seat.dir
+    client = AnsweringClient(rolled())
+    back = SelfUpgrader(PREVIOUS, directory=str(up_dir), clock=lambda: 1_800_000_000.0)
+    pusher = pusher_over(tmp_path, client, back)
+    for _ in range(3):
+        assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+        assert back.hold() is None
+        assert back.after_pass([]) == NONE
+    first, *rest = client.snapshots
+    assert first["upgradeFailed"] == {"version": RUNNING, "reason": f"rolled back to {PREVIOUS}: {WHY}"}
+    assert all("upgradeFailed" not in s for s in rest), "reported once"
+    assert seat.read()["upgradeFailedReported"] is True
+    assert seat.read()["confirmed"] is False, "a rollback is never confirmed as an upgrade"
+
+    # The next boot is a no-op.
+    assert seat.boot().returncode == 0
+    assert len(seat.pip_calls()) == 1
+
+
+@bash_only
+def test_a_rollback_reinstall_that_fails_is_retried_next_boot(tmp_path):
+    seat = Seat(tmp_path, installed=RUNNING)
+    confirmed_upgrade(seat.dir)
+    up = SelfUpgrader(RUNNING, directory=str(seat.dir))
+    up.observe(rolled())
+    up.after_pass([])
+    assert up.after_pass([]) == EXIT
+    seat.fail = PREVIOUS
+    assert seat.boot().returncode == 0
+    data = seat.read()
+    assert data["state"] == "rollback_failed" and RUNNING in data["skip"]
+    assert f"could not reinstall {PREVIOUS}" in data["upgradeFailed"]["reason"]
+    assert (seat.site / f"{DIST_DIR}-{RUNNING}.dist-info").exists()
+
+    # The daemon still on RUNNING does not drain for the same rollback again.
+    again = SelfUpgrader(RUNNING, directory=str(seat.dir))
+    again.observe(rolled())
+    assert again.hold() is None and again.after_pass([]) == NONE
+
+    seat.fail = ""
+    assert seat.boot().returncode == 0
+    assert seat.pip_calls()[-1].endswith(f"{DIST}=={PREVIOUS}")
+    data = seat.read()
+    assert data["state"] == "rolled_back"
+    assert data["upgradeFailed"]["reason"] == f"rolled back to {PREVIOUS}: {WHY}"
+    assert data["upgradeFailedReported"] is False
+
+
+@bash_only
+def test_a_rollback_naming_no_version_is_never_handed_to_pip(seat):
+    data = request(version=PREVIOUS, previous=RUNNING)
+    data["rollback"] = {"from": "1.0 --index-url=http://evil", "reason": WHY}
+    seat.write(data)
+    assert seat.boot().returncode == 0
+    assert seat.pip_calls() == [] and seat.read()["state"] == "invalid"
+
+
+@bash_only
+def test_an_ordinary_request_to_an_older_version_is_still_refused(seat):
+    """The rollback branch is keyed on the `rollback` record only: a plain
+    request for an older version still meets the never-a-downgrade guard."""
+    seat.write(request(version="0.31.20", previous=RUNNING))
+    assert seat.boot().returncode == 0
+    assert seat.pip_calls() == [] and seat.read()["state"] == "not_newer"

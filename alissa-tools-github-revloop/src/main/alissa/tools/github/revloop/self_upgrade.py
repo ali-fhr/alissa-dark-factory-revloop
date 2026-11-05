@@ -8,9 +8,14 @@ Every ``POST /v1/loop/fleet-vitals`` answer carries an ``upgrade`` block::
 
     {"mode": "managed" | "self_hosted",
      "target": {"version", "digest"} | null,
-     "autoUpgrade": bool, "paused": bool, "drain": bool}
+     "autoUpgrade": bool, "paused": bool, "drain": bool,
+     "rollback": {"from", "reason"} | null}
 
-This module reads it and acts on it in four steps:
+``rollback`` (issue #216, fleet-upgrade-safety §3.2, Studio US-5) is new:
+Studio sets it while it holds a failed smoke or a stuck-hold rise for the
+version ``from``. An older Studio leaves it out, which changes nothing.
+
+This module reads it and acts on it in these steps:
 
 1. **Read.** `parse_upgrade` turns the answer into an `UpgradeAnswer`, or
    None when the block is absent or malformed (an older Studio). The
@@ -45,6 +50,20 @@ This module reads it and acts on it in four steps:
    first write) or installed somewhere the daemon does not import from.
    It skips the target and reports it, so the seat never loops drain →
    exit → restart.
+6. **Roll back** (issue #216). A self-hosted answer whose ``rollback.from``
+   is the RUNNING version, with `autoUpgrade` on and the pause switch off,
+   holds like an upgrade (`HOLD_ROLLBACK`) and, at idle, rewrites the
+   request file with ``target = previous`` (the version this seat upgraded
+   from, read from the confirmed request), adds the running version to
+   ``skip``, records ``rollback: {"from", "reason"}`` and exits. The
+   entrypoint installs ``previous`` on the next boot (its rollback branch,
+   ahead of the never-a-downgrade guard) and leaves the ``upgradeFailed``
+   report, which the daemon on ``previous`` sends once. A ``rollback``
+   naming another version is ignored; so is one with no confirmed upgrade
+   to go back from (nothing names ``previous``). A rollback request is
+   written once per version: a file that already records a rollback from
+   the running version is the entrypoint's to finish, so a boot step that
+   never ran, or a reinstall that failed, never loops drain → exit.
 
 Never while paused, never in managed mode, never with a live session: those
 three are checked here, at the moment of the exit, not only when the hold
@@ -71,6 +90,9 @@ neither can drop the other's state. Its keys:
   ``unserved`` (daemon). A ``not_newer`` request this version wrote is
   unserved too: the daemon runs an older copy than the boot step sees.
 * ``skip`` -- versions never to move to again. A newer target clears it.
+* ``rollback`` -- ``{"from", "reason"}``, written by the daemon when it asks
+  to go back to ``target`` on Studio's answer (step 6). Only a rollback
+  request carries it.
 * ``upgradeFailed`` -- ``{"version", "reason"}``, the report owed to Studio.
   ``upgradeFailedReported`` is set once a POST carried it.
 """
@@ -109,6 +131,11 @@ IDLE_POLLS = 2
 # The hold reasons `hold` returns, and the poll summary quotes.
 HOLD_DRAIN = "drain"
 HOLD_UPGRADE = "upgrade"
+HOLD_ROLLBACK = "rollback"
+
+# Studio's rollback reason, as far as the request file and the logs keep it.
+ROLLBACK_REASON_MAX = 240
+ROLLBACK_REASON_DEFAULT = "Studio asked for a rollback"
 
 # The request states in which an upgrade is still on its way: the only ones
 # the daemon confirms or calls unserved. Every other state is final, or a
@@ -156,6 +183,8 @@ class UpgradeAnswer:
     auto_upgrade: bool
     paused: bool
     drain: bool
+    rollback_from: "str | None" = None
+    rollback_reason: "str | None" = None
 
     @property
     def target(self) -> "dict | None":
@@ -172,7 +201,9 @@ def parse_upgrade(payload: object) -> "UpgradeAnswer | None":
     (an unknown `mode`, a non-boolean flag). A malformed block is never read
     as a partial one: a guessed `paused: false` would let a seat upgrade
     through the operator's switch. A `target` without a string version is
-    read as no target."""
+    read as no target. A `rollback` that is absent, null or carries no
+    string `from` is read as no rollback (issue #216): the field is new, and
+    the rest of the block stands without it."""
     if not isinstance(payload, Mapping):
         return None
     block = payload.get("upgrade")
@@ -190,10 +221,20 @@ def parse_upgrade(payload: object) -> "UpgradeAnswer | None":
             version = raw.strip()
             raw_digest = target.get("digest")
             digest = raw_digest if isinstance(raw_digest, str) else None
+    rollback_from = rollback_reason = None
+    rollback = block.get("rollback")
+    if isinstance(rollback, Mapping):
+        raw = rollback.get("from")
+        if isinstance(raw, str) and raw.strip():
+            rollback_from = raw.strip()
+            why = rollback.get("reason")
+            why = " ".join(why.split()) if isinstance(why, str) else ""
+            rollback_reason = why[:ROLLBACK_REASON_MAX] or None
     auto_upgrade, paused, drain = flags
     return UpgradeAnswer(
         mode=str(mode), target_version=version, target_digest=digest,
         auto_upgrade=bool(auto_upgrade), paused=bool(paused), drain=bool(drain),
+        rollback_from=rollback_from, rollback_reason=rollback_reason,
     )
 
 
@@ -263,6 +304,11 @@ def _target_version(data: "Mapping") -> "str | None":
     return version if isinstance(version, str) else None
 
 
+def _rollback_record(data: "Mapping") -> "dict | None":
+    rollback = data.get("rollback")
+    return dict(rollback) if isinstance(rollback, Mapping) else None
+
+
 def _count(queued: "Callable[[], int | None]") -> "int | None":
     """`queued()`, with a failure read as unknown (never idle)."""
     try:
@@ -306,11 +352,15 @@ class SelfUpgrader:
         self.dry_run = dry_run
         self.answer: "UpgradeAnswer | None" = None
         self._hold: "str | None" = None
+        self._rollback_target: "str | None" = None
         self._idle_polls = 0
         # Targets this process could not request (the file would not
         # write): never held for again in this process, or the seat would
         # drain for ever without ever exiting.
         self._unwritable: "set[str]" = set()
+        # Running versions a rollback answer named but this seat could not
+        # go back from (no confirmed upgrade names `previous`): warned once.
+        self._no_previous: "set[str]" = set()
         self.exit_requested = False
 
     # -- reading the answer --
@@ -373,6 +423,9 @@ class SelfUpgrader:
             return
         if data.get("previous") != self.running:
             return
+        if _rollback_record(data) is not None:
+            self._rollback_unserved(data)
+            return
         skip = skip_list(data)
         if version in skip:
             return
@@ -405,6 +458,33 @@ class SelfUpgrader:
             "%s is now on the skip list and reported to Studio; this seat "
             "keeps running %s", self.running, version, reason, version,
             self.running,
+        )
+
+    def _rollback_unserved(self, data: dict) -> None:
+        """A rollback request this version wrote is still pending on a later
+        process of the same version: the boot step never installed
+        ``previous``. Marked unserved, so the file stops reading as a pending
+        request. ``previous`` is not skipped (it never failed), and nothing
+        is reported: the seat did not roll back. The rollback record stays,
+        so `rollback_to` does not ask again for this version."""
+        reason = (
+            f"the boot step never installed {_target_version(data)}; the "
+            f"daemon still runs {self.running}"
+        )
+        data.update({"state": "unserved", "lastError": reason})
+        try:
+            write_request(self.path, data)
+        except OSError as exc:
+            log.warning(
+                "self-upgrade: the rollback %s → %s was never served and %s "
+                "could not be updated (%s)", self.running,
+                _target_version(data), self.path, exc,
+            )
+            return
+        log.warning(
+            "self-upgrade: the rollback %s → %s was never served: %s — this "
+            "seat keeps running %s and will not ask again", self.running,
+            _target_version(data), reason, self.running,
         )
 
     def _clear_skip(self, answer: UpgradeAnswer) -> None:
@@ -452,9 +532,61 @@ class SelfUpgrader:
             return None
         return version
 
+    def rollback_to(self) -> "str | None":
+        """The version a self-hosted seat should roll back to now, or None
+        (issue #216): Studio's `rollback.from` names the running version,
+        `autoUpgrade` is on, the pause switch is off, and the request file
+        shows the confirmed upgrade to the running version, whose
+        ``previous`` is where the seat goes back to. A file that already
+        records a rollback from the running version is never asked again."""
+        a = self.answer
+        if a is None or a.mode != SELF_HOSTED:
+            return None
+        if not a.auto_upgrade or a.paused:
+            return None
+        if a.rollback_from is None or a.rollback_from != self.running:
+            return None
+        if self.running in self._unwritable:
+            return None
+        data = read_request(self.path) or {}
+        record = _rollback_record(data)
+        if record is not None and record.get("from") == self.running:
+            return None
+        previous = data.get("previous")
+        if (
+            _target_version(data) == self.running
+            and data.get("state") == "confirmed"
+            and isinstance(previous, str)
+            and version_key(previous) is not None
+            and previous != self.running
+        ):
+            return previous
+        if self.running not in self._no_previous:
+            self._no_previous.add(self.running)
+            log.warning(
+                "self-upgrade: Studio asks this seat to roll back %s (%s), but "
+                "no confirmed upgrade to %s names the version it came from — "
+                "not rolling back; this seat keeps running %s", self.running,
+                a.rollback_reason or ROLLBACK_REASON_DEFAULT, self.running,
+                self.running,
+            )
+        return None
+
+    def _move(self) -> "tuple[str | None, str | None]":
+        """(`HOLD_ROLLBACK`, previous), (`HOLD_UPGRADE`, target) or
+        (None, None). A rollback comes first: it leaves a version Studio
+        found broken."""
+        version = self.rollback_to()
+        if version is not None:
+            return HOLD_ROLLBACK, version
+        version = self.wanted()
+        if version is not None:
+            return HOLD_UPGRADE, version
+        return None, None
+
     def hold(self) -> "str | None":
         """Why no new reviewer session may start now (`HOLD_DRAIN`,
-        `HOLD_UPGRADE`), or None. Read by every spawn path."""
+        `HOLD_UPGRADE`, `HOLD_ROLLBACK`), or None. Read by every spawn path."""
         return self._hold
 
     def hold_detail(self) -> str:
@@ -466,15 +598,24 @@ class SelfUpgrader:
                 f"draining to self-upgrade {self.running} → "
                 f"{self.answer.target_version if self.answer else '?'}"
             )
+        if self._hold == HOLD_ROLLBACK:
+            return (
+                f"draining to roll back {self.running} → "
+                f"{self._rollback_target or '?'} on Studio's answer: "
+                f"{self._rollback_reason()}"
+            )
         return ""
 
+    def _rollback_reason(self) -> str:
+        a = self.answer
+        return (a.rollback_reason if a is not None else None) or ROLLBACK_REASON_DEFAULT
+
     def _update_hold(self) -> None:
+        kind, version = self._move()
+        self._rollback_target = version if kind == HOLD_ROLLBACK else None
+        new: "str | None" = kind
         if self.answer is not None and self.answer.drain:
             new = HOLD_DRAIN
-        elif self.wanted() is not None:
-            new = HOLD_UPGRADE
-        else:
-            new = None
         if new == self._hold:
             return
         old, self._hold = self._hold, new
@@ -511,10 +652,11 @@ class SelfUpgrader:
         # Re-checked here, not only at the hold's start: a skip list the
         # entrypoint just wrote, or a target that moved, must stop the exit.
         self._update_hold()
-        version = self.wanted()
+        kind, version = self._move()
         if version is None or self.answer is None:
             self._idle_polls = 0
             return NONE
+        verb = "roll back" if kind == HOLD_ROLLBACK else "upgrade"
         live = live_reviewer_sessions(roster)
         if live is None or live:
             if self._idle_polls:
@@ -538,32 +680,40 @@ class SelfUpgrader:
         self._idle_polls += 1
         if self._idle_polls < IDLE_POLLS:
             log.info(
-                "self-upgrade: idle on poll %d of %d before the exit to %s",
-                self._idle_polls, IDLE_POLLS, version,
+                "self-upgrade: idle on poll %d of %d before the exit to %s %s",
+                self._idle_polls, IDLE_POLLS, verb, version,
             )
             return WAIT
         if self.dry_run:
             log.info(
                 "[dry-run] self-upgrade: idle — would write %s and exit to "
-                "upgrade %s → %s", self.path, self.running, version,
+                "%s %s → %s", self.path, verb, self.running, version,
             )
             return WAIT
         try:
-            self._request(self.answer)
+            if kind == HOLD_ROLLBACK:
+                self._rollback(version)
+            else:
+                self._request(self.answer)
         except OSError as exc:
-            self._unwritable.add(version)
+            # A rollback that cannot be written puts the RUNNING version out
+            # of reach of `rollback_to`; an upgrade, its target.
+            self._unwritable.add(self.running if kind == HOLD_ROLLBACK else version)
             log.warning(
-                "self-upgrade: could not write %s (%s) — NOT upgrading to %s; "
+                "self-upgrade: could not write %s (%s) — NOT %s to %s; "
                 "the drain is lifted and this process will not try %s again",
-                self.path, exc, version, version,
+                self.path, exc,
+                "rolling back" if kind == HOLD_ROLLBACK else "upgrading",
+                version, version,
             )
             self._update_hold()
             return NONE
         self.exit_requested = True
         log.info(
             "self-upgrade: idle on %d consecutive polls — wrote %s; exiting "
-            "with code 0 so the container restarts and installs %s (from %s)",
+            "with code 0 so the container restarts and installs %s (from %s%s)",
             IDLE_POLLS, self.path, version, self.running,
+            f", a rollback: {self._rollback_reason()}" if kind == HOLD_ROLLBACK else "",
         )
         return EXIT
 
@@ -582,6 +732,32 @@ class SelfUpgrader:
         if old.get("upgradeFailed") and not old.get("upgradeFailedReported"):
             data["upgradeFailed"] = old["upgradeFailed"]
             data["upgradeFailedReported"] = False
+        write_request(self.path, data)
+
+    def _rollback(self, previous: str) -> None:
+        """Rewrite the request file for a rollback (issue #216): `target`
+        is `previous`, the running version joins `skip`, and the
+        `rollback` record tells the boot step this one goes back. Every key
+        this side does not own is kept, an undelivered report included. The
+        entrypoint's attempt keys belong to the upgrade being left and are
+        dropped."""
+        data = read_request(self.path) or {}
+        skip = skip_list(data)
+        if self.running not in skip:
+            skip.append(self.running)
+        for key in ("confirmedAt", "firstBootTs", "firstBootAt", "lastError",
+                    "rollbackReason"):
+            data.pop(key, None)
+        data.update({
+            "target": {"version": previous, "digest": None},
+            "previous": self.running,
+            "requestedAt": iso(self._clock()),
+            "state": "requested",
+            "confirmed": False,
+            "boots": 0,
+            "skip": skip,
+            "rollback": {"from": self.running, "reason": self._rollback_reason()},
+        })
         write_request(self.path, data)
 
     # -- the failure report --

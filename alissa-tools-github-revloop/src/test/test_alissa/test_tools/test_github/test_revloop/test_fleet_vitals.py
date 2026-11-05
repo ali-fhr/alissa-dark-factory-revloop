@@ -1238,3 +1238,33 @@ def test_the_probes_block_is_sent_when_held_and_left_out_otherwise(tmp_path):
     assert "probes" not in before and "probes" not in from_console
     assert after["probes"] == block
     assert "probes" in fleet_vitals.OPTIONAL_BLOCKS
+
+
+# -- the answer's upgrade.rollback (issue #216, fleet-upgrade-safety §3.2) --------
+
+class _RollbackClient(FakeVitalsClient):
+    def __init__(self, rollback):
+        super().__init__()
+        self.rollback = rollback
+
+    def post_fleet_vitals(self, snapshot):
+        base = super().post_fleet_vitals(snapshot)
+        block = {"mode": "self_hosted", "target": None, "autoUpgrade": True,
+                 "paused": False, "drain": False}
+        if self.rollback is not None:
+            block["rollback"] = self.rollback
+        return {**base, "upgrade": block}
+
+
+def test_the_pusher_reads_the_answers_rollback_and_an_older_studio_reads_as_none(tmp_path):
+    client = _RollbackClient({"from": "0.31.38", "reason": "smoke R1: 403"})
+    pusher = FleetVitalsPusher(_config(tmp_path), FakeSources(), client,
+                               clock=lambda: float(WALL))
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    assert pusher.upgrade.rollback_from == "0.31.38"
+    assert pusher.upgrade.rollback_reason == "smoke R1: 403"
+    assert pusher.upgrader is None, "the console's pusher acts on nothing"
+
+    client.rollback = None  # an answer without the field (an older Studio)
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_PUSHED
+    assert pusher.upgrade is not None and pusher.upgrade.rollback_from is None
