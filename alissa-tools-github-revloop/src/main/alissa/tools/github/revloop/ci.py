@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from .ghclient import (
     CHECKS_GREEN,
@@ -125,6 +126,28 @@ def _with_failing(rollup: CheckRollup, failing: "tuple[CheckContext, ...]") -> C
     return replace(rollup, state=state, failing=failing)
 
 
+def cut_off(*stamps: str) -> str:
+    """The EARLIEST of the readable ISO-8601 stamps, as given, or "".
+
+    "Before this PR's first commit" takes min(oldest commit's author date,
+    PR created_at): neither can move later on a rebase, and the earlier one
+    only ever narrows which runs count as pre-existing (PR #215 round 1).
+    An unparseable stamp is dropped rather than compared as text."""
+    best: "tuple[datetime, str] | None" = None
+    for stamp in stamps:
+        if not stamp:
+            continue
+        try:
+            at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if at.tzinfo is None:
+            continue
+        if best is None or at < best[0]:
+            best = (at, stamp)
+    return best[1] if best else ""
+
+
 def classify(github: GitHub, pr: PullRequest, rollup: CheckRollup) -> Classified:
     """Split `rollup`'s failures into new ones and pre-existing ones."""
     if rollup.state != CHECKS_RED or not rollup.failing:
@@ -178,9 +201,15 @@ def _classify(github: GitHub, pr: PullRequest, rollup: CheckRollup) -> Classifie
             and context.name not in base_names
         ):
             if first_commit_at is None:
-                first_commit_at = github.pull_request_first_commit_at(
-                    pr.owner, pr.repo, pr.number
+                first_commit_at = cut_off(
+                    github.pull_request_first_commit_at(pr.owner, pr.repo, pr.number),
+                    pr.created_at,
                 )
+            if not first_commit_at:
+                # No anchor at all: an unbounded listing could pick a run
+                # from a later PR, so the red stays blocking.
+                new.append(context)
+                continue
             prior = github.prior_pull_request_run(
                 pr.owner, pr.repo, job.workflow_id,
                 before=first_commit_at, exclude_branch=pr.head_ref, base_ref=base_ref,

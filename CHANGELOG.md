@@ -17,11 +17,18 @@ plain-text `version` file next to `version.py`; entries here start at 0.30.1
     round. The skip is logged once per (head, verdict). A push re-arms, and
     so does a request from anyone else or from an `operators` login. The
     timeline read now carries the event's `actor`
-    (`GitHub.newest_review_request`).
+    (`GitHub.newest_review_request`). The refusal also pages the operator
+    once per (head, verdict) (`UNCHANGED_HEAD_PAGE`, ledger kind
+    `unchanged-head:`), so a triage-only fix round or a re-run-green red does
+    not strand silently. The unsettled-checks lead and page now give the
+    same push-or-operator wording (PR #215 round 1).
   - New `ci.py`. A failing check is PRE-EXISTING when the base branch head
     fails the same check name, or, for a `pull_request`-only workflow, when
     the latest completed run of that workflow on an earlier PR (created
-    before this PR's first commit) failed the same job. In both cases the
+    before this PR's first commit) failed the same job. That cut-off is the
+    earlier of the oldest commit's author date and the PR's `created_at`,
+    since neither moves on a rebase; with neither readable the red stays
+    blocking. In both cases the
     diff must not touch the workflow file behind it. A check with no known
     workflow file counts only when the diff touches nothing under
     `.github/`. Any read failure leaves every red blocking.

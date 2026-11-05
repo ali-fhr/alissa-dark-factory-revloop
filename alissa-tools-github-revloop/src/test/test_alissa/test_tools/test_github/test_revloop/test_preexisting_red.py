@@ -169,6 +169,61 @@ def test_the_authors_re_request_on_an_unchanged_head_starts_no_round(config, mon
     assert len(announced) == 1, "logged once, not every poll"
 
 
+def _pages(gh):
+    return [c for c in gh.comments if "A re-review is owed" in c]
+
+
+def test_the_refused_re_request_pages_the_operator_once(config, monkeypatch):
+    """PR #215 round 1 [major]: the refusal must not be silent. A triage-only
+    CR8 round or a re-run-green red would otherwise strand with nobody told."""
+    w, gh, al = _judged_once(config, monkeypatch, actor=AUTHOR)
+
+    for _ in range(3):
+        assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SKIPPED
+
+    pages = _pages(gh)
+    assert len(pages) == 1, "one page per (head, verdict), not one per poll"
+    assert f"`{HEAD}`" in pages[0] and AUTHOR in pages[0]
+    assert "**push**" in pages[0] and "as an operator" in pages[0]
+    assert al.enqueued == []
+
+
+def test_the_page_survives_a_restart_and_retries_a_failed_post(config, monkeypatch):
+    w, gh, _ = _judged_once(config, monkeypatch, actor=AUTHOR)
+    real = gh.comment
+    gh.comment = lambda *a: (_ for _ in ()).throw(RuntimeError("502"))
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert _pages(gh) == []
+
+    gh.comment = real
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert len(_pages(gh)) == 1, "the ledger row lands only after the post"
+
+    again = ReviewWatcher(config, github=gh, alissa=w.alissa, state=State(config.state_db))
+    again.evaluate(OWNER, REPO, NUMBER)
+    assert len(_pages(gh)) == 1, "durable: a restarted daemon does not re-page"
+
+
+def test_a_dry_run_neither_pages_nor_silences_production(config, monkeypatch):
+    dry = dataclasses.replace(config, dry_run=True)
+    w, gh, _ = _judged_once(dry, monkeypatch, actor=AUTHOR)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+    assert _pages(gh) == []
+
+    live = ReviewWatcher(config, github=gh, alissa=w.alissa, state=State(config.state_db))
+    live.evaluate(OWNER, REPO, NUMBER)
+    assert len(_pages(gh)) == 1
+
+
+def test_a_request_that_starts_a_round_pages_nobody(config, monkeypatch):
+    w, gh, _ = _judged_once(config, monkeypatch, actor="ops-human")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert _pages(gh) == []
+
+
 def test_the_authors_re_request_matches_case_insensitively(config, monkeypatch):
     w, _, al = _judged_once(config, monkeypatch, actor=AUTHOR.upper())
 
@@ -303,6 +358,57 @@ def test_a_pull_request_only_workflow_red_on_an_earlier_pr_is_pre_existing(confi
     directive = al.enqueued[0]["directive"]
     assert "PRE-EXISTING REDS" in directive and "runs/100/job" in directive
     assert "Do NOT approve this round" not in directive
+
+
+def _pr_lane_world(w, gh):
+    name = "Check Unit-Tests"
+    gh.rollups[HEAD] = rollup_of([red(name)])
+    gh.rollups[BASE] = rollup_of([])
+    gh.jobs = [job(name, event="pull_request", workflow_id=42)]
+    gh.prior = ("https://ci/runs/100", [red(name, "https://ci/runs/100/job")])
+
+
+@pytest.mark.parametrize("first_commit, created, cut", [
+    # a rebase moved every commit date past the PR's opening: created_at wins
+    ("2026-11-05T09:00:00Z", "2026-11-05T01:00:00Z", "2026-11-05T01:00:00Z"),
+    # an older author date than the PR (work begun before it opened) wins
+    ("2026-11-04T20:00:00Z", "2026-11-05T01:00:00Z", "2026-11-04T20:00:00Z"),
+    ("", "2026-11-05T01:00:00Z", "2026-11-05T01:00:00Z"),
+    ("2026-11-05T02:00:00Z", "", "2026-11-05T02:00:00Z"),
+])
+def test_the_earlier_pr_cut_off_is_the_earliest_unrewritable_stamp(
+    config, first_commit, created, cut
+):
+    """PR #215 round 1 [minor]: a rebase must not move the cut-off later."""
+    w, gh, _ = watcher(config, [])
+    gh._pr = dataclasses.replace(gh._pr, created_at=created)
+    gh.first_commit_at = first_commit
+    _pr_lane_world(w, gh)
+
+    w.evaluate(OWNER, REPO, NUMBER)
+
+    assert [c["before"] for c in gh.prior_calls] == [cut]
+
+
+def test_no_cut_off_at_all_keeps_the_red_blocking(config):
+    w, gh, al = watcher(config, [])
+    gh.first_commit_at = ""
+    _pr_lane_world(w, gh)
+
+    classified = ci_mod.classify(gh, gh._pr, gh.rollups[HEAD])
+
+    assert gh.prior_calls == [], "an unbounded listing could pick a later PR's run"
+    assert classified.preexisting == ()
+
+
+def test_the_first_commit_read_prefers_the_author_date(monkeypatch):
+    gh = GitHub()
+    monkeypatch.setattr(gh, "_api", lambda *a, **k: [{"commit": {
+        "author": {"date": "2026-11-04T20:00:00Z"},
+        "committer": {"date": "2026-11-05T09:00:00Z"},
+    }}])
+
+    assert gh.pull_request_first_commit_at(OWNER, REPO, NUMBER) == "2026-11-04T20:00:00Z"
 
 
 # -- 3. a red the PR introduced still blocks ---------------------------------
@@ -441,11 +547,13 @@ def test_the_pr_read_carries_its_base(monkeypatch):
     gh = GitHub()
     monkeypatch.setattr(gh, "_api", lambda *a, **k: {
         "head": {"sha": HEAD, "ref": "h"}, "base": {"ref": "main", "sha": BASE},
+        "created_at": "2026-11-05T01:00:00Z",
     })
 
     pr = gh.pull_request(OWNER, REPO, NUMBER)
 
     assert (pr.base_ref, pr.base_sha) == ("main", BASE)
+    assert pr.created_at == "2026-11-05T01:00:00Z"
 
 
 def test_workflow_jobs_carry_the_workflow_file_and_event(monkeypatch):

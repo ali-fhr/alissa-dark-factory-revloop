@@ -676,9 +676,11 @@ CHECKS_UNSETTLED_LEAD = (
     "Nothing about the review itself changed — the verdict below is the round's "
     "own.\n\n"
     "Submitting this review consumes the pending review request, so the daemon "
-    "will not look at this PR again on its own: **conclude or fix the checks and "
-    "re-request review**, and the next round can approve the same code on a "
-    "green head. No label was touched.\n\n"
+    "will not look at this PR again on its own: **fix the checks and push**, and "
+    "the next round reviews the new head. If they conclude green on the same "
+    "code, have an operator **re-request review**, and the next round can "
+    "approve it — the PR author's re-request on an unchanged head does not "
+    "start a round. No label was touched.\n\n"
 )
 
 # The operator page that follows a DEGRADED verdict, and the reason it exists:
@@ -703,12 +705,38 @@ CHECKS_UNSETTLED_PAGE = (
     "**This needs a human, because the loop cannot re-enter on its own.** "
     "Submitting that review consumed the pending review request, so this PR has "
     "left the daemon's attention set. Two ways forward:\n\n"
-    "1. conclude or fix the checks, then **re-request review from "
-    "`{reviewer}`** — the next round reviews the same code and can approve it on "
-    "a green head;\n"
+    "1. fix the checks and **push** — the next round reviews the new head; or, "
+    "once they conclude green on the same code, **re-request review from "
+    "`{reviewer}` as an operator** (the PR author's re-request on an unchanged "
+    "head does not start a round) — the next round can then approve it;\n"
     "2. merge with a recorded waiver, if the unsettled checks are known-broken "
     "rather than known-red.\n\n"
     "No label was touched and no further round is queued."
+)
+
+# Issue #214 / PR #215 round 1: the operator page for a same-head re-request
+# by the PR author that `_refuse_unchanged_head` turned away. The refusal is
+# the issue's ask; the SILENCE was not. Two flows used to re-enter that way
+# and now need a human: a CR8 triage-only round (every finding answered
+# `[triage:ignore]`, nothing pushed, and CR9 owes a fresh reviewer's re-judge)
+# and a red-checks REQUEST_CHANGES whose re-run went green on the same code.
+# Without this the PR sits in `review-requested:@me` with nobody told -- the
+# strand class CHECKS_UNSETTLED_PAGE exists for. One page per (head, verdict)
+# through the ping ledger (unchanged_head_kind), recorded after it lands.
+UNCHANGED_HEAD_PAGE = (
+    "**A re-review is owed on `{sha}`, and the loop will not start it on its "
+    "own.**\n\n"
+    "`{actor}` (the PR author) re-requested review from `{reviewer}` at {at}, "
+    "but nothing was pushed since this head's last verdict ({verdict_at}). A "
+    "same-head re-request by the author does not start a round (issue #214: "
+    "it carries no new evidence and used to loop identical verdicts). If that "
+    "re-request answered the findings by triage alone, or a CI re-run turned "
+    "the same code green, a fresh round is still owed. Two ways forward:\n\n"
+    "1. **push** a commit — the next round reviews the new head;\n"
+    "2. **re-request review from `{reviewer}` as an operator** — the next round "
+    "re-judges this same head.\n\n"
+    "This is the only page for this head and verdict. No label was touched "
+    "and no round is queued."
 )
 
 # Appended to `{bound}` above only when the hold was PROMOTED -- an unreadable
@@ -2505,6 +2533,18 @@ def checks_unsettled_kind(round_: int, head_sha: str) -> str:
     return f"checks-unsettled:{round_}:{head_sha}"
 
 
+def unchanged_head_kind(head_sha: str, verdict_at: float) -> str:
+    """The ping-ledger kind that dedupes ONE unchanged-head page.
+
+    Per (head, verdict): a later verdict on the same head (an operator's
+    re-request ran a round) followed by another author re-request is a new
+    strand and gets its own page. Recorded only AFTER the comment lands, so a
+    transient comment failure retries on the next pass -- unlike the degraded
+    verdict's page, the PR stays in the search here (the request is pending).
+    """
+    return f"unchanged-head:{head_sha}:{int(verdict_at)}"
+
+
 def checks_hold_kind(round_: int, head_sha: str) -> str:
     """The ping-ledger kind that dedupes ONE held round's activity line.
 
@@ -4201,6 +4241,7 @@ class ReviewWatcher:
         else:
             self._unchanged_heads[key] = (pr.head_sha, verdict_at)
             log.info(message, *args)
+        self._page_unchanged_head(pr, round_, newest, verdict_at)
         return Decision(
             Action.SKIPPED,
             f"head {short} is unchanged since its last verdict — the author's "
@@ -4208,6 +4249,50 @@ class ReviewWatcher:
             f"re-request",
             round_,
         )
+
+    def _page_unchanged_head(
+        self, pr: PullRequest, round_: int, newest: "ReviewRequest", verdict_at: float
+    ) -> None:
+        """Page the operator ONCE per (head, verdict) that a fresh round is
+        owed but refused (see UNCHANGED_HEAD_PAGE).
+
+        Gated through `_drift_gated`/`_note_drift_gate`: durable in production,
+        process-lifetime in dry-run, so a dry run neither posts nor silences
+        the production page. The ledger row lands after the comment, so a
+        failed post retries on the next pass (the request is still pending,
+        so the PR is still polled).
+        """
+        kind = unchanged_head_kind(pr.head_sha, verdict_at)
+        record = not self.config.dry_run
+        if self._drift_gated(pr, kind, record):
+            return
+        body = UNCHANGED_HEAD_PAGE.format(
+            sha=pr.head_sha[:8],
+            actor=newest.actor,
+            reviewer=self.github.login,
+            at=newest.at or "an unknown time",
+            verdict_at=_stamp(verdict_at),
+        )
+        if not record:
+            log.info(
+                "%s round %d: [dry-run] would page the operator that a re-review "
+                "is owed on unchanged head %s",
+                pr.slug, round_, pr.head_sha[:8],
+            )
+            self._note_drift_gate(pr, kind, record)
+            return
+        try:
+            self.github.comment(pr.owner, pr.repo, pr.number, body)
+        except RateLimited:
+            raise
+        except Exception as exc:
+            log.warning(
+                "%s round %d: could not post the unchanged-head page (%s); "
+                "retrying next pass",
+                pr.slug, round_, exc,
+            )
+            return
+        self._note_drift_gate(pr, kind, record)
 
     def _fresh_request(self, pr: PullRequest) -> "ReviewRequest | None":
         """The newest review request for this login, from the issue timeline,

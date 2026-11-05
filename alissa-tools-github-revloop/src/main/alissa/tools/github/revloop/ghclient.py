@@ -230,6 +230,10 @@ class PullRequest:
     # branch head itself and uses this only as the ref's fallback.
     base_ref: str = ""
     base_sha: str = ""
+    # When the PR was opened (ISO-8601, GitHub's clock). Unlike any commit
+    # date it cannot be rewritten, so ci.py's "before this PR" cut-off never
+    # moves later than this (PR #215 round 1).
+    created_at: str = ""
 
     @property
     def full_name(self) -> str:
@@ -826,6 +830,7 @@ class GitHub:
             body=str(data.get("body") or ""),
             base_ref=str((data.get("base") or {}).get("ref") or ""),
             base_sha=str((data.get("base") or {}).get("sha") or ""),
+            created_at=str(data.get("created_at") or ""),
         )
 
     def reviews(self, owner: str, repo: str, number: int) -> list[Review]:
@@ -963,11 +968,16 @@ class GitHub:
     def pull_request_first_commit_at(
         self, owner: str, repo: str, number: int
     ) -> str:
-        """The committer date of the PR's OLDEST commit (ISO-8601), or "".
+        """The AUTHOR date of the PR's OLDEST commit (ISO-8601), or "".
 
         One call: the commits listing is oldest first, so its first page of
         one is the answer. "Before this PR's first commit" is the cut-off the
-        `pull_request`-only lane of ci.py lists earlier runs against."""
+        `pull_request`-only lane of ci.py lists earlier runs against. The
+        author date, not the committer date: a rebase or amend rewrites the
+        committer date to the time of the rewrite, which would move the
+        cut-off later and let a run from a PR opened AFTER this one count as
+        earlier (PR #215 round 1). ci.py also caps it at the PR's
+        `created_at`. The committer date is only the fallback."""
         data = (
             self._api(
                 "-X", "GET", f"repos/{owner}/{repo}/pulls/{number}/commits",
@@ -979,8 +989,8 @@ class GitHub:
             return ""
         commit = (data[0] or {}).get("commit") or {}
         return str(
-            (commit.get("committer") or {}).get("date")
-            or (commit.get("author") or {}).get("date")
+            (commit.get("author") or {}).get("date")
+            or (commit.get("committer") or {}).get("date")
             or ""
         )
 

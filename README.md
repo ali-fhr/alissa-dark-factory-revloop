@@ -959,7 +959,10 @@ head `H` is admitted only when
   round, pushed or not, and on an unchanged head that is no new evidence:
   4R7e #102 got four identical verdicts on one head that way. A push, a
   request from anyone else, or one from an `operators` login re-arms. An event
-  with no `actor` admits, as an unreadable timeline does.
+  with no `actor` admits, as an unreadable timeline does. A refused request
+  pages the operator ONCE per (head, verdict): a triage-only fix round or a
+  CI re-run that went green on the same code still owes a round, and only a
+  push or an operator re-request starts it.
 
 And inside `verdict_cooldown_s` (default 120 s) of that verdict **nothing** is
 queued on `H`, whatever the timeline says. The cooldown alone would have
