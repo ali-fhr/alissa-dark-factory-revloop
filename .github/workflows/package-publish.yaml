@@ -1,11 +1,27 @@
 name: Python Package Publish
 
 # Publishing is irreversible: a version number, once on PyPI, can never be
-# reused even if the release is deleted. ANY merged PR touching the dist
-# subtree (or this file) runs the full build and upload; what prevents a
-# duplicate release is twine's --skip-existing on the upload, which lets
-# PyPI reject versions it already has. To release, bump the version file and
-# merge; to merge without releasing, touch nothing under the dist subtree.
+# reused even if the release is deleted.
+#
+# A MERGE IS NOT A RELEASE (issue #220; fleet upgrade safety §4.2). Every
+# merged pull request touching the dist subtree (or this file) starts this
+# workflow, but its first step compares the version file at the merge commit
+# with that commit's first parent. If the version is unchanged, the run ends
+# green, having built and uploaded nothing. Only a release pull request
+# changes the version file: one from release-train.yaml, or one labelled
+# release:critical (check-version-bump.yaml enforces both). Merging it is the
+# release.
+#
+# Release branches publish too. A release:critical fix is cut from the last
+# release tag onto a `release/X.Y.Z` branch, and its pull request merges THERE,
+# so that merge publishes. The branch is then merged back into main. That
+# merge changes main's version file to a version whose `v<version>` tag
+# already exists on another commit, so the gate ends it green, having done
+# nothing. `twine upload --skip-existing` stays as the backstop behind the gate.
+#
+# The `tag` job marks every published release with `v<version>` on its merge
+# commit. A critical release is cut from that tag. The tag job is the only job
+# with a write scope.
 
 on:
   pull_request:
@@ -16,10 +32,11 @@ on:
       - closed
     branches:
       - main
+      - 'release/**'
 
 # Least privilege: PyPI auth is TWINE_* env secrets, not the GitHub token, so
-# this job never needs write scope (back-ported from the devloop repo, review
-# finding on its PR #11).
+# the publishing job never needs write scope (back-ported from the devloop
+# repo, review finding on its PR #11). Only the `tag` job widens its own.
 permissions:
   contents: read
 
@@ -28,30 +45,79 @@ jobs:
     environment: PYPI Package Publishing
     strategy:
       matrix:
-        path:
-          - alissa-tools-github-revloop
+        include:
+          - path: alissa-tools-github-revloop
+            version_file: alissa-tools-github-revloop/src/main/alissa/tools/github/revloop/version
     if: github.event.pull_request.merged == true
     name: Python Package Build and Publish for ${{ matrix.path }}
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+      version: ${{ steps.gate.outputs.version }}
     steps:
       - name: Clone Repo
         uses: actions/checkout@v4
         with:
+          # The commit the merge put on the base branch, not the pull request's
+          # transient merge ref. Full history and tags: the gate reads the first
+          # parent and the release tags.
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
           submodules: true
+      - name: Did this merge change the version?
+        id: gate
+        env:
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          VERSION_FILE: ${{ matrix.version_file }}
+        run: python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --version-file "${VERSION_FILE}"
       - name: Install Python
+        if: steps.gate.outputs.publish == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install Build Tools
+        if: steps.gate.outputs.publish == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install build twine
       - name: Build
+        if: steps.gate.outputs.publish == 'true'
         run: (cd ${{ matrix.path }}; python -m build)
       - name: Check Metadata
+        if: steps.gate.outputs.publish == 'true'
         run: twine check ${{ matrix.path }}/dist/*
       - name: Publish
+        if: steps.gate.outputs.publish == 'true'
         env:
           TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
         run: twine upload --verbose --skip-existing ${{ matrix.path }}/dist/*
+
+  tag:
+    needs: python-publish
+    if: needs.python-publish.outputs.publish == 'true'
+    name: Tag the release v<version>
+    runs-on: ubuntu-latest
+    # The ONLY job with a write scope: it pushes one tag.
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      TAG: v${{ needs.python-publish.outputs.version }}
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - name: Push the tag (idempotent)
+        run: |
+          set -euo pipefail
+          if existing="$(git ls-remote --exit-code --tags origin "refs/tags/${TAG}")"; then
+            # A re-run after the first run tagged this same commit is fine. A tag on another
+            # commit is never moved: it marks what PyPI already serves.
+            echo "::notice::${TAG} already exists (${existing%%[[:space:]]*}); it is never moved."
+            exit 0
+          fi
+          git tag "${TAG}" "${SHA}"
+          git push origin "refs/tags/${TAG}"
+          echo "::notice::tagged ${SHA} as ${TAG}"

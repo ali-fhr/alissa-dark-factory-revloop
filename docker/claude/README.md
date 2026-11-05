@@ -251,7 +251,8 @@ true, all enforced on the pull request by `check-version-bump.yaml`:
 
 | rule | job |
 | --- | --- |
-| a PR that touches `docker/**` must bump the version file (as a PR that touches the dist already had to) — so every image change is a new release and a published tag is never overwritten | `Version Bump Check` |
+| a PR that touches `docker/**` (or the dist) adds a line under `## Unreleased` in the root `CHANGELOG.md` and does **not** bump: a merge is not a release (issue #220) | `Version Bump Check` |
+| only a `release/X.Y.Z` PR (opened by `release-train.yaml` at 16:00Z and 23:00Z) or a PR labelled `release:critical` changes the version file; merging it publishes the image, and a merge that leaves the version unchanged publishes nothing | `Version Bump Check` |
 | the version must not already be on PyPI | `Version Bump Check` |
 | the Dockerfile's `ARG REVLOOP_VERSION` default must equal the version file — a plain `docker build` installs the ARG default, and the two had drifted to `0.29.0` vs `0.31.7` | `dockerfile-pin-sync` |
 

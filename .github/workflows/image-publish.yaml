@@ -13,9 +13,18 @@ name: Container Image Publish
 #
 # ONE VERSION AXIS. The image version IS the package version in the
 # plain-text `version` file: the Dockerfile's `ARG REVLOOP_VERSION` default is
-# kept equal to it by check-version-bump.yaml, and a docker/** change cannot
-# merge without bumping it, so every image change is a new version and a
-# published tag is never overwritten.
+# kept equal to it by check-version-bump.yaml, and a published tag is never
+# overwritten.
+#
+# A MERGE IS NOT A RELEASE (issue #220; fleet upgrade safety §4.2). A docker/**
+# or dist change merges WITHOUT a bump, with a CHANGELOG `## Unreleased` line,
+# and this workflow's first step ends such a merge green, with nothing built or
+# pushed: it compares the version file at the merge commit with its first
+# parent. The change ships in the next release pull request
+# (release-train.yaml, or a release:critical fix), whose merge changes the
+# version and publishes. A release branch merged back into main changes main's
+# version to one already tagged `v<version>` on another commit. The gate ends
+# that run too, and the GHCR existence check below stays as the backstop.
 #
 # ORDER OF EVENTS on a merge. package-publish.yaml uploads the wheel to PyPI in
 # parallel with this workflow; the Dockerfile installs the daemon FROM PyPI, so
@@ -23,8 +32,9 @@ name: Container Image Publish
 # `publish` job builds. The push is idempotent: a version tag that already
 # exists on GHCR ends the run green without building or pushing anything.
 #
-# TRIGGER. Same shape as package-publish.yaml: a pull request CLOSED into main
-# that was MERGED. Nothing runs on unmerged code — the `if:` on the first job
+# TRIGGER. Same shape as package-publish.yaml: a pull request CLOSED into main,
+# or into a `release/**` branch (where a release:critical fix publishes), that
+# was MERGED. Nothing runs on unmerged code — the `if:` on the first job
 # gates every job behind it (the second `needs:` it). A failed run (PyPI
 # timeout, contract failure) is retried with the Actions "Re-run jobs" button.
 # A re-run after a partial push is safe because the push order makes the
@@ -49,6 +59,7 @@ on:
       - closed
     branches:
       - main
+      - 'release/**'
 
 # Default for every job; the publishing job widens its own to packages: write.
 permissions:
@@ -94,13 +105,15 @@ env:
 jobs:
   release:
     # The ONLY gate on unmerged code: a closed-but-not-merged pull request
-    # skips this job, and `publish` needs it.
+    # skips this job, and `publish` needs it. A merge that leaves the version
+    # file unchanged runs only the gate step below, and `publish` skips.
     if: github.event.pull_request.merged == true
     name: Release version and PyPI wait
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
+      publish: ${{ steps.gate.outputs.publish }}
       version: ${{ steps.version.outputs.version }}
       revision: ${{ steps.version.outputs.revision }}
     steps:
@@ -109,11 +122,25 @@ jobs:
         with:
           # The commit the merge put on main — what the image's
           # org.opencontainers.image.revision label names — not the
-          # pull request's transient merge ref.
+          # pull request's transient merge ref. Full history and tags: the
+          # gate reads the first parent and the release tags.
           ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
           submodules: true
 
+      - name: Did this merge change the version?
+        id: gate
+        # The same decision package-publish.yaml makes (release_train.py
+        # publish-gate). An unchanged version ends the whole run green here:
+        # every later step and the `publish` job are skipped. A re-run of a
+        # release whose tag package-publish already pushed still proceeds,
+        # because the tag names this same merge commit.
+        env:
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --version-file "${VERSION_FILE}"
+
       - name: Read the version of record
+        if: steps.gate.outputs.publish == 'true'
         id: version
         env:
           REVISION: ${{ github.event.pull_request.merge_commit_sha }}
@@ -139,6 +166,7 @@ jobs:
           echo "Publishing ${IMAGE}:${version} from ${REVISION}"
 
       - name: Wait until PyPI serves the release
+        if: steps.gate.outputs.publish == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         # The Dockerfile's `pip install ${DIST_NAME}==${VERSION}` is what the
@@ -185,6 +213,7 @@ jobs:
 
   publish:
     needs: release
+    if: needs.release.outputs.publish == 'true'
     name: Build, contract-test and push the image
     runs-on: ubuntu-latest
     # Publishes are serialized HERE, on the job, not on the workflow: the
