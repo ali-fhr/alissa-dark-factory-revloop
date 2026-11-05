@@ -4,6 +4,29 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.37
+
+- **Boot probe R1: the seat reports, once per boot, whether a review can be
+  requested** (issue #212, fleet-upgrade-safety lane UR-1; origin
+  TASK-60109621, implementation TASK-1262885983). This is the first release
+  carrying the probe, so it is revloop's `PROBES_SINCE`.
+  - New `probes.py`. R1 runs on the first completed poll and is held for the
+    process. It reads the review edge's own discovery search
+    (`ReviewWatcher._review_requests`, which `poll_once` now calls too). An
+    empty answer is `ok`, a 401/403 is `failed` with the status quoted. It
+    reads the first fed repo under the reviewer token (`permissions.pull`).
+    It also checks the spawn preconditions: `claude --version`,
+    `claude auth status`, a temporary file created and removed in the hub,
+    and tmux `start-server ; list-sessions`. No fed repo is `not_applicable`.
+    Details are one line, ≤ 300 chars, with held credentials and GitHub
+    token shapes redacted.
+  - `fleet_vitals.py` sends the §2.2 `probes` block on every daemon post
+    once the set has run. `probes` joins `OPTIONAL_BLOCKS`, so a Studio that
+    refuses it gets the snapshot without it. The console's push leaves it
+    out.
+  - Read-only: no review, comment, issue, PR, branch, label, task or session
+    is written. Runs only with `fleet_vitals_enabled` on, and in dry-run too.
+
 ## 0.31.36
 
 - **The seat image moves to loopwork base 0.6.1, which ships alissa CLI

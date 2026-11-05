@@ -31,3 +31,21 @@ def scratch_upgrade_dir(tmp_path_factory, monkeypatch):
     root = tmp_path_factory.mktemp("alissa-upgrade")
     monkeypatch.setenv("ALISSA_UPGRADE_DIR", str(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def isolated_boot_probes(monkeypatch):
+    """Keep the boot probes (issue #212) off the host for EVERY test.
+
+    A watcher with fleet vitals on runs R1 on its first completed pass, and
+    R1's spawn legs shell out to `claude` and to tmux on the reviewers' own
+    socket. A test that is not about the probe must not start the
+    developer's (or the CI runner's) tmux server or read its Claude login, so
+    the probe's default runner refuses; `test_probes.py` passes its own."""
+    from alissa.tools.github.revloop import probes
+    from alissa.tools.github.revloop.proc import CommandError
+
+    def refuse(argv, **kwargs):
+        raise CommandError(argv, -1, "not run in tests")
+
+    monkeypatch.setattr(probes, "proc_run", refuse)
