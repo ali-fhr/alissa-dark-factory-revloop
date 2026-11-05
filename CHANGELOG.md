@@ -4,6 +4,35 @@ Releases of `alissa-tools-github-revloop`. The version of record is the
 plain-text `version` file next to `version.py`; entries here start at 0.30.1
 (earlier releases are described by their merge commits).
 
+## 0.31.40
+
+- **A seat whose rollback could not reinstall no longer reads as rolled
+  back, and is no longer stuck until something restarts it** (issue #218,
+  the `[minor]` left on the approving review of PR #217; origin
+  TASK-532050004, implementation TASK-854842980).
+  - The boot step's `rollback_failed` (either kind: a Studio-asked
+    rollback or an unconfirmed upgrade) adds the version it failed to
+    leave to `skip` and records `lastError`, but leaves NO `upgradeFailed`
+    report. The seat still runs that version, and Studio would read a
+    report for it as a rollback that landed. An undelivered report already
+    in the file is kept. The report is left when a retry lands
+    (`rolled_back`).
+  - The daemon retries the reinstall itself. A self-hosted seat
+    (`autoUpgrade` on, not paused) that runs the version a `rollback_failed`
+    file names as the one to leave keeps reviewing for 30 min
+    (`ROLLBACK_RETRY_AFTER_S`, counted from when the process first saw the
+    state), then drains (hold `rollback_retry`) and, at idle, writes
+    `state: rollback_retry` with `rollbackRetries` counted and exits. The
+    exit tail restarts the container (exit 75) on that state, and the boot
+    step treats it as `rollback_failed`. A Studio-asked rollback is
+    retried only while Studio still names the running version in
+    `rollback.from`. A newer upgrade target beats the retry.
+  - At most 2 retry exits per failed rollback (`ROLLBACK_RETRY_EXITS`),
+    then one WARNING and the seat stays where it is. A new rollback
+    request resets the count.
+  - Excursion beyond the issue's declared scope: `self_upgrade.py` (the
+    daemon half of the retry) and its test file.
+
 ## 0.31.39
 
 - **A self-hosted seat rolls back when Studio's vitals answer names its

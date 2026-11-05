@@ -30,7 +30,12 @@ behave the same way. What is pinned:
     version, it drains, writes `target = previous` with the running
     version skipped, exits at idle, the boot installs `previous` and the
     daemon there reports `upgradeFailed` once; naming another version, or
-    with `autoUpgrade` off, nothing happens.
+    with `autoUpgrade` off, nothing happens;
+  * a failed rollback (issue #218) -- the boot leaves no `upgradeFailed`
+    report while the seat still runs the version it failed to leave; the
+    daemon there drains for a retry exit after `ROLLBACK_RETRY_AFTER_S`,
+    inside the usual exit gates, at most `ROLLBACK_RETRY_EXITS` times, and
+    the report is owed once a retry lands.
 """
 
 from __future__ import annotations
@@ -921,7 +926,8 @@ def test_a_rollback_whose_reinstall_fails_is_retried_next_boot(seat):
     assert proc.returncode == 0, proc.stderr
     data = seat.read()
     assert data["state"] == "rollback_failed" and data["skip"] == [TARGET]
-    assert f"could not reinstall {PREVIOUS}" in data["upgradeFailed"]["reason"]
+    assert f"could not reinstall {PREVIOUS}" in data["lastError"]
+    assert "upgradeFailed" not in data, "the seat still runs the target: no report (issue #218)"
     assert (seat.site / f"{DIST_DIR}-{TARGET}.dist-info").exists()
 
     seat.fail = ""
@@ -940,23 +946,23 @@ def test_a_rollback_whose_reinstall_fails_is_retried_next_boot(seat):
 
 
 @bash_only
-def test_a_rollback_report_already_sent_is_not_owed_again_unchanged(tmp_path):
+def test_a_failed_reinstall_keeps_an_undelivered_report_and_adds_none(tmp_path):
+    """Issue #218: a `rollback_failed` boot leaves the file's report alone --
+    an undelivered one for another version survives, and none is written
+    for the version the seat still runs."""
     seat = Seat(tmp_path, installed=TARGET)  # the failed rollback left it on the target
     data = request()
     data.update(state="rollback_failed", boots=2, skip=[TARGET],
                 rollbackReason="not confirmed after 2 boots",
-                upgradeFailed={"version": TARGET, "reason": "x"},
-                upgradeFailedReported=True)
+                upgradeFailed={"version": "0.31.30", "reason": "x"},
+                upgradeFailedReported=False)
     seat.write(data)
     seat.fail = PREVIOUS
-    seat.boot()
-    first = seat.read()
-    assert first["state"] == "rollback_failed"
-    assert first["upgradeFailedReported"] is False, "the reason changed: owed again"
-    first["upgradeFailedReported"] = True
-    seat.write(first)
-    seat.boot()
-    assert seat.read()["upgradeFailedReported"] is True, "same report: not re-sent"
+    assert seat.boot().returncode == 0
+    data = seat.read()
+    assert data["state"] == "rollback_failed"
+    assert data["upgradeFailed"] == {"version": "0.31.30", "reason": "x"}
+    assert data["upgradeFailedReported"] is False
 
 
 @bash_only
@@ -1074,6 +1080,7 @@ def test_the_full_cycle_daemon_request_boot_install_confirm(seat):
 @bash_only
 @pytest.mark.parametrize("state, rc, expected", [
     ("requested", "0", 75), ("confirmed", "0", 0), ("requested", "3", 3),
+    ("rollback_retry", "0", 75), ("rollback_failed", "0", 0),
 ])
 def test_the_container_exits_75_after_a_self_upgrade_exit(seat, state, rc, expected):
     script = "log() { printf '[entrypoint] %s\\n' \"$*\" >&2; }\n"
@@ -1430,7 +1437,8 @@ def test_a_rollback_reinstall_that_fails_is_retried_next_boot(tmp_path):
     assert seat.boot().returncode == 0
     data = seat.read()
     assert data["state"] == "rollback_failed" and RUNNING in data["skip"]
-    assert f"could not reinstall {PREVIOUS}" in data["upgradeFailed"]["reason"]
+    assert f"could not reinstall {PREVIOUS}" in data["lastError"]
+    assert "upgradeFailed" not in data, "still on RUNNING: nothing reads as rolled back"
     assert (seat.site / f"{DIST_DIR}-{RUNNING}.dist-info").exists()
 
     # The daemon still on RUNNING does not drain for the same rollback again.
@@ -1463,3 +1471,167 @@ def test_an_ordinary_request_to_an_older_version_is_still_refused(seat):
     seat.write(request(version="0.31.20", previous=RUNNING))
     assert seat.boot().returncode == 0
     assert seat.pip_calls() == [] and seat.read()["state"] == "not_newer"
+
+
+# -- a failed rollback is retried by a bounded exit (issue #218) ----------------
+
+class Clock:
+    def __init__(self, t=1_800_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def failed_rollback(tmp_path, *, studio=True, retries=0):
+    """The file a boot leaves when it could not reinstall PREVIOUS and the
+    seat still runs RUNNING: a Studio-asked rollback, or an unconfirmed
+    upgrade previous → running (AU-5)."""
+    if studio:
+        data = {"target": {"version": PREVIOUS, "digest": None}, "previous": RUNNING,
+                "rollback": {"from": RUNNING, "reason": WHY}}
+    else:
+        data = {"target": {"version": RUNNING, "digest": "sha256:ab"}, "previous": PREVIOUS,
+                "rollbackReason": "not confirmed after 2 boots"}
+    data.update({"requestedAt": "2027-01-15T08:00:00Z", "state": "rollback_failed",
+                 "confirmed": False, "boots": 2, "skip": [RUNNING],
+                 "lastError": f"could not reinstall {PREVIOUS} (pip said no)"})
+    if retries:
+        data["rollbackRetries"] = retries
+    write_file(tmp_path, data)
+
+
+def stuck_upgrader(tmp_path, clock, studio=True):
+    up = SelfUpgrader(RUNNING, directory=str(tmp_path), clock=clock)
+    up.observe(rolled() if studio else answer(version=RUNNING))
+    return up
+
+
+@pytest.mark.parametrize("studio", [True, False], ids=["studio-rollback", "unconfirmed-upgrade"])
+def test_a_failed_rollback_drains_for_a_retry_exit_after_the_delay(tmp_path, studio, caplog):
+    caplog.set_level(logging.INFO, logger=mod.__name__)
+    failed_rollback(tmp_path, studio=studio)
+    clock = Clock()
+    up = stuck_upgrader(tmp_path, clock, studio)
+    assert up.hold() is None, "the seat keeps reviewing until the delay passes"
+    assert up.after_pass([]) == NONE
+    clock.t += mod.ROLLBACK_RETRY_AFTER_S - 1
+    assert up.after_pass([]) == NONE and up.hold() is None
+    clock.t += 1
+    assert up.after_pass(BUSY) == WAIT
+    assert up.hold() == mod.HOLD_RETRY
+    assert f"retry the failed rollback {RUNNING} → {PREVIOUS}" in up.hold_detail()
+    assert up.after_pass([]) == WAIT
+    assert up.after_pass([]) == EXIT and up.exit_requested
+    data = read_file(tmp_path)
+    assert data["state"] == "rollback_retry" and data["rollbackRetries"] == 1
+    assert data["skip"] == [RUNNING] and "upgradeFailed" not in data
+    assert sum("retrying it in 30 min" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("change", ["paused", "auto-off", "managed", "studio-withdrew"])
+def test_a_failed_rollback_is_not_retried_outside_the_exit_gates(tmp_path, change):
+    failed_rollback(tmp_path)
+    clock = Clock()
+    up = SelfUpgrader(RUNNING, directory=str(tmp_path), clock=clock)
+    payload = {
+        "paused": answer(version=RUNNING, paused=True, rollback={"from": RUNNING}),
+        "auto-off": answer(version=RUNNING, auto=False, rollback={"from": RUNNING}),
+        "managed": answer("managed", version=RUNNING, rollback={"from": RUNNING}),
+        "studio-withdrew": answer(version=RUNNING),
+    }[change]
+    up.observe(payload)
+    clock.t += mod.ROLLBACK_RETRY_AFTER_S * 2
+    for _ in range(3):
+        assert up.after_pass([]) == NONE
+    assert up.hold() is None and read_file(tmp_path)["state"] == "rollback_failed"
+
+
+def test_a_failed_rollback_gets_at_most_two_retry_exits(tmp_path, caplog):
+    failed_rollback(tmp_path, retries=mod.ROLLBACK_RETRY_EXITS)
+    clock = Clock()
+    up = stuck_upgrader(tmp_path, clock)
+    clock.t += mod.ROLLBACK_RETRY_AFTER_S * 2
+    for _ in range(3):
+        assert up.after_pass([]) == NONE
+    assert up.hold() is None
+    warned = [r for r in caplog.records if "not retrying again" in r.getMessage()]
+    assert len(warned) == 1 and warned[0].levelno == logging.WARNING
+
+
+def test_a_retry_the_boot_never_acted_on_still_counts(tmp_path):
+    """A `rollback_retry` a later process on the same version finds was
+    never served by the boot step: retried again, but within the cap."""
+    failed_rollback(tmp_path, retries=1)
+    data = read_file(tmp_path)
+    data["state"] = "rollback_retry"
+    write_file(tmp_path, data)
+    clock = Clock()
+    up = stuck_upgrader(tmp_path, clock)
+    clock.t += mod.ROLLBACK_RETRY_AFTER_S
+    up.after_pass([])
+    assert up.after_pass([]) == EXIT
+    assert read_file(tmp_path)["rollbackRetries"] == 2
+    again = stuck_upgrader(tmp_path, clock)
+    clock.t += mod.ROLLBACK_RETRY_AFTER_S
+    assert again.after_pass([]) == NONE and again.hold() is None
+
+
+def test_a_newer_target_beats_the_retry(tmp_path):
+    failed_rollback(tmp_path, studio=False)
+    clock = Clock()
+    up = SelfUpgrader(RUNNING, directory=str(tmp_path), clock=clock)
+    up.observe(answer(version=TARGET))
+    assert up.hold() == HOLD_UPGRADE
+
+
+def test_a_new_rollback_request_resets_the_retry_count(tmp_path):
+    confirmed_upgrade(tmp_path)
+    data = read_file(tmp_path)
+    data["rollbackRetries"] = 2
+    write_file(tmp_path, data)
+    up = SelfUpgrader(RUNNING, directory=str(tmp_path))
+    up.observe(rolled())
+    up.after_pass([])
+    assert up.after_pass([]) == EXIT
+    assert "rollbackRetries" not in read_file(tmp_path)
+
+
+@bash_only
+@pytest.mark.parametrize("studio", [True, False], ids=["studio-rollback", "unconfirmed-upgrade"])
+def test_the_retry_exit_restarts_the_container_and_the_boot_retries(tmp_path, studio):
+    seat = Seat(tmp_path, installed=RUNNING)
+    failed_rollback(seat.dir, studio=studio)
+    clock = Clock()
+
+    def retry_exit():
+        up = stuck_upgrader(seat.dir, clock, studio)
+        clock.t += mod.ROLLBACK_RETRY_AFTER_S
+        up.after_pass([])
+        assert up.after_pass([]) == EXIT
+        script = "log() { printf '[entrypoint] %s\\n' \"$*\" >&2; }\nDAEMON_RC=0\n"
+        script += lift("# >>> self_upgrade_exit", "# <<< self_upgrade_exit")
+        script += '\nexit "${DAEMON_RC}"\n'
+        proc = subprocess.run(["bash", "-c", script], env=seat.env(),
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 75
+
+    # Retry 1: PyPI still refuses -- rollback_failed again, still no report.
+    retry_exit()
+    seat.fail = PREVIOUS
+    assert seat.boot().returncode == 0
+    data = seat.read()
+    assert data["state"] == "rollback_failed" and data["rollbackRetries"] == 1
+    assert "upgradeFailed" not in data
+    assert (seat.site / f"{DIST_DIR}-{RUNNING}.dist-info").exists()
+
+    # Retry 2 lands: rolled back, and now the report is owed.
+    retry_exit()
+    seat.fail = ""
+    assert seat.boot().returncode == 0
+    assert seat.pip_calls()[-1].endswith(f"{DIST}=={PREVIOUS}")
+    data = seat.read()
+    assert data["state"] == "rolled_back" and data["skip"] == [RUNNING]
+    assert data["upgradeFailed"]["version"] == RUNNING
+    assert data["upgradeFailed"]["reason"].startswith(f"rolled back to {PREVIOUS}: ")
+    assert data["upgradeFailedReported"] is False
