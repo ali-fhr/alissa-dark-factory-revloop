@@ -9,10 +9,17 @@ rule below:
                 CHANGELOG.md line under `## Unreleased`. The version file may change only on a
                 `release/X.Y.Z` branch of this repository, where X.Y.Z must equal the new version,
                 or on a pull request labelled `release:critical`.
-  publish-gate  package-publish.yaml and image-publish.yaml. Publish only when the version file at
-                the merge commit differs from its first parent, and the `v<version>` tag is absent
-                or names this same commit (a re-run). The tag names another commit when this merge
-                is a release branch merged back into main, and that version is already out.
+  publish-gate  package-publish.yaml and image-publish.yaml. Publish only when the merge changed the
+                version file, and the `v<version>` tag is absent or names this same commit (a
+                re-run). The tag names another commit when this merge is a release branch merged
+                back into main, and that version is already out. "The merge changed it" is: the
+                version at the merge commit differs from its first parent, OR the pull request's
+                own head changes it against its fork point from the base branch. The first is exact
+                for a merge commit and a squash merge. A REBASE merge of several commits puts the
+                bump in whichever rebased commit carried it, so the first parent of the last one may
+                already hold the new version; the second leg (with --head-sha) catches that.
+                Without --head-sha, or when its commit cannot be read, the gate assumes a merge
+                commit or a squash merge and says so.
   cut           release-train.yaml. Move the `## Unreleased` entries under `## X.Y.Z (date)`, bump
                 the version file (patch, or minor when a bullet starts with `[minor]`) and sync the
                 Dockerfile ARG. When there is nothing to release, it changes nothing.
@@ -165,7 +172,7 @@ def sync_arg(dockerfile: str, arg: str, version: str) -> str:
 def decide(changed: Sequence[str], *, dist_prefix: str, test_prefix: str, image_prefix: str,
            version_file: str, head_ref: str, base_ref: str, same_repo: bool, labels: Sequence[str],
            head_version: Optional[str], base_changelog: str, head_changelog: str,
-           tag_exists: bool) -> Dict[str, object]:
+           tag_exists: bool, tag_elsewhere: bool = False) -> Dict[str, object]:
     """The check-version-bump.yaml verdict on one pull request. It is pure, so tests drive it."""
     published = [path for path in changed
                  if (path.startswith(dist_prefix) and not path.startswith(test_prefix))
@@ -216,12 +223,18 @@ def decide(changed: Sequence[str], *, dist_prefix: str, test_prefix: str, image_
                 f'unlisted change would ship unannounced in some later release.')
 
     # A release branch merged back into main carries a version that its own branch already
-    # published: the tag exists. The PyPI-exists rule would refuse it, and the publish runs on
-    # main stop at publish-gate, so the merge-back is exempt.
+    # published: the tag exists AND the head descends from it. The PyPI-exists rule would refuse
+    # it, and the publish runs on main stop at publish-gate, so the merge-back is exempt. A
+    # `tag_exists` caller must check the ancestry (cmd_guard does): a release/X.Y.Z branch reused
+    # for another tree, whose head does not contain the tag, is a new release of an already-used
+    # number and stays held to the PyPI-exists rule.
     merge_back = version_changed and release_branch and tag_exists and not base_ref.startswith(RELEASE_PREFIX)
     if merge_back:
         notices.append(f'{head_ref} merges back a release already tagged {TAG_PREFIX}{head_version}: the '
                        f'PyPI-exists check is skipped and the publish runs on the merge do nothing.')
+    elif version_changed and release_branch and tag_elsewhere:
+        notices.append(f'{TAG_PREFIX}{head_version} is tagged on a commit {head_ref} does not descend from: '
+                       f'this is not a merge-back of that release, so the PyPI-exists check runs.')
     return {
         'ok': not errors,
         'errors': errors,
@@ -235,13 +248,27 @@ def decide(changed: Sequence[str], *, dist_prefix: str, test_prefix: str, image_
 # ---- the publish gate ---------------------------------------------------------------------------
 
 def publish_decision(parent_version: Optional[str], version: Optional[str], tag_commit: Optional[str],
-                     sha: str) -> Tuple[bool, str]:
-    if version == parent_version:
+                     sha: str, pr_change: Optional[Tuple[Optional[str], Optional[str]]] = None,
+                     ) -> Tuple[bool, str]:
+    """(publish?, why). `pr_change` is (version at the fork point, version at the pull request head).
+
+    None means the head was not available, and the first-parent comparison decides alone: exact for
+    a merge commit or a squash merge, not for a multi-commit rebase merge.
+    """
+    pr_moved = pr_change is not None and pr_change[0] != pr_change[1]
+    if version == parent_version and not pr_moved:
+        assumed = '' if pr_change is not None else (
+            ' (first-parent comparison only: exact for a merge commit or a squash merge, not for a '
+            'rebase merge whose bump sits in an earlier rebased commit)')
         return False, (f'the version file is unchanged at {version or "<missing>"}: this merge is not a '
-                       f'release, so nothing is published')
+                       f'release, so nothing is published{assumed}')
     if tag_commit and tag_commit != sha:
         return False, (f'{TAG_PREFIX}{version} is already tagged at {tag_commit[:12]}: this merge brings an '
                        f'already-published release back onto its branch, so nothing new is published')
+    if version == parent_version and pr_change is not None:  # so pr_moved: a rebase merge
+        return True, (f'the pull request moves the version file {pr_change[0] or "<missing>"} -> '
+                      f'{pr_change[1] or "<missing>"} in a commit before the last one (a rebase merge): '
+                      f'publishing {version}')
     return True, f'the version file moves {parent_version or "<missing>"} -> {version}: publishing {version}'
 
 
@@ -261,6 +288,16 @@ def _first_line(text: Optional[str]) -> Optional[str]:
         return None
     lines = text.splitlines()
     return (lines[0].strip() if lines else '') or None
+
+
+def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    return subprocess.run(['git', 'merge-base', '--is-ancestor', ancestor, descendant],
+                          capture_output=True).returncode == 0
+
+
+def _commit(rev: str) -> Optional[str]:
+    out = _git('rev-parse', '-q', '--verify', f'{rev}^{{commit}}')
+    return out.strip() if out else None
 
 
 def _tag_commit(version: Optional[str]) -> Optional[str]:
@@ -292,13 +329,15 @@ def cmd_guard(args: argparse.Namespace) -> int:
         changed = [line.strip() for line in handle if line.strip()]
     labels = json.loads(args.labels or '[]') or []
     head_version = _first_line(_show(args.head_sha, args.version_file))
+    tag_commit = _tag_commit(head_version)
+    tag_in_head = tag_commit is not None and _is_ancestor(tag_commit, args.head_sha)
     verdict = decide(
         changed, dist_prefix=args.dist_prefix, test_prefix=args.test_prefix, image_prefix=args.image_prefix,
         version_file=args.version_file, head_ref=args.head_ref, base_ref=args.base_ref,
         same_repo=args.same_repo == 'true', labels=labels, head_version=head_version,
         base_changelog=_show(args.base_sha, args.changelog) or '',
         head_changelog=_show(args.head_sha, args.changelog) or '',
-        tag_exists=_tag_commit(head_version) is not None)
+        tag_exists=tag_in_head, tag_elsewhere=tag_commit is not None and not tag_in_head)
     for notice in cast(List[str], verdict['notices']):
         print(f'::notice::{notice}')
     for error in cast(List[str], verdict['errors']):
@@ -311,7 +350,16 @@ def cmd_guard(args: argparse.Namespace) -> int:
 def cmd_publish_gate(args: argparse.Namespace) -> int:
     version = _first_line(_show(args.sha, args.version_file))
     parent_version = _first_line(_show(f'{args.sha}^1', args.version_file))
-    publish, why = publish_decision(parent_version, version, _tag_commit(version), args.sha)
+    pr_change: Optional[Tuple[Optional[str], Optional[str]]] = None
+    head = _commit(args.head_sha) if args.head_sha else None
+    fork = _git('merge-base', head, f'{args.sha}^1') if head else None
+    if head and fork:
+        pr_change = (_first_line(_show(fork.strip(), args.version_file)), _first_line(_show(head, args.version_file)))
+    elif args.head_sha:
+        print(f'::warning::the pull request head {args.head_sha[:12]} cannot be read here: the gate compares '
+              f'the merge commit with its first parent only, which misses a bump in an earlier commit of a '
+              f'rebase merge')
+    publish, why = publish_decision(parent_version, version, _tag_commit(version), args.sha, pr_change)
     print(f'::notice::{why}')
     if not publish:
         _summary(f'## Nothing published\n\n{why}.\n')
@@ -360,6 +408,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gate = sub.add_parser('publish-gate', help='publish only on a version change')
     gate.add_argument('--sha', required=True)
     gate.add_argument('--version-file', required=True)
+    gate.add_argument('--head-sha', default='',
+                      help="the pull request's head commit, so a rebase merge's earlier bump is seen")
     gate.set_defaults(func=cmd_publish_gate)
 
     cut = sub.add_parser('cut', help='move ## Unreleased under a new release heading')

@@ -6,7 +6,8 @@ name: Python Package Publish
 # A MERGE IS NOT A RELEASE (issue #220; fleet upgrade safety §4.2). Every
 # merged pull request touching the dist subtree (or this file) starts this
 # workflow, but its first step compares the version file at the merge commit
-# with that commit's first parent. If the version is unchanged, the run ends
+# with that commit's first parent, and the pull request head with its fork
+# point (a rebase merge, issue #222). If the version is unchanged, the run ends
 # green, having built and uploaded nothing. Only a release pull request
 # changes the version file: one from release-train.yaml, or one labelled
 # release:critical (check-version-bump.yaml enforces both). Merging it is the
@@ -68,8 +69,19 @@ jobs:
         id: gate
         env:
           SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
           VERSION_FILE: ${{ matrix.version_file }}
-        run: python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --version-file "${VERSION_FILE}"
+        run: |
+          set -euo pipefail
+          # The pull request's head, so the gate also sees a bump in an earlier commit of a
+          # rebase merge (the first parent of the last rebased commit may already carry it).
+          # GitHub keeps refs/pull/<n>/head after the merge; without it the gate warns and
+          # falls back to the first-parent comparison.
+          git fetch --no-tags --quiet origin "+refs/pull/${PR}/head:refs/remotes/pull/${PR}/head" \
+            || echo "::warning::could not fetch refs/pull/${PR}/head"
+          python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --head-sha "${HEAD_SHA}" \
+            --version-file "${VERSION_FILE}"
       - name: Install Python
         if: steps.gate.outputs.publish == 'true'
         uses: actions/setup-python@v5

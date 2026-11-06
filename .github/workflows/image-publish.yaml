@@ -137,7 +137,18 @@ jobs:
         # because the tag names this same merge commit.
         env:
           SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        run: python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --version-file "${VERSION_FILE}"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # The pull request's head, so the gate also sees a bump in an earlier commit of a
+          # rebase merge (the first parent of the last rebased commit may already carry it).
+          # GitHub keeps refs/pull/<n>/head after the merge; without it the gate warns and
+          # falls back to the first-parent comparison.
+          git fetch --no-tags --quiet origin "+refs/pull/${PR}/head:refs/remotes/pull/${PR}/head" \
+            || echo "::warning::could not fetch refs/pull/${PR}/head"
+          python3 .github/scripts/release_train.py publish-gate --sha "${SHA}" --head-sha "${HEAD_SHA}" \
+            --version-file "${VERSION_FILE}"
 
       - name: Read the version of record
         if: steps.gate.outputs.publish == 'true'
