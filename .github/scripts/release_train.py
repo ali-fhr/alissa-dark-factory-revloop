@@ -253,13 +253,19 @@ def publish_decision(parent_version: Optional[str], version: Optional[str], tag_
     """(publish?, why). `pr_change` is (version at the fork point, version at the pull request head).
 
     None means the head was not available, and the first-parent comparison decides alone: exact for
-    a merge commit or a squash merge, not for a multi-commit rebase merge.
+    a merge commit or a squash merge, not for a multi-commit rebase merge. The rebase leg counts only
+    when the head's version is the merged one: a bump that conflict resolution replaced did not land.
     """
-    pr_moved = pr_change is not None and pr_change[0] != pr_change[1]
+    pr_moved = pr_change is not None and pr_change[0] != pr_change[1] and pr_change[1] == version
     if version == parent_version and not pr_moved:
-        assumed = '' if pr_change is not None else (
-            ' (first-parent comparison only: exact for a merge commit or a squash merge, not for a '
-            'rebase merge whose bump sits in an earlier rebased commit)')
+        if pr_change is None:
+            assumed = (' (first-parent comparison only: exact for a merge commit or a squash merge, not for '
+                       'a rebase merge whose bump sits in an earlier rebased commit)')
+        elif pr_change[0] != pr_change[1]:
+            assumed = (f' (the pull request moved it {pr_change[0] or "<missing>"} -> '
+                       f'{pr_change[1] or "<missing>"}, but that is not the version that landed)')
+        else:
+            assumed = ''
         return False, (f'the version file is unchanged at {version or "<missing>"}: this merge is not a '
                        f'release, so nothing is published{assumed}')
     if tag_commit and tag_commit != sha:
