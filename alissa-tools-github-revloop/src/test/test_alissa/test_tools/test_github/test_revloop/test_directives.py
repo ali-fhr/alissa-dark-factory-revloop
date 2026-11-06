@@ -439,8 +439,9 @@ def test_the_code_directives_are_untouched_by_the_plan_lane():
 # clause is load-bearing. The code directives are pinned beside it -- issue
 # #179 c5 is that the light lane leaves them byte for byte as they were.
 # Re-pinned all three for issue #208 (the transcript push before the kill);
-# the light one again for issue #227 (the content-error rule).
-LIGHT_TEMPLATE_SHA256 = "c271dd63f6b0b5c05210aa492aa891e86422ed9c67210650f72c768106155694"
+# the light one again for issue #227 (the content-error rule) and #229
+# (the exclusive approve).
+LIGHT_TEMPLATE_SHA256 = "095add9545218815084ff072c46aa384317dfab249f4f94abee47d5c6df128a0"
 CODE_TEMPLATE_SHA256 = {
     "round-1": "707eca8cfe9c0b541ddef4cba1349b121473fb92f24bc7e3759c95d874b3acd5",
     "round-k": "9dbc8c2260a90e5be77dc269930d36442618d34081955e020eeda1a0f96a12df",
@@ -511,11 +512,22 @@ def test_the_light_directive_makes_a_content_error_a_change_request():
         assert kind in text
     assert "whatever tag fits it — `[minor]` included" in text
     assert "your verdict is request_changes, never an approve with the finding attached" in text
-    assert "wording and style `[nit]`s may ride an approve" in text
+    assert "wording and style `[nit]`s ride it" in text
     assert f"`{DISCOVERY_NITS_NOT_FOLLOWED_UP}`" in text
     assert "`- **Content-Errors:** <n>`" in text
     # The cap is untouched.
     assert "THIS IS THE ONLY ROUND" in text and "the light round's cap is 1" in text
+
+
+def test_the_light_directive_makes_the_approve_exclusive():
+    """Issue #229: an approve carries nothing above a wording/style nit, so
+    the not-followed-up line is true of everything it carries -- a
+    non-content `[minor]` is a change request too."""
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert "AN APPROVE IS EXCLUSIVE" in text
+    assert "it may carry nothing above a wording or style `[nit]`" in text
+    assert "any other open finding — a content error or not" in text
+    assert text.index("AN APPROVE IS EXCLUSIVE") < text.index(DISCOVERY_NITS_NOT_FOLLOWED_UP)
 
 
 @pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE, *PLAN_TEMPLATES])
