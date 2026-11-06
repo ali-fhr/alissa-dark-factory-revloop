@@ -16,6 +16,8 @@ header).
 
 ## Unreleased
 
+## 0.31.42 (2026-11-06)
+
 - **A content error in a discovery findings file is a change request**
   (issue #227; origin TASK-501260812, implementation TASK-946384037). A
   findings file cannot change after the merge, so `DISCOVERY_LIGHT_DIRECTIVE`
