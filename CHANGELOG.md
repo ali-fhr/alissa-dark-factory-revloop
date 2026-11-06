@@ -16,6 +16,17 @@ header).
 
 ## Unreleased
 
+- **A content error in a discovery findings file is a change request**
+  (issue #227; origin TASK-501260812, implementation TASK-946384037). A
+  findings file cannot change after the merge, so `DISCOVERY_LIGHT_DIRECTIVE`
+  now tells the reviewer to request changes on any finding that says the file
+  is false, contradicts the code it cites, or leaves a listed risk with no
+  task, whatever its tag. An approve may carry only wording nits, says they
+  will not be followed up, and records `Content-Errors: <n>` in its envelope.
+  When the daemon posts the verdict itself, an approve envelope with a count
+  above 0 posts as `REQUEST_CHANGES`. The round cap and code PR reviews are
+  unchanged.
+
 ## 0.31.41 (2026-11-06)
 
 - **A merge is no longer a release** (issue #220, fleet upgrade safety

@@ -190,10 +190,12 @@ def test_the_envelope_has_no_class_field_of_its_own():
     the class back off the emitted line -- a field here would be a second
     copy nothing reads, free to drift. The Commit-Readiness pair (issue
     #148) follows the same rule: a value and a reason, no class. The
-    contract version (issue #155) is the envelope's own line, not a class."""
+    contract version (issue #155) and the content-error count (issue #227)
+    are the envelope's own lines, not a class."""
     assert [f.name for f in dataclasses.fields(VerdictEnvelope)] == [
         "verdict", "readiness", "readiness_reason",
         "commit_readiness", "commit_readiness_reason", "contract_version",
+        "content_errors",
     ]
 
 

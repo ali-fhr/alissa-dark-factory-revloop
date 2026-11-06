@@ -20,6 +20,12 @@ integration check's report: the plans repository, the integration-check
 marker, every changed path under `integration-check/` -- no round (c1); a
 marked PR touching anything else is reviewed under the code directive (c2);
 `integration_check_review: true` reviews every one (c3). No light round.
+
+Issue #227: a discovery PR's findings file is immutable once merged, so a
+content error at any tag is a change request. The light directive says so;
+an approve envelope that counts an open content error (`Content-Errors: n`,
+n > 0) posts as REQUEST_CHANGES, and an approve that stands carries the line
+saying its wording nits will not be followed up. Code PRs post as before.
 """
 
 from __future__ import annotations
@@ -46,19 +52,29 @@ from alissa.tools.github.revloop.ghclient import (
     rollup_of,
 )
 from alissa.tools.github.revloop.loop import (
+    DISCOVERY_CONTENT_LEAD,
     DISCOVERY_LIGHT_DIRECTIVE,
     DISCOVERY_MARKER,
+    DISCOVERY_NITS_NOT_FOLLOWED_UP,
     DISCOVERY_REVIEW_LIGHT,
     DISCOVERY_REVIEW_NONE,
     INTEGRATION_CHECK_MARKER,
     Action,
     ReviewWatcher,
+    discovery_content_gate,
     discovery_marked,
     discovery_review_line,
     discovery_skip_kind,
     integration_check_marked,
     integration_check_skip_kind,
     outside_discovery_prefix,
+)
+from alissa.tools.github.revloop.alissa import (
+    READINESS_AUTO,
+    VERDICT_APPROVE,
+    VERDICT_REQUEST_CHANGES,
+    VerdictEnvelope,
+    parse_content_errors,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
@@ -71,8 +87,12 @@ from test_loop import (  # the fakes and the PR scenario the loop tests share
     FakeGitHub,
     FakeTask,
     activity_comments,
+    envelope,
+    envelope_from,
     make_pr,
+    no_post_grace,  # noqa: F401 -- a fixture, used by name
     review,
+    trailer_of,
 )
 
 DISCOVERY_BODY = (
@@ -855,3 +875,155 @@ def test_a_malformed_ic_value_is_refused(tmp_path):
         Config.build(tmp_path, {}, environ={INTEGRATION_CHECK_REVIEW_ENV: "maybe"})
     with pytest.raises(ValueError, match="integration_check_review must be true or false"):
         Config.build(tmp_path, {"integration_check_review": "false"}, environ={})
+
+
+# -- issue #227: a content error is a change request, never an approve -------
+
+
+def envelope_on_discovery(config, verdict, content_errors, *, pr=None):
+    """A discovery PR whose light round's envelope landed with no native
+    review behind it -- the round the daemon closes itself."""
+    pr = pr or make_pr(body=DISCOVERY_BODY)
+    gh = FilesGitHub(pr, [])
+    al = FakeAlissa(
+        FakeTask(), verdict=verdict, verdict_count=1, readiness=READINESS_AUTO
+    )
+    al.content_errors = content_errors
+    w = ReviewWatcher(config, github=gh, alissa=al, state=State(config.state_db))
+    return w, gh, al
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_an_approve_with_an_open_content_error_posts_as_request_changes(
+    config, no_post_grace, count
+):
+    """AC1: whatever tag the reviewer gave the finding, an open content error
+    on a discovery PR is a change request -- the file cannot change after."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, count)
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "REQUEST_CHANGES"
+    assert posted["body"].startswith(DISCOVERY_CONTENT_LEAD.format(count=count))
+    assert "Merge-Readiness" not in posted["body"], "no trailer on a change request"
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP not in posted["body"]
+    assert "discovery content gate" in d.reason
+    [comment] = activity_comments(gh)
+    assert "native `REQUEST_CHANGES` review" in comment.body
+    assert f"counts {count} open content error(s)" in comment.body
+
+
+def test_a_content_error_round_is_still_the_only_round(config, no_post_grace):
+    """The cap and its escalation are untouched: the change request closes
+    the one light round, and the next poll starts no second one."""
+    w, gh, al = envelope_on_discovery(config, VERDICT_APPROVE, 1)
+    gh.default_rollup = lint_rollup(lint_run(REPORT_HEAD + LIGHT_LINE))
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    gh.move_head("def456")
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SKIPPED and "no second round" in d.reason
+    assert al.enqueued == []
+
+
+def test_a_clean_discovery_approve_says_its_nits_are_not_followed_up(
+    config, no_post_grace
+):
+    """AC2: an approve with only wording nits stands, and says in one line
+    that they will not be followed up -- above the readiness trailer, which
+    stays the last line the merge edge reads."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 0)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "APPROVE"
+    body = posted["body"]
+    assert body.count(DISCOVERY_NITS_NOT_FOLLOWED_UP) == 1
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP + "\n" in body, "a line of its own"
+    assert trailer_of(body) == "Merge-Readiness: auto"
+    assert "Discovery content gate" not in body
+
+
+def test_a_discovery_request_changes_envelope_posts_as_one(config, no_post_grace):
+    w, gh, _ = envelope_on_discovery(config, VERDICT_REQUEST_CHANGES, 2)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "REQUEST_CHANGES"
+    assert "Discovery content gate" not in posted["body"], "nothing was demoted"
+
+
+def test_an_envelope_without_the_count_keeps_its_approve(config, no_post_grace):
+    """The daemon carries the reviewer's count; it never invents one."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, None)
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP in gh.submitted[0]["body"]
+
+
+@pytest.mark.parametrize(
+    "pr_kw, config_kw",
+    [
+        ({}, {}),  # an ordinary code PR in the plans repository
+        ({"body": DISCOVERY_BODY}, {"discovery_review": True}),  # the code directive
+    ],
+    ids=["unmarked", "discovery-review-on"],
+)
+def test_a_code_pr_verdict_rule_is_unchanged(config, no_post_grace, pr_kw, config_kw):
+    """AC2: a code review's approve posts as an approve whatever a stray
+    count says, and carries no discovery line."""
+    w, gh, _ = envelope_on_discovery(
+        dataclasses.replace(config, **config_kw), VERDICT_APPROVE, 2,
+        pr=make_pr(**pr_kw),
+    )
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "APPROVE"
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP not in posted["body"]
+    assert "Discovery content gate" not in posted["body"]
+    assert trailer_of(posted["body"]) == "Merge-Readiness: auto"
+
+
+def test_an_unconfined_marked_pr_posts_under_the_code_rule(config, no_post_grace):
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 1)
+    gh.files = KB_FILES + ["src/app.ts"]
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+
+
+@pytest.mark.parametrize(
+    "envelope_, expected",
+    [
+        (VerdictEnvelope("approve", content_errors=2), "REQUEST_CHANGES"),
+        (VerdictEnvelope("approve", content_errors=0), "APPROVE"),
+        (VerdictEnvelope("approve"), "APPROVE"),
+        (None, "APPROVE"),
+    ],
+)
+def test_discovery_content_gate(envelope_, expected):
+    event, lead = discovery_content_gate(envelope_)
+    assert event == expected
+    assert bool(lead) == (expected == "REQUEST_CHANGES")
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("- **Content-Errors:** 2", 2),
+        ("**Content-Errors**: 0", 0),
+        ("Content-Errors: 11", 11),
+        ("- **Content-Errors:** none", None),
+        ("Content errors were checked.", None),
+    ],
+)
+def test_the_envelope_content_errors_line_is_parsed(monkeypatch, line, expected):
+    assert parse_content_errors(line) == expected
+    item = envelope("approve", 1, "2026-10-01T10:00:00Z")
+    item["markdownContent"] += f"- **Reviewed head:** abc123\n{line}\n"
+    assert envelope_from(monkeypatch, {"evidence": [item]}).content_errors == expected

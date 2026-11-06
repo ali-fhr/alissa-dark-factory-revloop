@@ -32,6 +32,7 @@ from . import prompts as prompts_mod
 from . import self_upgrade as self_upgrade_mod
 from .alissa import (
     COMMIT_READINESS_TRAILER_LABEL,
+    CONTENT_ERRORS_KEY,
     MANAGED_PREFIX,
     SHELL_COMMANDS,
     READINESS_AUTO,
@@ -450,6 +451,36 @@ def _post_delay_after(attempts: int) -> float:
 # and the review task make it auditable, and the marker (invisible in the
 # rendered comment) is what keeps this from being counted as a second round
 # alongside the reviewer session's own write-up.
+# What leads a discovery approve the content gate turned into a change
+# request (issue #227), so the review of record says why it is not the
+# verdict the envelope named.
+DISCOVERY_CONTENT_LEAD = (
+    "> **Discovery content gate.** The round's verdict envelope says `approve` "
+    "but counts {count} open content error(s) (`" + CONTENT_ERRORS_KEY + ": "
+    "{count}`). A findings file is immutable once merged, so a content error "
+    "is fixed on this PR or not at all: this round posts as a change "
+    "request.\n\n"
+)
+
+
+def discovery_content_gate(envelope: "VerdictEnvelope | None") -> "tuple[str, str]":
+    """The event a discovery PR's APPROVE envelope posts as, and the lead its
+    body opens with (issue #227).
+
+    An envelope counting an open content error (`Content-Errors: <n>`, n > 0)
+    is REQUEST_CHANGES, whatever tag the reviewer gave the finding; anything
+    else stays an APPROVE with no lead. An envelope without the line keeps
+    its approve: the count is the reviewer's record of a judgment the
+    directive asks it to make, and the daemon does not invent one -- the
+    reviewer's own native review, the normal path, never passes through
+    here at all.
+    """
+    count = envelope.content_errors if envelope is not None else None
+    if count:
+        return EVENT_REQUEST_CHANGES, DISCOVERY_CONTENT_LEAD.format(count=count)
+    return EVENT_APPROVE, ""
+
+
 NATIVE_VERDICT_BODY = (
     "**Review round {round} — `{verdict}`**\n\n"
     "Submitted by the review daemon under the configured reviewer identity, so "
@@ -1898,11 +1929,45 @@ _DISCOVERY_MERGE_READINESS_LINE = (
     "`operator`. "
 )
 
+# The one line an approve on a discovery PR says about the nits it carries
+# (issue #227). The reviewer's own native review states it on a line of its
+# own, and the daemon's fallback post carries it too, so whoever reads the
+# approve -- orcloop's harvest included -- sees that nothing follows it up.
+DISCOVERY_NITS_NOT_FOLLOWED_UP = (
+    "Wording nits on this discovery PR will not be followed up: its findings "
+    "file is immutable once merged."
+)
+
+# The verdict rule of a discovery PR (issue #227). A findings file cannot be
+# changed after the merge (K1), so an approve that leaves a content error
+# open ships that error into every plan that reads it -- and orcloop no
+# longer files the follow-up no worker could do. The PR is the only moment
+# the file can be fixed, so a content error at ANY tag is a change request;
+# only wording nits ride an approve. This clause wins over the reference's
+# own verdict section where the skill version in the container says
+# otherwise. The round cap and its escalation are untouched.
+_DISCOVERY_CONTENT_RULE = (
+    "CONTENT ERRORS ARE CHANGE REQUESTS. The findings file is immutable once "
+    "merged (K1): this PR is the only moment it can be fixed, and nothing "
+    "follows an approve up. A finding that says the findings file states "
+    "something false, contradicts the code it cites, or leaves a listed risk "
+    "with no suggested task is a CONTENT ERROR, whatever tag fits it — "
+    "`[minor]` included — and while any content error is open your verdict "
+    "is request_changes, never an approve with the finding attached. APPROVE "
+    "only when no content error is open: wording and style `[nit]`s may ride "
+    "an approve, and your native review then states, on a line of its own "
+    "before the Merge-Readiness line: `" + DISCOVERY_NITS_NOT_FOLLOWED_UP
+    + "` Record the open count in your verdict envelope as `- **"
+    + CONTENT_ERRORS_KEY + ":** <n>` (`0` on an approve); the daemon never "
+    "posts an approve for an envelope whose count is above 0. "
+)
+
 DISCOVERY_LIGHT_DIRECTIVE = (
     "You are a DISCOVERY REVIEWER — the one light review round of a discovery "
     "PR — not an implementer. {assignment} "
     + _DISCOVERY_LIGHT_PROTOCOL
     + _DISCOVERY_LINT_OWNS_THE_MECHANICS
+    + _DISCOVERY_CONTENT_RULE
     + _SHELL_RULE
     + _REVIEWER_RULE
     + _RECORD_THE_CAP
@@ -3892,6 +3957,19 @@ class ReviewWatcher:
         self._discovery_held_logged.add(seen)
         log.log(level, "%s: %s", pr.slug, reason)
 
+    def _is_discovery_pr(self, pr: PullRequest) -> bool:
+        """Whether the native post is closing a discovery PR's light round
+        (issue #227): the three signals `_discovery_skip` reads, with
+        `discovery_review` off -- with it on, the PR was reviewed under the
+        code directive and posts as any code PR does. Read at post time, not
+        off `_discovery_light`, because that set is process-lifetime and a
+        restart between spawn and post must not drop the rule."""
+        return (
+            discovery_marked(self.config, pr)
+            and not self.config.discovery_review
+            and self._confined_to(pr, DISCOVERY_PREFIX, "discovery")
+        )
+
     def _confined_to(self, pr: PullRequest, prefix: str, what: str) -> bool:
         """Whether every path the PR's head changes is under `prefix` -- the
         third signal of the discovery and integration-check skips. False (and
@@ -5150,6 +5228,17 @@ class ReviewWatcher:
         judged = str(row["head_sha"] or pr.head_sha)
         moved = bool(judged) and judged != pr.head_sha
         event = EVENT_APPROVE if verdict == VERDICT_APPROVE else EVENT_REQUEST_CHANGES
+        plan = is_plan_pr(self.config, pr)
+
+        # THE DISCOVERY CONTENT GATE (issue #227). A discovery PR's findings
+        # file cannot be fixed after the merge, so an approve envelope that
+        # still counts an open content error posts as REQUEST_CHANGES --
+        # ahead of the CI gate, which then has no approve to read a rollup
+        # for. An approve that stands carries the not-followed-up line.
+        discovery = not plan and self._is_discovery_pr(pr)
+        content_lead = ""
+        if discovery and event == EVENT_APPROVE:
+            event, content_lead = discovery_content_gate(envelope)
 
         # THE CI GATE (issue #58). Only an APPROVE is gated: a REQUEST_CHANGES on
         # a red head is already a "not ready" signal and says nothing that CI
@@ -5168,7 +5257,6 @@ class ReviewWatcher:
         # A PLAN PR's approve carries Commit-Readiness and nothing else
         # (issue #148): the plan close edge commits on it, and a plan is
         # never a code merge candidate.
-        plan = is_plan_pr(self.config, pr)
         label = COMMIT_READINESS_TRAILER_LABEL if plan else READINESS_TRAILER_LABEL
         if event != EVENT_APPROVE:
             trailer = ""
@@ -5178,15 +5266,19 @@ class ReviewWatcher:
             trailer = readiness_trailer(envelope)
             if gate.preexisting:
                 trailer = preexisting_trailer(trailer, judged, gate.preexisting)
-        body = gate.lead + NATIVE_VERDICT_BODY.format(
+        head_note = (
+            HEAD_MOVED_NOTE.format(judged=judged[:8], head=pr.head_sha[:8])
+            if moved
+            else ""
+        )
+        if discovery and event == EVENT_APPROVE:
+            # Before the readiness trailer: it stays the last non-empty line.
+            head_note += f"\n\n{DISCOVERY_NITS_NOT_FOLLOWED_UP}"
+        body = content_lead + gate.lead + NATIVE_VERDICT_BODY.format(
             round=round_,
             verdict=verdict,
             task_note=_VERDICT_TASK_NOTE.format(task_ref=task.ref),
-            head_note=(
-                HEAD_MOVED_NOTE.format(judged=judged[:8], head=pr.head_sha[:8])
-                if moved
-                else ""
-            ),
+            head_note=head_note,
             readiness=f"\n\n{trailer}" if trailer else "",
             marker=verdict_marker(round_),
         )
@@ -5216,6 +5308,12 @@ class ReviewWatcher:
             else f" — CI gate: the rollup at {judged[:8]} is {gate.state}, so the "
             f"{verdict} envelope did not post as an APPROVE"
         )
+        if content_lead:
+            gate_note += (
+                f" — discovery content gate: the {verdict} envelope counts "
+                f"{envelope.content_errors if envelope else 0} open content "
+                f"error(s), so it did not post as an APPROVE"
+            )
         if gate.preexisting:
             gate_note += (
                 f" — pre-existing CI reds (not blocking): "
