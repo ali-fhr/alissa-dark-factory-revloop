@@ -192,6 +192,12 @@ class PublishGateTest(unittest.TestCase):
     def test_rebase_merge_of_an_already_tagged_version_publishes_nothing(self):
         self.assertFalse(rt.publish_decision('0.31.41', '0.31.41', 'def', 'abc', ('0.31.40', '0.31.41'))[0])
 
+    # Issue #224: the PR's bump was replaced by main's in conflict resolution; it is not the release.
+    def test_rebase_merge_whose_bump_did_not_land_publishes_nothing(self):
+        publish, why = rt.publish_decision('0.31.42', '0.31.42', None, 'abc', ('0.31.40', '0.31.41'))
+        self.assertFalse(publish)
+        self.assertIn('not the version that landed', why)
+
     def test_without_the_head_the_gate_says_what_it_assumes(self):
         self.assertIn('first-parent comparison only', rt.publish_decision('0.31.40', '0.31.40', None, 'abc')[1])
 
