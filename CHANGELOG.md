@@ -26,6 +26,16 @@ header).
   When the daemon posts the verdict itself, an approve envelope with a count
   above 0 posts as `REQUEST_CHANGES`. The round cap and code PR reviews are
   unchanged.
+- **The discovery approve is exclusive and its post-time gate fails closed**
+  (issue #229, follow-up to the review of #228; origin TASK-824053788,
+  implementation TASK-256600314). `DISCOVERY_LIGHT_DIRECTIVE` now says an
+  approve may carry nothing above a wording or style `[nit]`: any other open
+  finding is a change request, content error or not. When the daemon posts
+  the verdict itself on a marked discovery PR, a files read that fails or a
+  head that moved past the judged round keeps the content gate in force, so
+  an approve envelope with `Content-Errors` above 0 still posts as
+  `REQUEST_CHANGES`. Before, either case read the PR as a code PR and posted
+  the approve.
 
 ## 0.31.41 (2026-11-06)
 

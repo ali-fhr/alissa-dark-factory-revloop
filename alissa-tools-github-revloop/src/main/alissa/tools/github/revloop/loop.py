@@ -1942,8 +1942,10 @@ DISCOVERY_NITS_NOT_FOLLOWED_UP = (
 # changed after the merge (K1), so an approve that leaves a content error
 # open ships that error into every plan that reads it -- and orcloop no
 # longer files the follow-up no worker could do. The PR is the only moment
-# the file can be fixed, so a content error at ANY tag is a change request;
-# only wording nits ride an approve. This clause wins over the reference's
+# the file can be fixed, so a content error at ANY tag is a change request,
+# and the approve is EXCLUSIVE (issue #229): nothing above a wording/style
+# nit rides it, so the not-followed-up line is true of everything it
+# carries. This clause wins over the reference's
 # own verdict section where the skill version in the container says
 # otherwise. The round cap and its escalation are untouched.
 _DISCOVERY_CONTENT_RULE = (
@@ -1953,10 +1955,14 @@ _DISCOVERY_CONTENT_RULE = (
     "something false, contradicts the code it cites, or leaves a listed risk "
     "with no suggested task is a CONTENT ERROR, whatever tag fits it — "
     "`[minor]` included — and while any content error is open your verdict "
-    "is request_changes, never an approve with the finding attached. APPROVE "
-    "only when no content error is open: wording and style `[nit]`s may ride "
-    "an approve, and your native review then states, on a line of its own "
-    "before the Merge-Readiness line: `" + DISCOVERY_NITS_NOT_FOLLOWED_UP
+    "is request_changes, never an approve with the finding attached. AN "
+    "APPROVE IS EXCLUSIVE: it may carry nothing above a wording or style "
+    "`[nit]`, and any other open finding — a content error or not, a "
+    "`[minor]` that says a section is hard to follow included — is "
+    "request_changes, because nothing follows it up either. An approve's "
+    "wording and style `[nit]`s ride it, and your native review then states, "
+    "on a line of its own before the Merge-Readiness line: `"
+    + DISCOVERY_NITS_NOT_FOLLOWED_UP
     + "` Record the open count in your verdict envelope as `- **"
     + CONTENT_ERRORS_KEY + ":** <n>` (`0` on an approve); the daemon never "
     "posts an approve for an envelope whose count is above 0. "
@@ -3957,25 +3963,50 @@ class ReviewWatcher:
         self._discovery_held_logged.add(seen)
         log.log(level, "%s: %s", pr.slug, reason)
 
-    def _is_discovery_pr(self, pr: PullRequest) -> bool:
+    def _is_discovery_pr(self, pr: PullRequest, judged: str) -> bool:
         """Whether the native post is closing a discovery PR's light round
         (issue #227): the three signals `_discovery_skip` reads, with
         `discovery_review` off -- with it on, the PR was reviewed under the
         code directive and posts as any code PR does. Read at post time, not
         off `_discovery_light`, because that set is process-lifetime and a
-        restart between spawn and post must not drop the rule."""
-        return (
-            discovery_marked(self.config, pr)
-            and not self.config.discovery_review
-            and self._confined_to(pr, DISCOVERY_PREFIX, "discovery")
+        restart between spawn and post must not drop the rule.
+
+        FAILS CLOSED once the marker holds (issue #229). At spawn time "code
+        directive" is the safe reading of an unknown diff; at post time it is
+        the unsafe one, because it lets an approve envelope that counts an
+        open content error post as APPROVE. So a files read that fails, or a
+        head that moved past `judged` (the files listing only ever describes
+        the CURRENT head, which the round never reviewed), keeps the content
+        gate in force. That costs nothing on a code round: its envelope
+        carries no count, and `discovery_content_gate` keeps such an approve.
+        """
+        if not discovery_marked(self.config, pr) or self.config.discovery_review:
+            return False
+        if judged and judged != pr.head_sha:
+            log.info(
+                "%s carries the discovery marker and its head moved from %s to "
+                "%s since the judged round — the discovery content gate stays "
+                "in force",
+                pr.slug, judged[:8], pr.head_sha[:8],
+            )
+            return True
+        return self._confined_to(
+            pr, DISCOVERY_PREFIX, "discovery", unreadable=True,
+            unreadable_means="the discovery content gate stays in force",
         )
 
-    def _confined_to(self, pr: PullRequest, prefix: str, what: str) -> bool:
+    def _confined_to(
+        self, pr: PullRequest, prefix: str, what: str, *,
+        unreadable: bool = False,
+        unreadable_means: str = "reviewing under the code directive",
+    ) -> bool:
         """Whether every path the PR's head changes is under `prefix` -- the
         third signal of the discovery and integration-check skips. False (and
-        a log line saying why) when one is not, or when the files cannot be
-        read in full: the code directive is the safe reading. `what` names
-        the marker in that line."""
+        a log line saying why) when one is not. When the files cannot be read
+        in full the answer is `unreadable`: False for the spawn-time skips,
+        where the code directive is the safe reading, True for the post-time
+        content gate (issue #229). `what` names the marker in the log line,
+        `unreadable_means` what the unreadable answer does."""
         key = (pr.full_name, pr.number, pr.head_sha)
         paths = self._changed_paths.get(key)
         if paths is None:
@@ -3988,10 +4019,10 @@ class ReviewWatcher:
             except (CommandError, TruncatedListing) as exc:
                 log.warning(
                     "%s carries the %s marker but its changed files cannot be "
-                    "read in full — reviewing under the code directive: %s",
-                    pr.slug, what, exc,
+                    "read in full — %s: %s",
+                    pr.slug, what, unreadable_means, exc,
                 )
-                return False
+                return unreadable
             self._changed_paths[key] = paths
 
         outside = outside_prefix(paths, prefix)
@@ -5234,8 +5265,10 @@ class ReviewWatcher:
         # file cannot be fixed after the merge, so an approve envelope that
         # still counts an open content error posts as REQUEST_CHANGES --
         # ahead of the CI gate, which then has no approve to read a rollup
-        # for. An approve that stands carries the not-followed-up line.
-        discovery = not plan and self._is_discovery_pr(pr)
+        # for. An approve that stands carries the not-followed-up line. Once
+        # the marker holds, an unreadable diff or a moved head keeps the gate
+        # in force (issue #229): failing open here would post the approve.
+        discovery = not plan and self._is_discovery_pr(pr, judged)
         content_lead = ""
         if discovery and event == EVENT_APPROVE:
             event, content_lead = discovery_content_gate(envelope)

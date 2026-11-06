@@ -989,6 +989,75 @@ def test_a_code_pr_verdict_rule_is_unchanged(config, no_post_grace, pr_kw, confi
     assert trailer_of(posted["body"]) == "Merge-Readiness: auto"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        CommandError(["gh", "api"], 1, "HTTP 502"),
+        TruncatedListing("acme/widgets#7 reached GitHub's 3000-file listing cap"),
+    ],
+    ids=["command-error", "truncated"],
+)
+def test_an_unreadable_diff_keeps_the_content_gate_in_force(
+    config, no_post_grace, error
+):
+    """Issue #229 (a): at post time the code reading is the UNSAFE one, so a
+    marked PR whose files cannot be read still posts a counted content error
+    as a change request."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 2)
+    gh.files_error = error
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "REQUEST_CHANGES"
+    assert posted["body"].startswith(DISCOVERY_CONTENT_LEAD.format(count=2))
+    assert gh.files_reads == 1
+
+
+def test_an_unreadable_diff_keeps_a_clean_approve(config, no_post_grace):
+    """Failing closed costs a clean round nothing: count 0 still approves."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 0)
+    gh.files_error = CommandError(["gh", "api"], 1, "HTTP 502")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP in gh.submitted[0]["body"]
+
+
+def test_a_moved_head_keeps_the_content_gate_in_force(config, no_post_grace):
+    """Issue #229 (b): the files listing describes the CURRENT head, which the
+    round never reviewed -- so a head that moved past the judged one does not
+    get to read the PR as a code PR, even when it now changes code."""
+    w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 1)
+    gh.files = KB_FILES + ["src/app.ts"]
+    w.state.note_verdict_post_owed(SLUG, NUMBER, 1, "0ld0ld0ld")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    [posted] = gh.submitted
+    assert posted["event"] == "REQUEST_CHANGES"
+    assert posted["commit_id"] == "0ld0ld0ld", "posted on the judged head"
+    assert gh.files_reads == 0, "the current head's diff is not the round's"
+
+
+@pytest.mark.parametrize(
+    "pr_kw, config_kw",
+    [({}, {}), ({"body": DISCOVERY_BODY}, {"discovery_review": True})],
+    ids=["unmarked", "discovery-review-on"],
+)
+def test_failing_closed_needs_the_marker(config, no_post_grace, pr_kw, config_kw):
+    """Without the marker (or with the code directive on) an unreadable diff
+    and a moved head leave a code PR's approve alone."""
+    w, gh, _ = envelope_on_discovery(
+        dataclasses.replace(config, **config_kw), VERDICT_APPROVE, 2,
+        pr=make_pr(**pr_kw),
+    )
+    gh.files_error = CommandError(["gh", "api"], 1, "HTTP 502")
+    w.state.note_verdict_post_owed(SLUG, NUMBER, 1, "0ld0ld0ld")
+
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.POSTED
+    assert gh.submitted[0]["event"] == "APPROVE"
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP not in gh.submitted[0]["body"]
+
+
 def test_an_unconfined_marked_pr_posts_under_the_code_rule(config, no_post_grace):
     w, gh, _ = envelope_on_discovery(config, VERDICT_APPROVE, 1)
     gh.files = KB_FILES + ["src/app.ts"]
