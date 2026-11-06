@@ -16,6 +16,8 @@ header).
 
 ## Unreleased
 
+## 0.31.41 (2026-11-06)
+
 - **A merge is no longer a release** (issue #220, fleet upgrade safety
   UR-3, design §4.2; origin TASK-950356071, implementation TASK-810645209).
   `check-version-bump.yaml` now requires a line here for a package or
