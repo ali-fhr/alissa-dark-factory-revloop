@@ -385,6 +385,8 @@ class FakeAlissa:
         self.commit_readiness_reason = ""
         # The same envelope's `Contract: v<n>` (issue #155). None: no line.
         self.contract_version = None
+        # The same envelope's `Content-Errors: <n>` (issue #227). None: no line.
+        self.content_errors = None
         self.verdict_count = verdict_count  # envelopes on the task = rounds done
         self.enqueued: list[dict] = []
         self.added: list[tuple] = []
@@ -520,6 +522,7 @@ class FakeAlissa:
             commit_readiness=self.commit_readiness,
             commit_readiness_reason=self.commit_readiness_reason,
             contract_version=self.contract_version,
+            content_errors=self.content_errors,
         )
 
     def count_verdicts(self, task_ref):

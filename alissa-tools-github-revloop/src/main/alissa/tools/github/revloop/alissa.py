@@ -553,6 +553,31 @@ def parse_contract_version(blob: object) -> "int | None":
     return None if match is None else int(match.group(1))
 
 
+# The discovery light round's content-error count (issue #227). A discovery
+# PR's findings file is immutable once merged (plan-lint K1), so a finding
+# that says the file states something false, contradicts the code it cites,
+# or leaves a listed risk unscheduled can only be fixed on the PR itself: the
+# light directive tells the reviewer to request changes on one, and to record
+# how many stayed open as `- **Content-Errors:** <n>`. The daemon reads the
+# count only to refuse an approve it would otherwise post for that round.
+# The markdown tolerance of the Contract line; the count is digits only, so
+# prose that opens with `Content-Errors` and no number reads as absent.
+CONTENT_ERRORS_KEY = "Content-Errors"
+_CONTENT_ERRORS_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?[ \t]*" + re.escape(CONTENT_ERRORS_KEY)
+    + r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*(\d{1,9})\b",
+    re.MULTILINE,
+)
+
+
+def parse_content_errors(blob: object) -> "int | None":
+    """The `Content-Errors: <n>` an envelope records, as an int, or None."""
+    if not isinstance(blob, str):
+        return None
+    match = _CONTENT_ERRORS_RE.search(blob)
+    return None if match is None else int(match.group(1))
+
+
 @dataclass(frozen=True)
 class Task:
     ref: str  # TASK-<taskNumber>
@@ -858,6 +883,9 @@ class VerdictEnvelope:
 
     `contract_version` is the envelope's `Contract: v<n>` (issue #155), or
     None when it records none -- read for the `round.verdict` event only.
+
+    `content_errors` is the envelope's `Content-Errors: <n>` (issue #227), or
+    None when it records none -- read only by a discovery PR's native post.
     """
 
     verdict: str
@@ -866,6 +894,7 @@ class VerdictEnvelope:
     commit_readiness: "str | None" = None
     commit_readiness_reason: str = ""
     contract_version: "int | None" = None
+    content_errors: "int | None" = None
 
 
 @dataclass(frozen=True)
@@ -1388,6 +1417,9 @@ class Alissa:
                     contract = parse_contract_version(content)
                     if contract is None:
                         contract = parse_contract_version(title)
+                    content_errors = parse_content_errors(content)
+                    if content_errors is None:
+                        content_errors = parse_content_errors(title)
                     found.append(
                         (Alissa._created_key(item.get("createdAt")),
                          index,
@@ -1398,6 +1430,7 @@ class Alissa:
                              commit_readiness=commit,
                              commit_readiness_reason=commit_reason,
                              contract_version=contract,
+                             content_errors=content_errors,
                          ))
                     )
                     break

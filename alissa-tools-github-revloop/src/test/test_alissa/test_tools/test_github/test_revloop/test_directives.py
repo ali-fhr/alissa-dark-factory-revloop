@@ -16,6 +16,7 @@ from alissa.tools.github.revloop.alissa import COMMIT_READINESS_CLASSES
 from alissa.tools.github.revloop.loop import (
     CHECKS_AT_SPAWN_RED,
     DISCOVERY_LIGHT_DIRECTIVE,
+    DISCOVERY_NITS_NOT_FOLLOWED_UP,
     PLAN_ROUND_1_DIRECTIVE,
     PLAN_ROUND_K_DIRECTIVE,
     PLAN_RUBRIC,
@@ -437,8 +438,9 @@ def test_the_code_directives_are_untouched_by_the_plan_lane():
 # Pinned by digest like the plan templates, and for the same reason: every
 # clause is load-bearing. The code directives are pinned beside it -- issue
 # #179 c5 is that the light lane leaves them byte for byte as they were.
-# Re-pinned all three for issue #208 (the transcript push before the kill).
-LIGHT_TEMPLATE_SHA256 = "b9428ee0cbdc514fcaf73ecfc60777c358ef1b4767e932724337a928cc94da9a"
+# Re-pinned all three for issue #208 (the transcript push before the kill);
+# the light one again for issue #227 (the content-error rule).
+LIGHT_TEMPLATE_SHA256 = "c271dd63f6b0b5c05210aa492aa891e86422ed9c67210650f72c768106155694"
 CODE_TEMPLATE_SHA256 = {
     "round-1": "707eca8cfe9c0b541ddef4cba1349b121473fb92f24bc7e3759c95d874b3acd5",
     "round-k": "9dbc8c2260a90e5be77dc269930d36442618d34081955e020eeda1a0f96a12df",
@@ -493,6 +495,35 @@ def test_the_light_directive_states_the_merge_readiness_rules():
     assert "first line under `## Summary`" in text
     assert "bare last non-empty line" in text
     assert "do not walk the code checklist" in text
+
+
+def test_the_light_directive_makes_a_content_error_a_change_request():
+    """Issue #227: the findings file is immutable after merge, so a content
+    error at any tag is request_changes; only wording nits ride an approve,
+    and the approve says they will not be followed up."""
+    text = render_plan(DISCOVERY_LIGHT_DIRECTIVE, cap=1)
+    assert "CONTENT ERRORS ARE CHANGE REQUESTS" in text
+    assert "immutable once merged" in text
+    for kind in (
+        "states something false", "contradicts the code it cites",
+        "leaves a listed risk with no suggested task",
+    ):
+        assert kind in text
+    assert "whatever tag fits it — `[minor]` included" in text
+    assert "your verdict is request_changes, never an approve with the finding attached" in text
+    assert "wording and style `[nit]`s may ride an approve" in text
+    assert f"`{DISCOVERY_NITS_NOT_FOLLOWED_UP}`" in text
+    assert "`- **Content-Errors:** <n>`" in text
+    # The cap is untouched.
+    assert "THIS IS THE ONLY ROUND" in text and "the light round's cap is 1" in text
+
+
+@pytest.mark.parametrize("template", [ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE, *PLAN_TEMPLATES])
+def test_no_other_directive_carries_the_content_rule(template):
+    text = render_plan(template)
+    assert "CONTENT ERRORS ARE CHANGE REQUESTS" not in text
+    assert DISCOVERY_NITS_NOT_FOLLOWED_UP not in text
+    assert "Content-Errors" not in text
 
 
 def test_the_light_directive_keeps_every_shared_clause():
