@@ -106,17 +106,21 @@ body names neither emits the same payload as before, byte for byte.
 ``janitor.volume_pressure`` (issue #177) is the workspace volume at or above
 `janitor_warn_pct` -- until then a WARNING line nobody saw while 119 dead
 review checkouts filled a 46 GB volume. Again a ledger ROW: the watcher
-records ONE `volume-pressure:` ping per pressure EPISODE (the first sweep at
-or above the line opens it; the first reading back under the line closes it),
-under the anchor-less `('', 0)` an `auth-rejected:` row without a PR uses,
-with what that sweep saw folded into the kind: `data: { usedPct, warnPct,
-freedBytes, foldersLeft }` (`foldersLeft` null when the sweep did not run).
+records ONE `volume-pressure:` ping per pressure EPISODE (since issue #232
+the episode opens once three sweeps in a row at or above the line freed
+nothing; the first reading back under the line closes it), under the
+anchor-less `('', 0)` an `auth-rejected:` row without a PR uses, with what
+that sweep saw folded into the kind: `data: { usedPct, warnPct, freedBytes,
+foldersLeft, heldBytes, held }` (`foldersLeft` null when the sweep did not
+run; `heldBytes` -- the sweep's held total -- and `held` -- its largest held
+reasons, `[{reason, bytes}]` -- since issue #232, null on an older row).
 Keyed on the episode's start second, so a backfill re-derives the same one
 event. No repo and no PR: the volume is the seat's, not a PR's.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -217,15 +221,22 @@ _AUTH_REJECTED_RE = re.compile(
 )
 
 # The `janitor.volume_pressure` row (issue #177): one per pressure EPISODE,
-# `volume-pressure:<started>:<usedPct>:<warnPct>:<freedBytes>:<foldersLeft>`.
+# `volume-pressure:<started>:<usedPct>:<warnPct>:<freedBytes>:<foldersLeft>`
+# and, since issue #232, `:<heldBytes>:<held JSON>` -- the sweep's held-size
+# breakdown, `[[reason, bytes], ...]` largest first (at most VOLUME_HELD_TOP).
 # `started` (epoch seconds) is the episode's identity and its dedupe key;
-# `foldersLeft` is empty when the sweep did not run (roster unlistable,
-# unsupported layout).
+# `foldersLeft` is empty when the sweep did not run (roster
+# unlistable, unsupported layout), and then the tail is left off -- as on a row
+# written before issue #232, which derives with `heldBytes` and `held` null.
 VOLUME_PRESSURE_PREFIX = "volume-pressure:"
 VOLUME_PRESSURE_EVENT = "janitor.volume_pressure"
+VOLUME_HELD_TOP = 5
+# A held reason's length cap in the row (the reasons are the janitor's own
+# fixed sentences behind a hub slug; the cap only bounds a pathological slug).
+_VOLUME_HELD_REASON_MAX = 160
 _VOLUME_PRESSURE_RE = re.compile(
     r"^volume-pressure:(?P<started>\d+):(?P<pct>\d+(?:\.\d+)?):(?P<warn>\d+):"
-    r"(?P<freed>\d+):(?P<left>\d*)$"
+    r"(?P<freed>\d+):(?P<left>\d*)(?::(?P<held_total>\d*):(?P<held>\[.*\]))?$"
 )
 
 
@@ -235,12 +246,40 @@ def volume_pressure_kind(
     warn_pct: int,
     freed: int,
     left: "int | None",
+    held: "list[tuple[str, int]] | None" = None,
+    held_total: "int | None" = None,
 ) -> str:
-    """The ledger kind of ONE pressure episode (see VOLUME_PRESSURE_PREFIX)."""
-    return (
+    """The ledger kind of ONE pressure episode (see VOLUME_PRESSURE_PREFIX).
+    `held` is the sweep's `top_held()` -- (reason, bytes) pairs, largest
+    first -- and `held_total` its `held_total`; both None when the sweep
+    did not run."""
+    kind = (
         f"{VOLUME_PRESSURE_PREFIX}{int(started)}:{round(float(used_pct), 1)}:"
         f"{int(warn_pct)}:{max(0, int(freed))}:{'' if left is None else int(left)}"
     )
+    if held is None and held_total is None:
+        return kind  # the sweep did not run: nothing held to say
+    pairs = [
+        [str(reason)[:_VOLUME_HELD_REASON_MAX], max(0, int(size))]
+        for reason, size in (held or [])[:VOLUME_HELD_TOP]
+    ]
+    total = "" if held_total is None else str(max(0, int(held_total)))
+    return f"{kind}:{total}:{json.dumps(pairs, separators=(',', ':'))}"
+
+
+def _volume_held(match: "re.Match[str]") -> "tuple[int | None, list[dict] | None]":
+    """The (heldBytes, held) a pressure row carries, (None, None) on a row
+    written before issue #232 or one whose tail does not parse."""
+    raw = match.group("held")
+    if raw is None:
+        return None, None
+    try:
+        pairs = json.loads(raw)
+        held = [{"reason": str(r), "bytes": int(b)} for r, b in pairs]
+    except (ValueError, TypeError):
+        return None, None
+    total = match.group("held_total")
+    return (int(total) if total else None), held
 
 
 # The credential variables a container may carry, in Claude Code's own
@@ -737,6 +776,7 @@ def _ping_events(
             if match is None:
                 continue
             pct, warn = float(match.group("pct")), int(match.group("warn"))
+            held_total, held = _volume_held(match)
             out.append(_event(
                 VOLUME_PRESSURE_EVENT,
                 at,
@@ -749,6 +789,8 @@ def _ping_events(
                     "foldersLeft": (
                         int(match.group("left")) if match.group("left") else None
                     ),
+                    "heldBytes": held_total,
+                    "held": held,
                 },
             ))
         elif kind.startswith(PROMPT_PREFIX):

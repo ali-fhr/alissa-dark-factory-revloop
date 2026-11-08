@@ -4,7 +4,11 @@ open ledger round holds them; nothing else under a hub is ever touched;
 dry-run removes nothing; a full volume warns once; fleet vitals carry
 `diskUsedPct`. Issue #177: a `REVIEW-*` checkout made INSIDE `<hub>/main` is
 reaped too, the grace shrinks under disk pressure, and a pressure episode
-records one `janitor.volume_pressure` loop event."""
+records one `janitor.volume_pressure` loop event. Issue #232: holds are per
+folder -- a round records its own folder at spawn (`REVIEW-pr<N>` when it has
+no review task), no round holds a whole hub, sustained pressure (three sweeps
+freeing nothing) opens the episode, and a low volume or an unwritable ledger
+reaches the operator's Needs-you through the fleet vitals."""
 
 from __future__ import annotations
 
@@ -23,11 +27,21 @@ from alissa.tools.github.revloop.alissa_client import AlissaError
 from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.fleet_vitals import FleetVitalsPusher
 from alissa.tools.github.revloop.janitor import Guard, sweep
-from alissa.tools.github.revloop.loop import ReviewWatcher
+from alissa.tools.github.revloop.loop import (
+    DISCOVERY_LIGHT_DIRECTIVE,
+    PLAN_ROUND_1_DIRECTIVE,
+    PLAN_ROUND_K_DIRECTIVE,
+    ROUND_1_DIRECTIVE,
+    ROUND_K_DIRECTIVE,
+    _REVIEWER_RULE,
+    ReviewWatcher,
+    _task_less_reviewer_rule,
+    _with_task_less_reviewer_rule,
+)
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
 from test_fleet_vitals import WALL, FakeSources, FakeVitalsClient
-from test_loop import FakeAlissa, FakeGitHub, make_pr
+from test_loop import FakeAlissa, FakeGitHub, make_pr, watcher
 
 NOW = 1_800_000_000.0
 DAY = 24 * 3600
@@ -173,19 +187,38 @@ def test_a_held_pr_keeps_its_scratch_and_its_tasks_checkout(tmp_path):
     assert len(result.held) == 3
 
 
-def test_a_round_without_a_task_ref_holds_every_checkout_in_its_hub_only(tmp_path):
+def test_a_round_without_a_task_ref_holds_only_its_own_folders(tmp_path):
+    """Issue #232: no hub-wide hold. A round with no review task holds its
+    PR's `REVIEW-pr<N>` (any `-r<k>`) and its recorded folder in its own hub
+    -- and no other checkout there or anywhere."""
     hub = make_hub(tmp_path, "widgets")
     other = make_hub(tmp_path, "gadgets")
     stale = GRACE * 2
-    mine = folder(hub / "REVIEW-TASK-80", age=stale)
-    theirs = folder(other / "REVIEW-TASK-80", age=stale)
+    own = folder(hub / "REVIEW-pr7", age=stale)
+    own_round = folder(hub / "main" / "REVIEW-pr7-r2", age=stale)
+    recorded = folder(hub / "REVIEW-renamed-by-hand", age=stale)
+    unrelated = folder(hub / "REVIEW-TASK-80", age=stale)
+    other_pr = folder(hub / "REVIEW-pr8", age=stale)
+    theirs = folder(other / "REVIEW-pr7", age=stale)
     guard = Guard()
-    guard.hold("acme/widgets", 7, None)
+    guard.hold("acme/widgets", 7, None, folder=recorded)
 
-    run_sweep([hub, other], guard)
+    result = run_sweep([hub, other], guard)
 
-    assert mine.is_dir()
-    assert not theirs.exists()
+    assert own.is_dir() and own_round.is_dir() and recorded.is_dir()
+    assert not unrelated.exists() and not other_pr.exists() and not theirs.exists()
+    assert dict(result.held)[recorded] == janitor_mod.RECORDED_FOLDER_HOLD
+
+
+def test_a_task_checkout_with_a_round_suffix_is_held_by_its_task(tmp_path):
+    hub = make_hub(tmp_path)
+    suffixed = folder(hub / "REVIEW-TASK-70-r3", age=GRACE * 2)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, "TASK-70")
+
+    run_sweep([hub], guard)
+
+    assert suffixed.is_dir()
 
 
 def test_a_nameless_session_holds_its_pr_in_every_hub(tmp_path):
@@ -367,10 +400,15 @@ def test_a_skill_session_without_a_ledger_row_holds_by_name(ws):
     alissa.sessions = [ManagedSession(name="review-pr-7", status="busy")]
     scratch, review = stale_pair(hub, 7, "TASK-70")
 
+    own = hub / "REVIEW-pr7"
+    own.mkdir()
+    old = time.time() - GRACE * 2
+    os.utime(own, (old, old))
+
     w._run_janitor()
 
-    assert scratch.is_dir()
-    assert review.is_dir(), "no task ref known: every checkout in the hub is held"
+    assert scratch.is_dir() and own.is_dir(), "the PR's own folders stay held"
+    assert not review.exists(), "no task ref known: the hub is NOT held (issue #232)"
 
 
 def test_an_open_ledger_round_holds_with_no_session_listed(ws):
@@ -851,7 +889,6 @@ def test_real_git_a_checkout_made_inside_main_is_removed_and_unregistered(tmp_pa
 def test_the_reviewer_rule_says_where_the_checkout_goes():
     """c4: the rule names the place beside `main/` -- the name trust seeds --
     and the janitor reaps that name in both places."""
-    from alissa.tools.github.revloop.loop import _REVIEWER_RULE
     from alissa.tools.github.revloop.trust import review_checkout_name
 
     assert "BESIDE `main/`, never inside it" in _REVIEWER_RULE
@@ -1007,37 +1044,75 @@ def test_the_watcher_shrinks_the_grace_while_the_volume_is_pressed(ws, monkeypat
     assert beside.is_dir(), "fresh even under pressure"
     assert any("the grace dropped to 120 minute(s)" in r.getMessage()
                for r in caplog.records)
-    assert len(volume_pings(w)) == 1
-    assert w._janitor_pressure_since is None, "back under the line: episode closed"
+    assert volume_pings(w) == [], "a sweep that frees bytes is no incident"
+    assert w._janitor_pressure_since is None and w._janitor_pressed_sweeps == 0
 
 
-def test_one_volume_pressure_event_per_episode_and_recovery_closes_it(ws, monkeypatch):
-    w, _, hub = ws
+def pressed_sweeps(w, count, start, step=600):
+    """Run `count` janitor sweeps `step` seconds apart from `start`."""
+    for n in range(count):
+        if w._janitor_last is not None:
+            w._janitor_last -= 10 * 60
+        w._run_janitor(now=start + n * step)
+
+
+def test_one_volume_pressure_event_after_three_sweeps_that_free_nothing(ws, monkeypatch):
+    """Issue #232: sustained pressure -- PRESSURE_SWEEPS sweeps in a row at
+    or above the warn line that freed nothing -- opens the episode: ONE row,
+    carrying the held-size breakdown. More sweeps add nothing; a reading
+    under the line closes it, and a new run of three is a new event."""
+    w, alissa, hub = ws
     pct = {"now": 97.5}
     monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: pct["now"])
-    young_checkout(hub)
+    session = "review-widgets-pr7-r1-abc123"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
+                         session=session, task_ref="TASK-70")
+    alissa.sessions = [ManagedSession(name=session, status="busy")]
+    stale_pair(hub, 7, "TASK-70")  # held: nothing the janitor may free
     t0 = int(time.time())
 
-    w._run_janitor(now=t0)
-    w._janitor_last -= 10 * 60
-    w._run_janitor(now=t0 + 600)
-
+    pressed_sweeps(w, 2, t0)
+    assert volume_pings(w) == [] and w._janitor_pressed_sweeps == 2
+    pressed_sweeps(w, 1, t0 + 1200)
     rows = volume_pings(w)
-    assert len(rows) == 1, "one event per episode, not per sweep"
-    assert rows[0]["repo"] == "" and rows[0]["number"] == 0
-    started, used, warn, freed, left = rows[0]["kind"].split(":")[1:]
-    assert (started, used, warn) == (str(t0), "97.5", "80")
-    assert int(freed) > 0 and left == "0"
+    assert len(rows) == 1 and rows[0]["repo"] == "" and rows[0]["number"] == 0
+    started, used, warn, freed, left = rows[0]["kind"].split(":")[1:6]
+    assert (started, used, warn, freed, left) == (str(t0 + 1200), "97.5", "80", "0", "2")
+
+    from alissa.tools.github.revloop.loop_events import derive_events
+    (event,) = [e for e in derive_events(w.state)
+                if e["kind"] == "janitor.volume_pressure"]
+    assert event["data"]["heldBytes"] > 0
+    assert {h["reason"] for h in event["data"]["held"]} == {
+        "widgets: PR #7 has a live session or open round",
+        "widgets: TASK-70 has a live session or open round",
+    }
+    assert sum(h["bytes"] for h in event["data"]["held"]) == event["data"]["heldBytes"]
+
+    pressed_sweeps(w, 3, t0 + 1800)
+    assert len(volume_pings(w)) == 1, "one event per episode, not per sweep"
 
     pct["now"] = 60.0
-    w._janitor_last -= 10 * 60
-    w._run_janitor(now=t0 + 1200)
-    assert w._janitor_pressure_since is None
+    pressed_sweeps(w, 1, t0 + 4000)
+    assert w._janitor_pressure_since is None and w._janitor_pressed_sweeps == 0
 
     pct["now"] = 85.0
-    w._janitor_last -= 10 * 60
-    w._run_janitor(now=t0 + 1800)
+    pressed_sweeps(w, 3, t0 + 5000)
     assert len(volume_pings(w)) == 2, "a new episode is a new event"
+
+
+def test_a_sweep_that_frees_bytes_restarts_the_count(ws, monkeypatch):
+    w, _, hub = ws
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 95.0)
+    t0 = int(time.time())
+
+    pressed_sweeps(w, 2, t0)
+    young_checkout(hub)  # three hours old: removable under pressure
+    pressed_sweeps(w, 1, t0 + 1200)
+    assert w._janitor_pressed_sweeps == 0
+    pressed_sweeps(w, 2, t0 + 1800)
+
+    assert volume_pings(w) == [] and w._janitor_pressed_sweeps == 2
 
 
 def test_the_event_is_recorded_even_when_the_sweep_cannot_run(ws, monkeypatch):
@@ -1049,10 +1124,10 @@ def test_the_event_is_recorded_even_when_the_sweep_cannot_run(ws, monkeypatch):
 
     alissa.list_review_sessions = boom
 
-    assert w._run_janitor(now=NOW) is None
+    pressed_sweeps(w, 3, NOW)
 
     rows = volume_pings(w)
-    assert len(rows) == 1 and rows[0]["kind"].endswith(":0:")
+    assert len(rows) == 1 and rows[0]["kind"].endswith(":0:"), "no held tail"
 
 
 def test_a_dry_run_records_no_volume_pressure_row(ws, monkeypatch, caplog):
@@ -1062,7 +1137,7 @@ def test_a_dry_run_records_no_volume_pressure_row(ws, monkeypatch, caplog):
     monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 95.0)
 
     with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
-        w._run_janitor(now=NOW)
+        pressed_sweeps(w, 3, NOW)
 
     assert volume_pings(w) == []
     assert any(r.getMessage().startswith("[dry-run] janitor: would record volume-pressure:")
@@ -1092,7 +1167,7 @@ def test_a_failed_ledger_write_leaves_the_episode_unopened(ws, monkeypatch, capl
 
     monkeypatch.setattr(w.state, "record_ping", broken)
     with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
-        w._run_janitor(now=time.time())
+        pressed_sweeps(w, 3, time.time())
     assert w._janitor_pressure_since is None
     assert any("could not record the volume-pressure episode" in r.getMessage()
                for r in caplog.records)
@@ -1103,95 +1178,78 @@ def test_a_failed_ledger_write_leaves_the_episode_unopened(ws, monkeypatch, capl
     assert len(volume_pings(w)) == 1, "the next sweep records it"
 
 
-# -- an unknown-ref round's hold is bounded by its spawn time (issue #185) ----
-
-STALE = 90 * 60  # config.STALE_ROUND_SECONDS
+# -- per-folder holds, never a hub-wide one (issue #232) ------------------------
 
 
-def test_an_unknown_ref_round_holds_only_checkouts_made_after_its_spawn(tmp_path):
-    hub = make_hub(tmp_path)
-    spawned = NOW - 3 * DAY
-    after = folder(hub / "REVIEW-TASK-81", age=2 * DAY)
-    within_skew = folder(hub / "main" / "REVIEW-TASK-82",
-                         age=3 * DAY + janitor_mod.HOLD_SKEW_SECONDS - 60)
-    before = folder(hub / "REVIEW-TASK-83", age=4 * DAY)
+def test_one_task_less_live_round_never_holds_forty_stale_checkouts(tmp_path):
+    """AC 1: the 2026-11-08 shape -- one live round with no review task in
+    the hub, forty dead REVIEW-* checkouts past the (pressure) grace. The
+    forty go (over two bounded sweeps); the round's recorded folder and its
+    PR's folders stay."""
+    hub = make_hub(tmp_path, "studio.alissa.app")
+    pressure_grace = 120 * 60
+    stale = [folder(hub / f"REVIEW-TASK-{n:03d}", age=pressure_grace + 60 + n)
+             for n in range(20)]
+    stale += [folder(hub / "main" / f"REVIEW-TASK-{n:03d}", age=pressure_grace + 60 + n)
+              for n in range(20, 40)]
+    own = folder(hub / "REVIEW-pr4491", age=pressure_grace + 600)
+    scratch = folder(hub / "main" / ".review-scratch-pr4491-r1", age=pressure_grace + 600)
     guard = Guard()
-    guard.hold("acme/widgets", 7, None, since=spawned)
+    guard.hold("ali-fhr/studio.alissa.app", 4491, None, folder=own)
+
+    def once():
+        return sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner(),
+                     pressure_grace_seconds=pressure_grace,
+                     under_pressure=lambda: True)
+
+    first = once()
+    second = once()
+
+    assert not any(path.exists() for path in stale)
+    assert len(first.removed) + len(second.removed) == 40
+    assert own.is_dir() and scratch.is_dir()
+    assert {path for path, _ in second.held} == {own, scratch}
+    assert not any("names no review task" in why for _, why in second.held)
+
+
+def test_a_folder_no_live_round_names_is_kept_only_by_the_grace(tmp_path):
+    hub = make_hub(tmp_path)
+    young = folder(hub / "REVIEW-TASK-81", age=GRACE - 60)
+    old = folder(hub / "REVIEW-TASK-82", age=GRACE + 60)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, None)
 
     result = run_sweep([hub], guard)
 
-    assert after.is_dir() and within_skew.is_dir()
-    assert not before.exists(), "older than the round: it cannot be the round's"
-    assert {p for p, _ in result.held} == {after, within_skew}
-    assert all(why == janitor_mod.HUB_HOLD_BOUNDED for _, why in result.held)
+    assert young.is_dir() and not old.exists()
+    assert result.held == [] and result.fresh == 1
 
 
-def test_the_earliest_unknown_ref_round_bounds_the_hub_and_an_unknown_spawn_holds_all(tmp_path):
+def test_an_unnamed_scratch_folder_is_not_held_by_a_live_round(tmp_path):
     hub = make_hub(tmp_path)
-    mid = folder(hub / "REVIEW-TASK-81", age=3 * DAY)
-    old = folder(hub / "REVIEW-TASK-82", age=5 * DAY)
+    unnamed = folder(hub / "main" / ".review-scratch-notes", age=GRACE * 2)
     guard = Guard()
-    guard.hold("acme/widgets", 7, None, since=NOW - 2 * DAY)
-    guard.hold("acme/widgets", 8, None, since=NOW - 4 * DAY)
+    guard.hold("acme/widgets", 7, "TASK-70")
 
     run_sweep([hub], guard)
 
-    assert mid.is_dir() and not old.exists()
-
-    guard.hold("acme/widgets", 9, None)  # no spawn time: today's hub-wide hold
-    older = folder(hub / "REVIEW-TASK-83", age=6 * DAY)
-    result = run_sweep([hub], guard)
-    assert older.is_dir() and mid.is_dir()
-    assert janitor_mod.HUB_HOLD_UNBOUNDED in {why for _, why in result.held}
+    assert not unnamed.exists()
 
 
-def test_a_known_ref_hold_is_unchanged_by_the_spawn_bound(tmp_path):
-    hub = make_hub(tmp_path)
-    mine = folder(hub / "REVIEW-TASK-70", age=5 * DAY)
-    other = folder(hub / "REVIEW-TASK-80", age=5 * DAY)
-    scratch = folder(hub / "main" / ".review-scratch-pr7-r1", age=5 * DAY)
-    guard = Guard()
-    guard.hold("acme/widgets", 7, "TASK-70", since=NOW - DAY)
-
-    result = run_sweep([hub], guard)
-
-    assert mine.is_dir(), "a known ref holds its checkout whatever its age"
-    assert scratch.is_dir()
-    assert not other.exists(), "a known ref never holds the rest of the hub"
-    assert guard.all_checkouts == {}
-    assert len(result.held) == 2
-
-
-def test_the_backstop_voids_a_hub_wide_hold_on_checkouts_older_than_the_stale_window(tmp_path):
-    hub = make_hub(tmp_path)
-    stale_checkout = folder(hub / "REVIEW-TASK-81", age=STALE + 60)
-    young_one = folder(hub / "main" / "REVIEW-TASK-82", age=STALE - 60)
-    known = folder(hub / "REVIEW-TASK-70", age=3 * DAY)
-    scratch = folder(hub / "main" / ".review-scratch-pr7-r1", age=3 * DAY)
-    guard = Guard()
-    guard.hold("acme/widgets", 7, "TASK-70")
-    guard.hold("acme/widgets", 8, None)  # hub-wide, no spawn time
-
-    without = sweep([hub], guard, grace_seconds=60, now=NOW, runner=Runner())
-    assert stale_checkout.is_dir() and young_one.is_dir()
-    assert without.backstop is False and without.backstop_released == 0
-
-    result = sweep([hub], guard, grace_seconds=60, now=NOW, runner=Runner(),
-                   stale_round_seconds=STALE)
-
-    assert result.backstop is True and result.backstop_released == 1
-    assert not stale_checkout.exists()
-    assert young_one.is_dir(), "inside the stale window a live round may own it"
-    assert known.is_dir() and scratch.is_dir(), "known-ref and PR holds are never voided"
+def test_round_folder_names_the_task_checkout_or_the_prs_own():
+    hub = Path("/ws/widgets")
+    assert janitor_mod.round_folder(hub, "TASK-70", 7) == hub / "REVIEW-TASK-70"
+    assert janitor_mod.round_folder(hub, None, 7) == hub / "REVIEW-pr7"
+    assert janitor_mod.round_folder(hub, "  ", 7) == hub / "REVIEW-pr7"
 
 
 def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypatch):
     hub = make_hub(tmp_path)
     folder(hub / "REVIEW-TASK-70", age=3 * DAY, files=("a", "b"))
-    folder(hub / "REVIEW-TASK-81", age=2 * DAY)
+    folder(hub / "REVIEW-pr8", age=2 * DAY)
     guard = Guard()
     guard.hold("acme/widgets", 7, "TASK-70")
-    guard.hold("acme/widgets", 8, None, since=NOW - 3 * DAY)
+    guard.hold("acme/widgets", 8, None)
     sizes: dict = {}
     walks = []
     real = janitor_mod.held_bytes_of
@@ -1202,7 +1260,7 @@ def test_held_bytes_are_counted_per_hub_and_reason_and_cached(tmp_path, monkeypa
 
     assert set(first.held_bytes) == {
         "widgets: TASK-70 has a live session or open round",
-        f"widgets: {janitor_mod.HUB_HOLD_BOUNDED}",
+        "widgets: PR #8 has a live session or open round",
     }
     assert all(size > 0 for size in first.held_bytes.values())
     assert first.top_held(1)[0][0].startswith("widgets: TASK-70"), "two files outweigh one"
@@ -1552,47 +1610,220 @@ def test_a_held_walk_resumes_from_its_progress(tmp_path):
     assert janitor_mod.held_bytes_of(root, lambda: False, progress) == janitor_mod.dir_bytes(root)
 
 
-def test_the_watcher_bounds_a_ledger_round_without_a_task_ref_by_its_spawn(ws, caplog):
-    w, alissa, hub = ws
-    session = "review-widgets-pr7-r1-abc123"
-    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
-                         session=session, task_ref=None)
-    spawned = int(time.time()) - 3 * DAY
-    w.state._db.execute("UPDATE spawns SET spawned_at = ?", (spawned,))
-    w.state._db.commit()
-    alissa.sessions = [ManagedSession(name=session, status="busy")]
-    newer = young_checkout(hub, "REVIEW-TASK-81", hours=2 * 24)
-    older = young_checkout(hub, "REVIEW-TASK-82", hours=4 * 24)
-
-    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
-        result = w._run_janitor()
-
-    assert newer.is_dir(), "made after the round spawned: it may be the round's"
-    assert not older.exists(), "older than the round's spawn: reclaimed"
-    assert result is not None and result.held_total > 0
-    summary = [r.getMessage() for r in caplog.records
-               if r.getMessage().startswith("janitor: removed 1 folder(s)")]
-    assert summary and f"widgets: {janitor_mod.HUB_HOLD_BOUNDED} = " in summary[0]
+# -- a task-less round's own folder, end to end (issue #232) --------------------
 
 
-@pytest.mark.parametrize("pct, released", [(94.9, False), (95.0, True)])
-def test_the_watcher_backstop_releases_a_rowless_sessions_hub_wide_hold(
-    ws, caplog, monkeypatch, pct, released
+@pytest.fixture
+def spawn_ws(tmp_path, monkeypatch):
+    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: 50.0)
+    root = tmp_path / "ws"
+    hub = make_hub(root, "widgets")
+    config = Config(
+        workspace_root=root,
+        hub_template="{root}/{repo}/main",
+        state_path=tmp_path / "state.db",
+        janitor_interval_minutes=10,
+        round_cap=3,
+    )
+    return config, hub
+
+
+def test_a_task_less_round_spawns_into_its_own_recorded_folder(spawn_ws, caplog):
+    """AC 2: a CR2 round (no review task) gets `<hub>/REVIEW-pr<N>`, made by
+    the daemon, named in its directive and its spawn log line, and recorded
+    on its spawn row with the spawn time. The janitor holds it while the
+    session lives -- whatever its age -- and removes it once the round is
+    over."""
+    config, hub = spawn_ws
+    w, _, al = watcher(config, make_pr(), [], task=None)
+    before = int(time.time())
+
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        decision = w.evaluate("acme", "widgets", 7)
+
+    own = hub / "REVIEW-pr7"
+    assert decision.session and own.is_dir()
+    (enqueued,) = al.enqueued
+    directive = enqueued["directive"]
+    assert str(own) in directive
+    # One checkout location, not two (round 1 of PR #233): the standing
+    # `../REVIEW-<review task ref>` rule is replaced, not contradicted.
+    assert _task_less_reviewer_rule(own) in directive
+    assert _REVIEWER_RULE not in directive
+    assert "../REVIEW-<review task ref> <the PR head>" not in directive
+    assert f"git worktree add {own}/wt <the PR head>" in directive
+    assert enqueued["cwd"] == hub / "main", "the session still starts in main/"
+    assert any("no open Alissa review task (CR2)" in r.getMessage()
+               and str(own) in r.getMessage() for r in caplog.records)
+    row = w.state.find_spawn_by_session(decision.session)
+    assert row["folder"] == str(own) and row["task_ref"] is None
+    assert row["spawned_at"] >= before
+
+    # Live, and older than any grace: held by its recorded folder.
+    (own / "notes.md").write_text("scratch")
+    old = time.time() - GRACE * 3
+    for each in (own / "notes.md", own):
+        os.utime(each, (old, old))
+    stranger = young_checkout(hub, "REVIEW-TASK-99", hours=GRACE * 3 / HOUR)
+    al.sessions = [ManagedSession(name=decision.session, status="busy")]
+
+    result = w._run_janitor()
+
+    assert own.is_dir(), "held while its session lives"
+    assert not stranger.exists(), "the live round does not hold the hub"
+    assert result is not None and [p for p, _ in result.held] == [own]
+
+    # The round ends: its session is reaped and gone from the roster.
+    al.sessions = []
+    w.state.record_reap(decision.session)
+    w._janitor_last -= 10 * 60
+    w._run_janitor()
+
+    assert not own.exists(), "removable once the round is over"
+
+
+def test_a_task_round_records_its_review_checkout_and_makes_nothing(spawn_ws):
+    config, hub = spawn_ws
+    w, _, al = watcher(config, make_pr(), [])
+
+    decision = w.evaluate("acme", "widgets", 7)
+
+    row = w.state.find_spawn_by_session(decision.session)
+    assert row["folder"] == str(hub / "REVIEW-TASK-500")
+    assert not (hub / "REVIEW-TASK-500").exists(), "the reviewer makes its checkout"
+    directive = al.enqueued[0]["directive"]
+    assert _REVIEWER_RULE in directive, "a task round keeps the standing rule"
+    assert "REVIEW-pr7" not in directive
+
+
+@pytest.mark.parametrize("template", [
+    ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE, PLAN_ROUND_1_DIRECTIVE,
+    PLAN_ROUND_K_DIRECTIVE, DISCOVERY_LIGHT_DIRECTIVE,
+])
+def test_every_reviewer_template_swaps_in_the_task_less_rule(template):
+    """Every reviewer template embeds `_REVIEWER_RULE` verbatim, so the
+    task-less swap lands in each, exactly once, and leaves no second
+    checkout location behind."""
+    assert template.count(_REVIEWER_RULE) == 1
+    own = Path("/ws/widgets/REVIEW-pr7")
+
+    out = _with_task_less_reviewer_rule(template, own)
+
+    assert out.count(_task_less_reviewer_rule(own)) == 1
+    assert "../REVIEW-<review task ref>" not in out.replace(
+        "the `../REVIEW-<review task ref>` location", "")
+    assert "This replaces the `../REVIEW-<review task ref>` location" in out
+
+
+def test_the_task_less_rule_is_appended_when_a_template_lacks_the_rule():
+    own = Path("/ws/widgets/REVIEW-pr7")
+    out = _with_task_less_reviewer_rule("Review it.", own)
+    assert out == "Review it. " + _task_less_reviewer_rule(own)
+
+
+def test_a_dry_run_task_less_spawn_makes_no_folder(spawn_ws):
+    config, hub = spawn_ws
+    config = Config(workspace_root=config.workspace_root, hub_template=config.hub_template,
+                    state_path=config.state_db, round_cap=3, dry_run=True)
+    w, _, _ = watcher(config, make_pr(), [], task=None)
+
+    w.evaluate("acme", "widgets", 7)
+
+    assert not (hub / "REVIEW-pr7").exists()
+
+
+# -- escalation: Needs-you rows in the fleet vitals (issue #232) ------------------
+
+
+def test_seat_inbox_rows_flag_a_volume_under_two_gb_free():
+    low = fleet_vitals.seat_inbox_rows(
+        "/workspace", free_bytes=fleet_vitals.VOLUME_LOW_BYTES - 1, used_pct=99.0,
+    )
+    enough = fleet_vitals.seat_inbox_rows(
+        "/workspace", free_bytes=fleet_vitals.VOLUME_LOW_BYTES, used_pct=95.0,
+    )
+    unreadable = fleet_vitals.seat_inbox_rows("/workspace", free_bytes=None)
+
+    assert enough == [] and unreadable == []
+    (row,) = low
+    assert row["kind"] == "volume-low" and row["isPr"] is False
+    assert row["repo"] is None and row["number"] is None
+    assert "/workspace" in row["subject"] and "99.0% used" in row["subject"]
+    assert row["lever"]
+
+
+def test_the_daemon_pushes_both_needs_you_rows_ahead_of_the_pr_pages(tmp_path, monkeypatch):
+    """AC 3: under 2 GB free the snapshot carries `volume-low`, and while the
+    ledger refuses passes `ledger-unwritable` (with its age) -- ahead of the
+    per-PR rows, so the list cap never drops them."""
+    monkeypatch.setattr(fleet_vitals, "disk_free_bytes", lambda path: 700 * 1024 ** 2)
+    monkeypatch.setattr(fleet_vitals, "volume_used_pct", lambda path: 99.0)
+    sources = FakeSources()
+    page = {"kind": "stalled", "repo_slug": "acme/widgets", "number": 7,
+            "age_seconds": 60, "url": "https://github.com/acme/widgets/pull/7"}
+    sources.inbox = lambda: {"live": [page] * (fleet_vitals.LIST_CAP + 5)}
+    unwritable = {"for": 125.0}
+    pusher = FleetVitalsPusher(
+        Config(workspace_root=tmp_path, state_path=tmp_path / "state.db"),
+        sources, FakeVitalsClient(), clock=lambda: WALL,
+        ledger_reader=lambda: unwritable["for"],
+    )
+
+    body = pusher.build(heartbeat_at=WALL, queue_depth=0)
+
+    kinds = [row["kind"] for row in body["inbox"]]
+    assert kinds[:2] == ["ledger-unwritable", "volume-low"]
+    assert len(kinds) == fleet_vitals.LIST_CAP
+    assert body["inbox"][0]["ageS"] == 125
+    assert "700.0 MiB free" in body["inbox"][1]["subject"]
+
+    unwritable["for"] = None
+    monkeypatch.setattr(fleet_vitals, "disk_free_bytes", lambda path: 30 * 1024 ** 3)
+    body = pusher.build(heartbeat_at=WALL, queue_depth=0)
+    assert {row["kind"] for row in body["inbox"]} == {"stalled"}
+
+
+def test_the_watcher_wires_its_ledger_streak_into_the_vitals(ws, monkeypatch):
+    w, _, _ = ws
+    seen = {}
+
+    def fake_build_pusher(config, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    from alissa.tools.github.revloop import loop as loop_module
+    monkeypatch.setattr(loop_module, "build_pusher", fake_build_pusher)
+    config = Config(workspace_root=w.config.workspace_root,
+                    state_path=w.config.state_db, fleet_vitals_enabled=True)
+    fresh = ReviewWatcher(config, github=FakeGitHub(make_pr(), []), alissa=FakeAlissa(),
+                          state=w.state)
+
+    assert seen["ledger_reader"]() is None
+    fresh._note_ledger_unwritable()
+    assert seen["ledger_reader"]() is not None
+
+
+def test_an_unwritable_ledger_still_sweeps_and_pushes_vitals_on_the_first_pass(
+    ws, monkeypatch, caplog
 ):
-    w, alissa, hub = ws
-    monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: pct)
-    alissa.sessions = [ManagedSession(name="review-pr-7", status="busy")]
+    """AC 3: the ledger-unwritable condition escalates on its FIRST pass --
+    an ERROR line, the vitals push (whose snapshot carries the row) and a
+    janitor sweep, the one part of a pass that frees space -- and the pass is
+    still refused."""
+    from alissa.tools.github.revloop.loop import LedgerUnwritable
+
+    w, _, hub = ws
+    monkeypatch.setattr(w.state, "writable", lambda: False)
+    pushed = []
+    monkeypatch.setattr(w, "_push_fleet_vitals",
+                        lambda completed_at: pushed.append(w._ledger_unwritable_for()))
     scratch, review = stale_pair(hub, 7, "TASK-70")
 
     with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
-        result = w._run_janitor()
+        with pytest.raises(LedgerUnwritable):
+            w.poll_once()
 
-    assert scratch.is_dir(), "the PR's own scratch stays held"
-    assert review.exists() is not released
-    assert result is not None and result.backstop is released
-    warns = [r for r in caplog.records if "hub-wide holds are void" in r.getMessage()]
-    assert len(warns) == (1 if released else 0)
-    if released:
-        assert warns[0].levelno == logging.WARNING
-        assert "1 released" in warns[0].getMessage()
-        assert "PR #7 has a live session or open round = " in warns[0].getMessage()
+    (line,) = [r for r in caplog.records if "cannot be written" in r.getMessage()]
+    assert line.levelno == logging.ERROR
+    assert pushed == [pytest.approx(0.0, abs=5)]
+    assert not scratch.exists() and not review.exists(), "the janitor ran"

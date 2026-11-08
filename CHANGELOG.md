@@ -16,6 +16,23 @@ header).
 
 ## Unreleased
 
+- **The janitor holds folders, never a hub; sustained pressure and an
+  unwritable ledger reach the operator** (issue #232; origin TASK-1486193834,
+  implementation TASK-1931317059). On 2026-11-08 one review-task-less (CR2)
+  round held every `REVIEW-*` checkout in its hub, 44 dead ones (33.6 GiB)
+  stayed for hours, the volume reached 99% and the ledger went unwritable.
+  Every spawn row now records its round's folder (`folder` column, beside
+  `spawned_at`): `REVIEW-<review task>`, or `REVIEW-pr<N>` for a round with
+  no review task, which the daemon makes and names in the directive and the
+  spawn log line. The janitor's hold is per folder (the PR's scratch, the
+  review task's checkout, `REVIEW-pr<N>`, the recorded folder); the hub-wide
+  hold and its 95% backstop are gone. `janitor.volume_pressure` now fires
+  once three sweeps at or above the warn line freed nothing and carries
+  `heldBytes` and `held`. The fleet vitals' `inbox` carries `volume-low`
+  (under 2 GiB free) and `ledger-unwritable` rows for Needs-you, and the
+  ledger-unwritable condition logs at ERROR from its first pass, still
+  pushing vitals and running the janitor.
+
 ## 0.31.42 (2026-11-06)
 
 - **A content error in a discovery findings file is a change request**

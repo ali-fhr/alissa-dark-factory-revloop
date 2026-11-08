@@ -1324,6 +1324,40 @@ _REVIEWER_RULE = (
     "directory, `git worktree add ../REVIEW-<review task ref> <the PR head>`. "
 )
 
+
+def _task_less_reviewer_rule(folder: Path) -> str:
+    """The reviewer rule of a round spawned with no review task (issue #232).
+
+    Its spawn row records `REVIEW-pr<N>` and no task ref, so a checkout made
+    under the review task the reviewer creates later (`../REVIEW-<review task
+    ref>`, the standing rule and the review skill's step) is one the janitor
+    cannot attribute to the live round. This variant REPLACES that rule in the
+    rendered directive -- one location, never two -- and says so, so the
+    skill's own checkout step does not win over it."""
+    return (
+        "You never push and never delete: a reviewer that needs scratch files "
+        "writes them under its own checkout and leaves them. This round has "
+        f"its own folder, `{folder}`, which the daemon made and holds while "
+        "the round lives: write any scratch files there, and make any "
+        "checkout you need to run code inside it -- `git worktree add "
+        f"{folder}/wt <the PR head>`. This replaces the `../REVIEW-<review "
+        "task ref>` location the review skill names, for this whole round, "
+        "even after you create the review task: a checkout anywhere else is "
+        "not held for you. "
+    )
+
+
+def _with_task_less_reviewer_rule(directive: str, folder: Path) -> str:
+    """Swap `_REVIEWER_RULE` for the task-less variant in a rendered directive
+    (every reviewer template embeds the rule verbatim, so the templates and
+    their pinned digests stay as they are). A template without the rule gets
+    the variant appended, so the round still names its folder."""
+    rule = _task_less_reviewer_rule(folder)
+    if _REVIEWER_RULE in directive:
+        return directive.replace(_REVIEWER_RULE, rule, 1)
+    return directive.rstrip() + " " + rule
+
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
@@ -3021,6 +3055,7 @@ class ReviewWatcher:
                 config_reader=self._vitals_config,
                 upgrader=self.self_upgrade,
                 probes_reader=lambda: self._boot_probes,
+                ledger_reader=self._ledger_unwritable_for,
             )
             if config.fleet_vitals_enabled
             else None
@@ -3098,6 +3133,10 @@ class ReviewWatcher:
         # under the line closes it. In memory, so a restart under pressure
         # opens (and reports) a new episode.
         self._janitor_pressure_since: "float | None" = None
+        # Consecutive sweeps at or above `janitor_warn_pct` that freed
+        # nothing (issue #232): the episode opens -- one
+        # `janitor.volume_pressure` event -- at janitor_mod.PRESSURE_SWEEPS.
+        self._janitor_pressed_sweeps = 0
         # Held folders' sizes from the last sweep, path -> (mtime, bytes,
         # sized at) (issues #185, #187): the held-bytes summary re-walks only
         # what changed or is older than janitor_mod.SIZE_CACHE_SECONDS.
@@ -7291,6 +7330,16 @@ class ReviewWatcher:
         # was decided in _refused_before_start, above the CI gate, so a round
         # that will never start buys no rollup.
         plan = is_plan_pr(self.config, pr)
+        # The round's own folder (issue #232), recorded on its spawn row and
+        # held by the janitor while the round is live: `REVIEW-<review task>`
+        # beside `main/`, or -- for a round with no review task yet --
+        # `REVIEW-pr<N>`, which the daemon makes below so the reviewer has a
+        # folder of its own to write into instead of an unattributable one.
+        folder = janitor_mod.round_folder(
+            hub_root_of(self.config.hub_for(pr.owner, pr.repo)),
+            task.ref if task else None,
+            pr.number,
+        )
         if plan and task is None:
             # The ordinary round 1 of a plan PR, not a CR2 gap: a plan has no
             # origin task and no implementer to have made one, so its first
@@ -7315,8 +7364,9 @@ class ReviewWatcher:
         elif task is None:
             log.warning(
                 "%s has no open Alissa review task (CR2) — spawning against the PR "
-                "URL; the reviewer must create or locate one before recording a verdict",
-                pr.slug,
+                "URL in its own folder %s; the reviewer must create or locate one "
+                "before recording a verdict",
+                pr.slug, folder,
             )
             assignment = (
                 f"Review the GitHub PR {pr.url} . There is no Alissa review task for "
@@ -7347,6 +7397,11 @@ class ReviewWatcher:
             checks=checks,
             stability=stability.text if stability is not None else "",
         )
+        if task is None:
+            # One checkout location, not two (issue #232 round 1): the
+            # standing `../REVIEW-<review task ref>` rule is swapped for the
+            # round's own folder, the one its spawn row records.
+            directive = _with_task_less_reviewer_rule(directive, folder)
 
         hub, problem = self._ensure_hub(pr, task_ref=task.ref if task else None)
         if problem is not None:
@@ -7361,6 +7416,17 @@ class ReviewWatcher:
         refused = self._claim_spawn(pr, round_, name, late=True)
         if refused is not None:
             return refused
+
+        if task is None and not self.config.dry_run:
+            try:
+                folder.mkdir(exist_ok=True)
+            except OSError as exc:
+                # The round still records it: the reviewer's own mkdir or
+                # `git worktree add` makes it, and the hold is by path.
+                log.warning(
+                    "%s round %d: could not make the round's folder %s (%s)",
+                    pr.slug, round_, folder, exc,
+                )
 
         self.alissa.enqueue_reviewer(
             session=name,
@@ -7399,6 +7465,8 @@ class ReviewWatcher:
                 # What the PR serves (issue #165), for the round events.
                 issue_number=pr_closing_issue(pr.body, pr.full_name),
                 task_number=task_number_of(pr_origin_task_ref(pr.body)),
+                # The round's folder (issue #232): the janitor's hold.
+                folder=str(folder),
             )
             # Recorded only once the round is actually enqueued, and beside
             # the spawn row for the same reason: a notice the reviewer never
@@ -8679,6 +8747,14 @@ class ReviewWatcher:
         # during the substrate incident this whole change is about.
         if not self.config.dry_run and not self.state.writable():
             self._note_ledger_unwritable()
+            # The ledger is unwritable mostly because the volume is full
+            # (issue #232, 2026-11-08): the janitor is the one part of the
+            # pass that frees space and decides nothing the ledger must
+            # record, and the vitals push is how the operator hears of it
+            # (its `ledger-unwritable` inbox row). Both are best-effort and
+            # never raise.
+            self._push_fleet_vitals(completed_at=time.time())
+            self._run_janitor()
             raise LedgerUnwritable(str(self.config.state_db))
         self._note_ledger_writable()
 
@@ -8912,9 +8988,8 @@ class ReviewWatcher:
         stamp = time.time() if now is None else now
         pct = self._volume_used_pct()
         pressed = pct is not None and pct >= self.config.janitor_warn_pct
-        backstop = pct is not None and pct >= janitor_mod.BACKSTOP_PCT
         try:
-            result = self._sweep_workspace(stamp, pressed=pressed, backstop=backstop)
+            result = self._sweep_workspace(stamp, pressed=pressed)
         except Exception as exc:
             log.warning(
                 "janitor: sweep failed unexpectedly (%s: %s) — nothing more is "
@@ -8941,7 +9016,7 @@ class ReviewWatcher:
         return pct is not None and pct >= self.config.janitor_warn_pct
 
     def _sweep_workspace(
-        self, now: float, *, pressed: bool = False, backstop: bool = False
+        self, now: float, *, pressed: bool = False
     ) -> "janitor_mod.SweepResult | None":
         if not janitor_mod.layout_supported(
             self.config.hub_for, self.config.workspace_root
@@ -8976,17 +9051,8 @@ class ReviewWatcher:
                 self.config.janitor_pressure_grace_minutes * 60 if pressed else None
             ),
             under_pressure=self._volume_pressed if pressed else None,
-            stale_round_seconds=STALE_ROUND_SECONDS if backstop else None,
             sizes=self._janitor_sizes,
         )
-        if result.backstop:
-            log.warning(
-                "janitor: volume at or above %d%% — hub-wide holds are void for "
-                "checkouts older than %d minute(s); %d released; %s held%s",
-                int(janitor_mod.BACKSTOP_PCT), STALE_ROUND_SECONDS // 60,
-                result.backstop_released, janitor_mod.human(result.held_total),
-                janitor_mod.held_reasons(result.top_held()),
-            )
         if result.pressure:
             log.info(
                 "janitor: volume at or above %d%% — the grace dropped to %d "
@@ -9029,9 +9095,10 @@ class ReviewWatcher:
         reaped, and a verdict post still owed. The roster is the pass's
         post-reap listing when the sweep produced one.
 
-        Every hold carries its round's spawn time (issue #185), so a round
-        whose review-task ref is not known yet holds only the checkouts in
-        its hub made since it spawned."""
+        Every hold is per folder (issue #232): a round holds its PR's
+        scratch folders, its review task's checkout, its PR's `REVIEW-pr<N>`
+        and the folder its spawn row recorded -- never its whole hub, so a
+        round whose review-task ref is not known yet holds nothing more."""
         sessions = self._pass_roster
         if sessions is None:
             try:
@@ -9048,20 +9115,18 @@ class ReviewWatcher:
             if row is not None:
                 guard.hold(
                     str(row["repo"]), int(row["number"]), row["task_ref"],
-                    since=row["spawned_at"],
+                    folder=row["folder"],
                 )
             else:
                 # No ledger row (a skill-shaped `review-pr-<n>`): the name is
                 # the only evidence, and a name without a repo holds its PR
-                # number in every hub. The roster reports no start time, so
-                # its hold on the hub's checkouts stays unbounded (issue
-                # #185); the >=95% backstop is what reaches past it.
+                # number -- its scratch and its `REVIEW-pr<N>` -- in every hub.
                 guard.hold(ref.repo, ref.number)
         for spawn_row in self.state.read_spawns(since=now - STALE_ROUND_SECONDS):
             if not self.state.is_reaped(str(spawn_row["session"])):
                 guard.hold(
                     str(spawn_row["repo"]), int(spawn_row["number"]),
-                    spawn_row["task_ref"], since=spawn_row["spawned_at"],
+                    spawn_row["task_ref"], folder=spawn_row["folder"],
                 )
         for post in self.state.read_verdict_posts():
             if post["posted_at"] is None and post["abandoned_at"] is None:
@@ -9071,7 +9136,7 @@ class ReviewWatcher:
                 guard.hold(
                     str(post["repo"]), int(post["number"]),
                     spawn["task_ref"] if spawn is not None else None,
-                    since=spawn["spawned_at"] if spawn is not None else None,
+                    folder=spawn["folder"] if spawn is not None else None,
                 )
         return guard
 
@@ -9083,11 +9148,14 @@ class ReviewWatcher:
     ) -> None:
         """One WARNING when the workspace volume is at or above
         `janitor_warn_pct` (0 = never), and the pressure EPISODE (issue
-        #177): the first sweep at or above the line records ONE
-        `volume-pressure:` ping -- what the sweep freed and left folded in --
-        which loop_events derives into one `janitor.volume_pressure` event;
-        the first reading back under the line (after this sweep, or at a
-        later one) closes the episode. Dry-run records nothing: it shares the
+        #177): once janitor_mod.PRESSURE_SWEEPS consecutive sweeps at or
+        above the line have freed nothing (issue #232 -- sustained pressure
+        is an incident, a sweep that frees bytes is the janitor at work),
+        ONE `volume-pressure:` ping is recorded -- what the sweep freed and
+        left, and the held-size breakdown, folded in -- which loop_events
+        derives into one `janitor.volume_pressure` event; the first reading
+        back under the line (after this sweep, or at a later one) closes the
+        episode and resets the count. Dry-run records nothing: it shares the
         ledger with production, so it only says what it would record. Never
         raises."""
         threshold = self.config.janitor_warn_pct
@@ -9096,15 +9164,25 @@ class ReviewWatcher:
         if pct < threshold:
             self._close_pressure_episode(pct)
             return
-        log.warning(
-            "janitor: workspace volume %s is %.1f%% used (warn at %d%%)",
-            self.config.workspace_root, pct, threshold,
+        freed = result.freed if result is not None else 0
+        self._janitor_pressed_sweeps = (
+            0 if freed > 0 else self._janitor_pressed_sweeps + 1
         )
-        if self._janitor_pressure_since is None:
+        log.warning(
+            "janitor: workspace volume %s is %.1f%% used (warn at %d%%) — %d "
+            "sweep(s) in a row freed nothing",
+            self.config.workspace_root, pct, threshold,
+            self._janitor_pressed_sweeps,
+        )
+        if (
+            self._janitor_pressure_since is None
+            and self._janitor_pressed_sweeps >= janitor_mod.PRESSURE_SWEEPS
+        ):
             kind = volume_pressure_kind(
-                stamp, pct, threshold,
-                result.freed if result is not None else 0,
+                stamp, pct, threshold, freed,
                 result.left if result is not None else None,
+                held=result.top_held() if result is not None else None,
+                held_total=result.held_total if result is not None else None,
             )
             if self.config.dry_run:
                 log.info("[dry-run] janitor: would record %s", kind)
@@ -9124,6 +9202,7 @@ class ReviewWatcher:
             self._close_pressure_episode(after)
 
     def _close_pressure_episode(self, pct: float) -> None:
+        self._janitor_pressed_sweeps = 0
         if self._janitor_pressure_since is None:
             return
         self._janitor_pressure_since = None
@@ -9159,8 +9238,12 @@ class ReviewWatcher:
         should_log, crossing = self._ledger_streak.record(now)
         if not should_log:
             return
+        # Escalated from the FIRST pass (issue #232): on 2026-11-08 the
+        # WARNING fired for hours while the volume sat at 99%, and nothing
+        # reached the operator. The fleet vitals carry a `ledger-unwritable`
+        # inbox row (`_ledger_unwritable_for`) for as long as it lasts.
         log.log(
-            logging.ERROR if self._ledger_streak.escalated else logging.WARNING,
+            logging.ERROR,
             "ledger at %s cannot be written — skipping this pass entirely "
             "(%d consecutive, %.0f min)%s: the daemon will not spawn, escalate, "
             "grant or post what it cannot record. It is alive and re-probing "
@@ -9170,6 +9253,14 @@ class ReviewWatcher:
             self._ledger_streak.held(now) / 60,
             " — this is no longer transient" if crossing else "",
         )
+
+    def _ledger_unwritable_for(self) -> "float | None":
+        """Seconds the ledger has refused passes, or None while it is
+        writable: the vitals' `ledger-unwritable` inbox row (issue #232)."""
+        streak = getattr(self, "_ledger_streak", None)
+        if streak is None or not streak.count:
+            return None
+        return streak.held(time.monotonic())
 
     def _note_ledger_writable(self) -> None:
         """Announce that the gate has re-opened. Unconditional, like the

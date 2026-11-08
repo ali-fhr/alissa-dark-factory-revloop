@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS spawns (
     task_ref   TEXT,
     spawned_at INTEGER NOT NULL,
     issue_number INTEGER,
-    task_number  INTEGER
+    task_number  INTEGER,
+    folder       TEXT
 )"""
 
 SCHEMA = f"""
@@ -416,6 +417,10 @@ _ADDED_COLUMNS = {
     "spawns": (
         ("issue_number", "INTEGER"),
         ("task_number", "INTEGER"),
+        # The round's own workspace folder, recorded at spawn (issue #232):
+        # what the janitor holds while the round is live. NULL on every row
+        # spawned before it, which then holds no folder by path.
+        ("folder", "TEXT"),
     ),
 }
 
@@ -769,18 +774,22 @@ class State:
         task_ref: str | None,
         issue_number: int | None = None,
         task_number: int | None = None,
+        folder: "str | None" = None,
     ) -> None:
         """`issue_number` / `task_number` are what the PR serves (issue
         #165): the same-repo issue its body closes and the origin task it
         names, None when it names none. The loop-event emitter stamps them
-        on every round event of the PR."""
+        on every round event of the PR. `folder` is the round's own
+        workspace folder (issue #232, `janitor.round_folder`), which the
+        janitor holds while the round is live; `spawned_at` is stamped
+        here."""
         self._db.execute(
             "INSERT OR REPLACE INTO spawns "
             "(repo, number, round, head_sha, session, task_ref, spawned_at, "
-            "issue_number, task_number) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "issue_number, task_number, folder) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (repo, number, round_, head_sha, session, task_ref, int(time.time()),
-             issue_number, task_number),
+             issue_number, task_number, folder),
         )
         self._db.commit()
 
@@ -1958,7 +1967,7 @@ class State:
         """
         sql = (
             "SELECT repo, number, round, head_sha, session, task_ref, spawned_at, "
-            "issue_number, task_number "
+            "issue_number, task_number, folder "
             "FROM spawns"
         )
         params: tuple = ()

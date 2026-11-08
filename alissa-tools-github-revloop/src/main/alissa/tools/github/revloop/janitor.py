@@ -27,7 +27,7 @@ session and no open ledger round still holds. The HOLD is the caller's
 this module states what a folder is, whether a `Guard` holds it, and removes
 it.
 
-Three properties everything here is written around:
+Four properties everything here is written around:
 
 * **Only the two shapes, only where they are made.** A scratch folder is a
   `.review-scratch-*` DIRECT child of `<hub>/main`, a review checkout a
@@ -42,9 +42,16 @@ Three properties everything here is written around:
   and the grace is a day by default. A held folder is kept whatever its age.
   Under disk PRESSURE (issue #177) the grace drops -- to two hours by default
   -- oldest first, only while the volume is still at or above its warn line.
-  A round that names no review task yet holds only its hub's checkouts made
-  since it spawned (issue #185), and at or above `BACKSTOP_PCT` no such
-  hub-wide hold reaches a checkout older than the stale-round window.
+* **Held per folder, never per hub** (issue #232). A live round holds the
+  folders it can be shown to own: its PR's scratch folders, the checkout its
+  review task names, `REVIEW-pr<N>` for its PR, and the folder the ledger
+  recorded for it at spawn (`round_folder`). A round that names none of them
+  holds nothing else -- its hub's `main/` and `.source` are never candidates
+  anyway, and a folder it made but the ledger cannot name is protected by the
+  grace, as every fresh folder is. Before issue #232 such a round held every
+  checkout in its hub (issues #185, #232: 44 dead checkouts, 33.6 GiB, kept
+  for hours on 2026-11-08 by a steady trickle of review-task-less rounds,
+  until the volume reached 99% and the ledger went unwritable).
 * **Nothing raises past its own concern.** A folder that vanishes mid-sweep,
   an unreadable hub, a failed removal: logged and skipped, because this runs
   at the end of a poll pass that must complete.
@@ -69,7 +76,7 @@ from typing import Callable, Iterable
 
 from .alissa import session_repo_slug
 from .proc import CommandError, run
-from .trust import REVIEW_CHECKOUT_PREFIX
+from .trust import REVIEW_CHECKOUT_PREFIX, review_checkout_name
 
 log = logging.getLogger(__name__)
 
@@ -79,8 +86,18 @@ SCRATCH_PREFIX = ".review-scratch-"
 # What a scratch folder's name says about its round: `pr<N>` and, usually,
 # `-r<round>`. Prefix-matched after SCRATCH_PREFIX, so a suffix a session
 # appended (`-2`, `.old`) still names its PR. A name that does not parse
-# names no PR, and is held whenever anything in its hub is (see Guard).
+# names no PR, and nothing holds it past the grace (issue #232).
 _SCRATCH_PR_RE = re.compile(r"pr(?P<number>\d+)(?:-r(?P<round>\d+))?")
+
+# A review-task-less round's own folder (issue #232): `REVIEW-pr<N>`, beside
+# `main/`, named by `round_folder` and recorded on the round's spawn row.
+# Matched whole after REVIEW_CHECKOUT_PREFIX (an optional `-r<round>` aside),
+# so `REVIEW-pr7` names PR 7 and `REVIEW-project-x` names nothing.
+_CHECKOUT_PR_RE = re.compile(r"pr(?P<number>\d+)(?:-r\d+)?")
+
+# A round suffix a checkout name may carry after its task ref
+# (`REVIEW-TASK-<n>-r<k>`); the hold compares the ref without it.
+_ROUND_SUFFIX_RE = re.compile(r"-r\d+$")
 
 # The hub's bare repository, which every worktree (`main/`, a REVIEW-
 # checkout, a scratch folder's `wt/`) points into. Its presence is what makes
@@ -107,15 +124,11 @@ SUPPORTED_TEMPLATE = "{root}/{repo}/main"
 _PROBE_OWNERS = ("janitor-probe-owner-a", "janitor-probe-owner-b")
 _PROBE_REPO = "janitor-probe-repo"
 
-# How far before a round's spawn time a checkout may be stamped and still
-# be held by that round when its review-task ref is unknown (issue #185):
-# clock skew between the ledger's stamp and the filesystem's.
-HOLD_SKEW_SECONDS = 5 * 60
-
-# The volume used percentage at or above which the pressure backstop applies
-# (issue #185): a hub-wide hold is void for checkouts older than the stale-
-# round window, and one WARNING names what holds the most bytes.
-BACKSTOP_PCT = 95.0
+# Sustained pressure (issue #232): this many consecutive sweeps at or above
+# `janitor_warn_pct` that freed nothing open the pressure episode -- one
+# `janitor.volume_pressure` loop event. A sweep that frees bytes is the
+# janitor doing its job, not yet an incident.
+PRESSURE_SWEEPS = 3
 
 # How long a held folder's cached size is trusted (issue #187). The cache is
 # keyed on the folder's newest mtime, which only sees the folder and its
@@ -153,9 +166,9 @@ class HeldWalk:
 # at least once (issue #197): its folder keeps a kept walk's place in line.
 SizeCache = dict[Path, "tuple[float, int, float, float] | HeldWalk"]
 
-# The two reasons a hub-wide hold gives, so the sweep summary groups them.
-HUB_HOLD_BOUNDED = "a live round in this hub names no review task and spawned before this checkout"
-HUB_HOLD_UNBOUNDED = "a live round in this hub names no review task or spawn time"
+# The reason a live round's recorded folder (issue #232) is held under, when
+# its name does not already say which round owns it.
+RECORDED_FOLDER_HOLD = "a live round recorded it as its folder at spawn"
 
 Runner = Callable[..., str]
 
@@ -165,7 +178,7 @@ class Candidate:
     """One folder the janitor may remove: its path, which hub it is under,
     what kind it is, and what its name says it belongs to -- the PR number for
     a scratch folder (None when the name does not parse), the task ref for a
-    review checkout."""
+    review checkout, or its PR number for a `REVIEW-pr<N>` one (issue #232)."""
 
     path: Path
     hub: Path
@@ -182,7 +195,7 @@ class Candidate:
 
 @dataclass
 class Guard:
-    """What the live roster and the open ledger rounds hold, per hub.
+    """What the live roster and the open ledger rounds hold, per FOLDER.
 
     Keyed by the repo SLUG (`session_repo_slug` of the repo name) -- the one
     form a hub directory, a ledger row and a session name all reduce to. Two
@@ -190,84 +203,76 @@ class Guard:
     holds MORE than needed. The key None means "every hub": a skill-shaped
     `review-pr-<n>` session names no repo, and holds its PR number anywhere.
 
-    A round whose review-task ref is unknown cannot be mapped to a single
-    REVIEW- checkout -- every fresh round starts that way, since the reviewer
-    creates its review task after it spawns. Such a round holds the checkouts
-    in its hub that are NEWER than its spawn time less `HOLD_SKEW_SECONDS`
-    (issue #185): a checkout older than every unknown-ref round in the hub
-    cannot belong to any of them. `all_checkouts` keeps, per hub, the
-    earliest such bound; None there means a round whose spawn time is not
-    known either, and holds every checkout in the hub, as before issue #185
-    -- the hold that, with studio reviews running near-continuously, kept 78
-    dead checkouts (~44 GB) and filled the fleet's volume on 2026-10-21.
+    A held round holds exactly the folders it can be shown to own (issue
+    #232): its PR's `.review-scratch-pr<N>-*` folders, the `REVIEW-<task
+    ref>` checkout its review task names (a `-r<k>` suffix aside), its PR's
+    `REVIEW-pr<N>` folder, and the folder its ledger row recorded at spawn
+    (`folders`, absolute paths). There is no hub-wide hold any more: a round
+    whose review task is not known yet -- every fresh round, and every round
+    of a PR no review task was opened for (CR2) -- holds its recorded folder
+    and nothing else, and a folder no live round names is removable once it
+    is past the grace. Until issue #232 such a round held every checkout in
+    its hub (bounded by its spawn time since issue #185, unbounded without
+    one), which on 2026-11-08 kept 44 dead checkouts (33.6 GiB) for hours.
     """
 
     numbers: "dict[str | None, set[int]]" = field(default_factory=dict)
     tasks: "dict[str | None, set[str]]" = field(default_factory=dict)
-    all_checkouts: "dict[str | None, float | None]" = field(default_factory=dict)
+    folders: "set[str]" = field(default_factory=set)
 
     def hold(
         self,
         repo: "str | None",
         number: int,
         task_ref: "str | None" = None,
-        since: "float | None" = None,
+        folder: "Path | str | None" = None,
     ) -> None:
         """Hold PR `number` of `repo` (`owner/name`, a bare name, or a
-        session-name slug; None = any hub) and the checkout its task names.
-        With no task ref, `since` (the round's spawn time, epoch seconds)
-        bounds the checkouts held in the hub; without it, every one is."""
+        session-name slug; None = any hub), the checkout its task names and
+        the round's recorded `folder` (an absolute path), when known."""
         slug = None if repo is None else session_repo_slug(repo.rpartition("/")[2])
         self.numbers.setdefault(slug, set()).add(int(number))
         ref = (task_ref or "").strip()
         if ref:
             self.tasks.setdefault(slug, set()).add(ref)
-            return
-        bound = None if since is None else float(since) - HOLD_SKEW_SECONDS
-        if slug in self.all_checkouts:
-            prev = self.all_checkouts[slug]
-            bound = None if prev is None or bound is None else min(prev, bound)
-        self.all_checkouts[slug] = bound
+        if folder:
+            self.folders.add(_folder_key(folder))
 
     def _in(self, table: "dict[str | None, set]", slug: str, value: object) -> bool:
         return value in table.get(slug, ()) or value in table.get(None, ())
 
-    def _any(self, slug: str) -> bool:
-        return bool(self.numbers.get(slug) or self.numbers.get(None))
-
-    def holds(
-        self,
-        candidate: Candidate,
-        mtime: "float | None" = None,
-        void_before: "float | None" = None,
-    ) -> "str | None":
-        """Why `candidate` must stay, or None when nothing holds it.
-
-        `mtime` is the candidate's age stamp (`newest_mtime`); a review
-        checkout with none is held by every hub-wide hold, bounded or not.
-        `void_before` is the pressure backstop (issue #185): a hub-wide hold
-        does not reach a checkout whose stamp is older than it. A known task
-        ref's hold and a scratch folder's are never voided."""
+    def holds(self, candidate: Candidate) -> "str | None":
+        """Why `candidate` must stay, or None when nothing holds it."""
         slug = candidate.hub_slug
         if candidate.kind == KIND_SCRATCH:
-            if candidate.number is None:
-                return "unnamed scratch in a hub with a live round" if self._any(slug) else None
-            if self._in(self.numbers, slug, candidate.number):
+            if candidate.number is not None and self._in(
+                self.numbers, slug, candidate.number
+            ):
                 return f"PR #{candidate.number} has a live session or open round"
             return None
-        if candidate.task_ref and self._in(self.tasks, slug, candidate.task_ref):
-            return f"{candidate.task_ref} has a live session or open round"
-        if mtime is not None and void_before is not None and mtime < void_before:
-            return None
-        for key in (slug, None):
-            if key not in self.all_checkouts:
-                continue
-            bound = self.all_checkouts[key]
-            if bound is None:
-                return HUB_HOLD_UNBOUNDED
-            if mtime is None or mtime >= bound:
-                return HUB_HOLD_BOUNDED
+        ref = _ROUND_SUFFIX_RE.sub("", candidate.task_ref or "")
+        if ref and self._in(self.tasks, slug, ref):
+            return f"{ref} has a live session or open round"
+        if candidate.number is not None and self._in(self.numbers, slug, candidate.number):
+            return f"PR #{candidate.number} has a live session or open round"
+        if _folder_key(candidate.path) in self.folders:
+            return RECORDED_FOLDER_HOLD
         return None
+
+
+def _folder_key(path: "Path | str") -> str:
+    """A folder path as the Guard compares it: absolute and normalized, never
+    resolved (a removed folder must still compare)."""
+    return os.path.normpath(os.path.abspath(os.fspath(path)))
+
+
+def round_folder(hub: "Path | str", task_ref: "str | None", number: int) -> Path:
+    """The folder a round records as its own at spawn (issue #232): beside
+    `main/` in its hub, `REVIEW-<task ref>` when the round has a review task
+    (the checkout the reviewer rule tells it to make) and `REVIEW-pr<N>` when
+    it has none (a CR2 round, whose reviewer creates its task later)."""
+    name = review_checkout_name(task_ref) or f"{REVIEW_CHECKOUT_PREFIX}pr{int(number)}"
+    return Path(hub) / name
 
 
 @dataclass
@@ -290,9 +295,8 @@ class SweepResult:
     pressure: bool = False
     pressure_removed: int = 0
     # Issue #185: bytes held per "<hub slug>: <reason>", so held growth is
-    # visible before it fills the disk; held folders not sized because the
-    # sweep's time budget ran out; and, when the backstop applied, how many
-    # checkouts only it released from a hub-wide hold.
+    # visible before it fills the disk, and held folders not sized because
+    # the sweep's time budget ran out.
     held_bytes: "dict[str, int]" = field(default_factory=dict)
     held_unsized: int = 0
     # Issue #187: held folders whose size came from the cache, not a walk
@@ -302,8 +306,6 @@ class SweepResult:
     # Issue #189: unsized held folders whose walk is kept to resume next
     # sweep (a subset of `held_unsized`).
     held_resuming: int = 0
-    backstop: bool = False
-    backstop_released: int = 0
 
     @property
     def freed(self) -> int:
@@ -432,9 +434,12 @@ def scan_hub(hub: Path) -> "list[Candidate]":
     for path in _dirs(hub, REVIEW_CHECKOUT_PREFIX) + _dirs(
         hub / "main", REVIEW_CHECKOUT_PREFIX
     ):
+        rest = path.name[len(REVIEW_CHECKOUT_PREFIX):]
+        match = _CHECKOUT_PR_RE.fullmatch(rest)
         found.append(Candidate(
             path=path, hub=hub, kind=KIND_REVIEW,
-            task_ref=path.name[len(REVIEW_CHECKOUT_PREFIX):],
+            number=int(match["number"]) if match else None,
+            task_ref=None if match else rest,
         ))
     return found
 
@@ -521,6 +526,15 @@ def human(size: "int | float") -> str:
     return f"{value:.1f} TiB"
 
 
+def disk_free_bytes(path: "Path | str") -> "int | None":
+    """Bytes free on the volume holding `path` (one statvfs), or None when
+    it cannot be read (issue #232: the vitals' low-volume signal)."""
+    try:
+        return int(shutil.disk_usage(os.fspath(path)).free)
+    except OSError:
+        return None
+
+
 def disk_used_pct(path: "Path | str") -> "float | None":
     """Used percent of the volume holding `path` (one statvfs, rounded to a
     tenth), or None when it cannot be read."""
@@ -603,7 +617,6 @@ def sweep(
     clock: "Callable[[], float]" = time.monotonic,
     pressure_grace_seconds: "float | None" = None,
     under_pressure: "Callable[[], bool] | None" = None,
-    stale_round_seconds: "float | None" = None,
     sizes: "SizeCache | None" = None,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
@@ -629,12 +642,6 @@ def sweep(
     same bound -- so it reports what one live sweep would do (a dry run frees
     nothing, so under pressure it reports every pressure-eligible folder).
 
-    The pressure backstop (issue #185): when `stale_round_seconds` is given
-    (the caller passes STALE_ROUND_SECONDS at or above `BACKSTOP_PCT`), a
-    hub-wide hold -- a round with no review-task ref -- is void for a
-    checkout older than that window: no live round can own a checkout older
-    than the stale window. `backstop_released` counts what only it freed.
-
     Every held folder is sized into `held_bytes` per hub and reason, AFTER
     the removal loop and on whatever is left of the time budget (issue
     #187): removal never pays for observability. A walk that reaches the
@@ -656,10 +663,6 @@ def sweep(
         result.pressure = under_pressure()
         if result.pressure:
             shrunk = min(grace_seconds, pressure_grace_seconds)
-    void_before = None
-    if stale_round_seconds is not None:
-        result.backstop = True
-        void_before = now - stale_round_seconds
     held_queue: "list[tuple[float, Candidate, str]]" = []
     aged: "list[tuple[float, Candidate]]" = []
     for hub in hub_list:
@@ -675,15 +678,7 @@ def sweep(
         if age < shrunk:
             result.fresh += 1
             continue
-        why = guard.holds(candidate, mtime)
-        if why is not None and void_before is not None:
-            if guard.holds(candidate, mtime, void_before) is None:
-                result.backstop_released += 1
-                log.info(
-                    "janitor: backstop releases %s (%.1f h old) from a hub-wide "
-                    "hold — %s", candidate.path, age / 3600, why,
-                )
-                why = None
+        why = guard.holds(candidate)
         if why is not None:
             log.debug("janitor: keeping %s — %s", candidate.path, why)
             result.held.append((candidate.path, why))

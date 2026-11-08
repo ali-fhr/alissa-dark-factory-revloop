@@ -1404,6 +1404,7 @@ def test_a_volume_pressure_row_derives_one_anchorless_event(ledger, clock):
         "data": {
             "usedPct": 99.1, "warnPct": 80,
             "freedBytes": 43 * 1024 ** 3, "foldersLeft": 2,
+            "heldBytes": None, "held": None,
         },
     }
     assert re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$", event["kind"])
@@ -1419,7 +1420,38 @@ def test_a_sweep_that_did_not_run_carries_folders_left_null(ledger, clock):
 
     assert event["data"] == {
         "usedPct": 91.0, "warnPct": 80, "freedBytes": 0, "foldersLeft": None,
+        "heldBytes": None, "held": None,
     }
+
+
+def test_a_volume_pressure_row_carries_the_held_size_breakdown(ledger, clock):
+    """Issue #232: the sweep's held total and its largest held reasons ride
+    the row -- reasons with colons and spaces included -- at most
+    VOLUME_HELD_TOP of them, and come out as `heldBytes` / `held`."""
+    held = [(f"widgets: PR #{n} has a live session or open round", 10 * n)
+            for n in range(9, 0, -1)]
+    kind = loop_events.volume_pressure_kind(
+        1_792_340_000, 97.0, 80, 0, 44, held=held, held_total=33 * 1024 ** 3,
+    )
+    ledger.record_ping("", 0, kind)
+
+    (event,) = _pressure_events(ledger)
+
+    assert event["data"]["heldBytes"] == 33 * 1024 ** 3
+    assert event["data"]["foldersLeft"] == 44
+    assert event["data"]["held"] == [
+        {"reason": reason, "bytes": size}
+        for reason, size in held[:loop_events.VOLUME_HELD_TOP]
+    ]
+
+
+def test_a_volume_pressure_row_with_an_unparseable_held_tail_still_derives(ledger, clock):
+    ledger.record_ping("", 0, "volume-pressure:100:95.0:80:0:3:7:[1,2]")
+
+    (event,) = _pressure_events(ledger)
+
+    assert event["data"]["foldersLeft"] == 3
+    assert event["data"]["held"] is None and event["data"]["heldBytes"] is None
 
 
 def test_two_episodes_are_two_events(ledger, clock):
