@@ -1325,7 +1325,17 @@ _REVIEWER_RULE = (
 )
 
 
-def _task_less_reviewer_rule(folder: Path) -> str:
+def task_less_checkout(folder: Path, round_: int) -> Path:
+    """The checkout a task-less round makes inside its folder (issue #234).
+
+    `REVIEW-pr<N>` is the same folder for every task-less round of a PR and
+    reviewers never delete, so one shared `<folder>/wt` met `fatal: '…/wt'
+    already exists` on the PR's second task-less round. Each round gets its
+    own leaf, still inside the held folder."""
+    return folder / f"wt-r{round_}"
+
+
+def _task_less_reviewer_rule(folder: Path, round_: int) -> str:
     """The reviewer rule of a round spawned with no review task (issue #232).
 
     Its spawn row records `REVIEW-pr<N>` and no task ref, so a checkout made
@@ -1333,26 +1343,35 @@ def _task_less_reviewer_rule(folder: Path) -> str:
     ref>`, the standing rule and the review skill's step) is one the janitor
     cannot attribute to the live round. This variant REPLACES that rule in the
     rendered directive -- one location, never two -- and says so, so the
-    skill's own checkout step does not win over it."""
+    skill's own checkout step does not win over it.
+
+    The checkout is per round (`task_less_checkout`, issue #234), detached so
+    an earlier round's checkout of the same head never blocks it, and a
+    re-spawn of the SAME round that finds its leaf already made reuses it
+    instead of failing on `git worktree add`."""
+    checkout = task_less_checkout(folder, round_)
     return (
         "You never push and never delete: a reviewer that needs scratch files "
         "writes them under its own checkout and leaves them. This round has "
         f"its own folder, `{folder}`, which the daemon made and holds while "
         "the round lives: write any scratch files there, and make any "
         "checkout you need to run code inside it -- `git worktree add "
-        f"{folder}/wt <the PR head>`. This replaces the `../REVIEW-<review "
-        "task ref>` location the review skill names, for this whole round, "
-        "even after you create the review task: a checkout anywhere else is "
-        "not held for you. "
+        f"--detach {checkout} <the PR head>`; if `{checkout}` already exists "
+        "(this round was spawned before), reuse it instead -- `git -C "
+        f"{checkout} checkout --detach <the PR head>`. Earlier rounds' "
+        "checkouts in that folder are not yours to reuse or remove. This "
+        "replaces the `../REVIEW-<review task ref>` location the review skill "
+        "names, for this whole round, even after you create the review task: "
+        "a checkout anywhere else is not held for you. "
     )
 
 
-def _with_task_less_reviewer_rule(directive: str, folder: Path) -> str:
+def _with_task_less_reviewer_rule(directive: str, folder: Path, round_: int) -> str:
     """Swap `_REVIEWER_RULE` for the task-less variant in a rendered directive
     (every reviewer template embeds the rule verbatim, so the templates and
     their pinned digests stay as they are). A template without the rule gets
     the variant appended, so the round still names its folder."""
-    rule = _task_less_reviewer_rule(folder)
+    rule = _task_less_reviewer_rule(folder, round_)
     if _REVIEWER_RULE in directive:
         return directive.replace(_REVIEWER_RULE, rule, 1)
     return directive.rstrip() + " " + rule
@@ -7400,8 +7419,9 @@ class ReviewWatcher:
         if task is None:
             # One checkout location, not two (issue #232 round 1): the
             # standing `../REVIEW-<review task ref>` rule is swapped for the
-            # round's own folder, the one its spawn row records.
-            directive = _with_task_less_reviewer_rule(directive, folder)
+            # round's own folder, the one its spawn row records, and its
+            # checkout is a per-round leaf there (issue #234).
+            directive = _with_task_less_reviewer_rule(directive, folder, round_)
 
         hub, problem = self._ensure_hub(pr, task_ref=task.ref if task else None)
         if problem is not None:

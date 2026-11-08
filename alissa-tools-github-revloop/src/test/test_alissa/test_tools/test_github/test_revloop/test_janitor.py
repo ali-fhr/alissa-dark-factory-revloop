@@ -37,11 +37,12 @@ from alissa.tools.github.revloop.loop import (
     ReviewWatcher,
     _task_less_reviewer_rule,
     _with_task_less_reviewer_rule,
+    task_less_checkout,
 )
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
 from test_fleet_vitals import WALL, FakeSources, FakeVitalsClient
-from test_loop import FakeAlissa, FakeGitHub, make_pr, watcher
+from test_loop import FakeAlissa, FakeGitHub, make_pr, review, watcher
 
 NOW = 1_800_000_000.0
 DAY = 24 * 3600
@@ -1648,10 +1649,10 @@ def test_a_task_less_round_spawns_into_its_own_recorded_folder(spawn_ws, caplog)
     assert str(own) in directive
     # One checkout location, not two (round 1 of PR #233): the standing
     # `../REVIEW-<review task ref>` rule is replaced, not contradicted.
-    assert _task_less_reviewer_rule(own) in directive
+    assert _task_less_reviewer_rule(own, 1) in directive
     assert _REVIEWER_RULE not in directive
     assert "../REVIEW-<review task ref> <the PR head>" not in directive
-    assert f"git worktree add {own}/wt <the PR head>" in directive
+    assert f"git worktree add --detach {own}/wt-r1 <the PR head>" in directive
     assert enqueued["cwd"] == hub / "main", "the session still starts in main/"
     assert any("no open Alissa review task (CR2)" in r.getMessage()
                and str(own) in r.getMessage() for r in caplog.records)
@@ -1707,9 +1708,9 @@ def test_every_reviewer_template_swaps_in_the_task_less_rule(template):
     assert template.count(_REVIEWER_RULE) == 1
     own = Path("/ws/widgets/REVIEW-pr7")
 
-    out = _with_task_less_reviewer_rule(template, own)
+    out = _with_task_less_reviewer_rule(template, own, 2)
 
-    assert out.count(_task_less_reviewer_rule(own)) == 1
+    assert out.count(_task_less_reviewer_rule(own, 2)) == 1
     assert "../REVIEW-<review task ref>" not in out.replace(
         "the `../REVIEW-<review task ref>` location", "")
     assert "This replaces the `../REVIEW-<review task ref>` location" in out
@@ -1717,8 +1718,47 @@ def test_every_reviewer_template_swaps_in_the_task_less_rule(template):
 
 def test_the_task_less_rule_is_appended_when_a_template_lacks_the_rule():
     own = Path("/ws/widgets/REVIEW-pr7")
-    out = _with_task_less_reviewer_rule("Review it.", own)
-    assert out == "Review it. " + _task_less_reviewer_rule(own)
+    out = _with_task_less_reviewer_rule("Review it.", own, 1)
+    assert out == "Review it. " + _task_less_reviewer_rule(own, 1)
+
+
+def test_each_task_less_round_gets_its_own_checkout_leaf():
+    """Issue #234: `REVIEW-pr<N>` is shared by every task-less round of a PR
+    and reviewers never delete, so a single `<folder>/wt` collided on the
+    second round. Each round names its own leaf inside the held folder, adds
+    it detached, and reuses it when a re-spawn of the same round finds it."""
+    own = Path("/ws/widgets/REVIEW-pr7")
+    first, second = task_less_checkout(own, 1), task_less_checkout(own, 2)
+
+    assert first != second
+    assert first.parent == own and second.parent == own, "still inside the held folder"
+    rule = _task_less_reviewer_rule(own, 2)
+    assert f"git worktree add --detach {second} <the PR head>" in rule
+    assert f"git -C {second} checkout --detach <the PR head>" in rule
+    assert str(first) not in rule
+    assert f"{own}/wt " not in rule and f"{own}/wt`" not in rule
+
+
+def test_a_second_task_less_round_does_not_name_the_first_rounds_checkout(spawn_ws):
+    """Issue #234, end to end: round 1's checkout is still on disk in
+    `REVIEW-pr<N>` when a second task-less round spawns; the new round's
+    directive names a fresh leaf, so `git worktree add` never meets it."""
+    config, hub = spawn_ws
+    own = hub / "REVIEW-pr7"
+    stale = task_less_checkout(own, 1)
+    stale.mkdir(parents=True)
+    (stale / "README.md").write_text("round 1's checkout")
+    w, _, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")], task=None)
+
+    decision = w.evaluate("acme", "widgets", 7)
+
+    assert decision.session and decision.round == 2
+    directive = al.enqueued[0]["directive"]
+    fresh = task_less_checkout(own, 2)
+    assert f"git worktree add --detach {fresh} <the PR head>" in directive
+    assert not fresh.exists(), "the reviewer makes its checkout"
+    assert f"worktree add --detach {stale} " not in directive
+    assert (stale / "README.md").is_file(), "the daemon leaves round 1's checkout alone"
 
 
 def test_a_dry_run_task_less_spawn_makes_no_folder(spawn_ws):
