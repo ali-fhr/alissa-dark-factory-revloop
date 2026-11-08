@@ -16,6 +16,14 @@ header).
 
 ## Unreleased
 
+- **A second task-less round of a PR no longer collides on its checkout**
+  (issue #234; origin TASK-2131779786, implementation TASK-1564326312). Every
+  task-less (CR2) round of a PR shares `REVIEW-pr<N>` and reviewers never
+  delete, so round 2's `git worktree add <folder>/wt` met `already exists`.
+  The directive now names a per-round leaf, `REVIEW-pr<N>/wt-r<round>`, added
+  `--detach`, and tells a re-spawn of the same round to reuse it
+  (`git -C <leaf> checkout --detach <the PR head>`). Templates and their
+  pinned digests are unchanged.
 - **The janitor holds folders, never a hub; sustained pressure and an
   unwritable ledger reach the operator** (issue #232; origin TASK-1486193834,
   implementation TASK-1931317059). On 2026-11-08 one review-task-less (CR2)
