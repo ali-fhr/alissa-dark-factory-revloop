@@ -576,8 +576,8 @@ def build_snapshot(
         "kpis": None,
         "inbox": inbox,
         "diskUsedPct": disk_used_pct,
-        "idle": idle,
         LANE_SESSIONS_KEY: lane_sessions(rows),
+        "idle": idle,
     }
     if config is not None:
         snapshot["config"] = dict(config)
