@@ -125,6 +125,7 @@ from .alissa_client import (
     AlissaError,
 )
 from .config import REPOS_BOWS, Config
+from .janitor import disk_free_bytes, human
 from .janitor import disk_used_pct as volume_used_pct
 from .proc import CommandError, run as proc_run
 
@@ -206,6 +207,73 @@ _LEVERS = {
     "stability-held": LEVER_REENTER,
     "stalled": LEVER_STALLED,
 }
+
+# The seat's own Needs-you rows (issue #232), beside the per-PR pages: the
+# workspace volume nearly full, and the ledger refusing every pass. Studio
+# reads every `inbox` row of a seat's latest snapshot into the operator's
+# Needs-you (`inboxItemsFromVitals`, action `unblock`), and a row's presence
+# is the episode -- so each is sent on every push while its condition holds
+# and dropped on the first push after. On 2026-11-08 the operator learned of
+# a 99%-full volume and an unwritable ledger from Railway's UI, not Alissa.
+KIND_VOLUME_LOW = "volume-low"
+KIND_LEDGER_UNWRITABLE = "ledger-unwritable"
+# Free space under which the volume-low row is sent: "under 2 GB free".
+VOLUME_LOW_BYTES = 2 * 1024 ** 3
+LEVER_VOLUME = (
+    "free space on the workspace volume (stale REVIEW-* folders past the "
+    "janitor's grace), or grow the volume"
+)
+LEVER_LEDGER = (
+    "free space on the workspace volume, or fix its mount — the daemon "
+    "resumes on its own once the ledger is writable"
+)
+
+
+def seat_inbox_rows(
+    workspace_root: "str | os.PathLike",
+    *,
+    state_db: "str | os.PathLike | None" = None,
+    ledger_unwritable_for: "float | None" = None,
+    free_bytes: "int | None" = None,
+    used_pct: "float | None" = None,
+) -> "list[dict]":
+    """The seat's own Needs-you rows (issue #232), in the contract's
+    `inbox` shape: `volume-low` while the workspace volume has less than
+    VOLUME_LOW_BYTES free (`free_bytes`; None = unreadable, no row), and
+    `ledger-unwritable` while the ledger has refused passes for
+    `ledger_unwritable_for` seconds (None = writable, no row). Neither names
+    a PR, so both carry `isPr: false` and no repo."""
+    rows: "list[dict]" = []
+    if ledger_unwritable_for is not None:
+        rows.append({
+            "kind": KIND_LEDGER_UNWRITABLE,
+            "subject": (
+                f"ledger {state_db or 'state.db'} cannot be written — the "
+                f"daemon spawns, escalates and posts nothing"
+            ),
+            "repo": None,
+            "number": None,
+            "isPr": False,
+            "ageS": max(0, int(ledger_unwritable_for)),
+            "url": None,
+            "lever": LEVER_LEDGER,
+        })
+    if free_bytes is not None and free_bytes < VOLUME_LOW_BYTES:
+        used = f", {used_pct:.1f}% used" if used_pct is not None else ""
+        rows.append({
+            "kind": KIND_VOLUME_LOW,
+            "subject": (
+                f"workspace volume {os.fspath(workspace_root)}: "
+                f"{human(free_bytes)} free{used}"
+            ),
+            "repo": None,
+            "number": None,
+            "isPr": False,
+            "ageS": None,
+            "url": None,
+            "lever": LEVER_VOLUME,
+        })
+    return rows
 
 
 def iso_utc(seconds: "int | float") -> str:
@@ -359,6 +427,7 @@ def build_snapshot(
     rate_login: "str | None" = None,
     gh_calls_last_hour: "int | None" = None,
     probes: "Mapping | None" = None,
+    seat_inbox: "Sequence[dict] | None" = None,
 ) -> dict:
     """The contract body for this pass, off the console's builders.
 
@@ -387,6 +456,9 @@ def build_snapshot(
 
     `probes` is the boot probe block (issue #212), or None to leave the key
     out (the set has not run yet this boot, or the console's push).
+
+    `seat_inbox` is the seat's own Needs-you rows (`seat_inbox_rows`, issue
+    #232), sent AHEAD of the per-PR pages so the list cap never drops them.
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -411,7 +483,11 @@ def build_snapshot(
             rows, key=lambda r: (not r.get("live"), not r.get("managed"))
         )
         session_list = [_session_row(r, repos) for r in ordered[:LIST_CAP]]
-    inbox = [_inbox_row(item) for item in sources.inbox()["live"][:LIST_CAP]]
+    inbox = [dict(row) for row in (seat_inbox or ())][:LIST_CAP]
+    inbox += [
+        _inbox_row(item)
+        for item in sources.inbox()["live"][:LIST_CAP - len(inbox)]
+    ]
     live, managed = parking.roster_counts(rows)
     idle = parking.idle_block(
         snaps[0] if snaps else None,
@@ -584,6 +660,7 @@ class FleetVitalsPusher:
         upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
         github: object = None,
         probes_reader: "Callable[[], Mapping | None] | None" = None,
+        ledger_reader: "Callable[[], float | None] | None" = None,
     ):
         self.config = config
         self._sources = sources
@@ -613,9 +690,14 @@ class FleetVitalsPusher:
         # The daemon's boot probe block (issue #212), or None -- the
         # console's pusher -- to leave it out.
         self._probes_reader = probes_reader
+        # The daemon's ledger-gate streak (issue #232): seconds the ledger
+        # has refused passes, or None. None here -- the console's pusher --
+        # sends no `ledger-unwritable` row.
+        self._ledger_reader = ledger_reader
 
     def build(self, *, heartbeat_at: "int | float", queue_depth: "int | None") -> dict:
         """This pass's contract body, fitted to the API's caps."""
+        used_pct = volume_used_pct(self.config.workspace_root)
         return fit_body(build_snapshot(
             self._sources,
             heartbeat_at=heartbeat_at,
@@ -624,11 +706,29 @@ class FleetVitalsPusher:
             repos=self.config.repos,
             now=self._clock(),
             config=self._config(),
-            disk_used_pct=volume_used_pct(self.config.workspace_root),
+            disk_used_pct=used_pct,
             rate_login=self._github_read("asserted_login"),
             gh_calls_last_hour=self._github_read("calls_last_hour"),
             probes=self._probes(),
+            seat_inbox=seat_inbox_rows(
+                self.config.workspace_root,
+                state_db=self.config.state_db,
+                ledger_unwritable_for=self._ledger_unwritable_for(),
+                free_bytes=disk_free_bytes(self.config.workspace_root),
+                used_pct=used_pct,
+            ),
         ))
+
+    def _ledger_unwritable_for(self) -> "float | None":
+        """The ledger reader's answer, or None. A reader that fails costs
+        the row, never the snapshot."""
+        if self._ledger_reader is None:
+            return None
+        try:
+            return self._ledger_reader()
+        except Exception as exc:
+            log.warning("fleet-vitals: could not read the ledger state (%s)", exc)
+            return None
 
     def _probes(self) -> "Mapping | None":
         """The boot probe block, or None. A reader that fails costs the
@@ -853,6 +953,7 @@ def build_pusher(
     config_reader: "Callable[[], Mapping | None] | None" = None,
     upgrader: "self_upgrade_mod.SelfUpgrader | None" = None,
     probes_reader: "Callable[[], Mapping | None] | None" = None,
+    ledger_reader: "Callable[[], float | None] | None" = None,
 ) -> FleetVitalsPusher:
     """The pusher the watcher wires in when `fleet_vitals_enabled` is on.
 
@@ -866,8 +967,9 @@ def build_pusher(
     `loop`, which imports this module. `config_reader` is the daemon's
     `config` block source (issue #159), `upgrader` its self-upgrade state
     (issue #193), and `github` also feeds `rate.login` and `ghCallsLastHour`
-    (issue #205), and `probes_reader` its boot probe block (issue #212); the
-    console builds its own pusher without any of them.
+    (issue #205), `probes_reader` its boot probe block (issue #212), and
+    `ledger_reader` its ledger-gate streak (issue #232); the console builds
+    its own pusher without any of them.
     """
     from .version import version
     from .webui.sources import Sources
@@ -880,5 +982,5 @@ def build_pusher(
     return FleetVitalsPusher(
         config, sources, AlissaClient(base=endpoint),
         config_reader=config_reader, upgrader=upgrader, github=github,
-        probes_reader=probes_reader,
+        probes_reader=probes_reader, ledger_reader=ledger_reader,
     )

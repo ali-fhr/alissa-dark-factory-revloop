@@ -185,7 +185,7 @@ else refused by name.
 | `janitor_enabled` | `true` | the **workspace janitor**: at the end of a pass, every `janitor_interval_minutes`, remove each hub's stale `main/.review-scratch-*` and `REVIEW-*` folders that no live session or open round holds, `git worktree prune` the hub's `.source`, and warn on a full volume — see *The workspace janitor*. `--janitor` / `--no-janitor`; environment `ALISSA_REVIEW_JANITOR_ENABLED` |
 | `janitor_grace_minutes` | `1440` | how old (newest mtime of the folder and its direct children) a scratch folder or `REVIEW-` checkout must be before the janitor may remove it. `>= 1`. `--janitor-grace-minutes`; environment `ALISSA_REVIEW_JANITOR_GRACE_MINUTES` |
 | `janitor_interval_minutes` | `10` | how often the janitor sweeps; `0` = every pass. The first sweep runs at the end of the first pass. `--janitor-interval-minutes`; environment `ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES` |
-| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING, shrinks the grace to `janitor_pressure_grace_minutes` and records one `janitor.volume_pressure` loop event per episode; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
+| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING, shrinks the grace to `janitor_pressure_grace_minutes` and, once three sweeps in a row free nothing, records one `janitor.volume_pressure` loop event per episode; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
 | `janitor_pressure_grace_minutes` | `120` | the grace **under disk pressure**: while the volume is at or above `janitor_warn_pct`, a folder older than this is removable too, oldest first, until the volume is back under the line. `>= 1`; never longer than `janitor_grace_minutes`. File or environment `ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES` (no CLI flag) |
 | `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
@@ -1381,11 +1381,17 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   the session's spawn row names its repo, PR and review task, and a
   skill-shaped `review-pr-<n>` with no row holds PR `<n>` in every hub) or by
   an open ledger round (an unreaped spawn younger than the 90-minute
-  stale-round window, or a verdict post still owed). A held PR keeps every one
-  of its scratch folders and its review task's `REVIEW-<task>` checkout (in
-  either place); a held round whose review task is unknown keeps every
-  `REVIEW-*` in its hub. If the roster cannot be listed the removal half is
-  skipped that interval.
+  stale-round window, or a verdict post still owed). Holds are **per folder,
+  never per hub** (issue #232): a held PR keeps every one of its scratch
+  folders, its review task's `REVIEW-<task>` checkout (in either place, a
+  `-r<k>` suffix allowed), its own `REVIEW-pr<N>` folder, and the folder its
+  spawn row recorded. A round with no review task (a CR2 round) is spawned
+  with a folder of its own, `<hub>/REVIEW-pr<N>`, which the daemon makes,
+  names in the directive and the spawn log line, and records on the round's
+  ledger row with its spawn time; such a round holds that folder and nothing
+  else in its hub. A folder no live round names is protected only by the
+  grace. If the roster cannot be listed the removal half is skipped that
+  interval.
 - **Under disk pressure the grace shrinks.** When the workspace volume is at
   or above `janitor_warn_pct` as a sweep starts, the grace drops to
   `janitor_pressure_grace_minutes` (default 120 — past the 90-minute
@@ -1408,11 +1414,13 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   workspace volume is at or above `janitor_warn_pct` (default 80; `0` = never)
   the sweep also logs **one WARNING** with the percentage, and an INFO line
   saying the grace dropped and how many folders went only under it.
-- **A pressure episode is a loop event.** The first sweep at or above the
-  line records one `volume-pressure:` ledger row, which the loop-events
-  emitter sends as **`janitor.volume_pressure`** (no repo, no PR; `data:
-  { usedPct, warnPct, freedBytes, foldersLeft }`, `foldersLeft` null when the
-  sweep could not run; deduped on the episode's start second) — so the
+- **Sustained pressure is a loop event.** Once three sweeps in a row at or
+  above the line have freed nothing (issue #232), one `volume-pressure:`
+  ledger row is recorded, which the loop-events emitter sends as
+  **`janitor.volume_pressure`** (no repo, no PR; `data: { usedPct, warnPct,
+  freedBytes, foldersLeft, heldBytes, held }`, `foldersLeft`, `heldBytes` and
+  `held` null when the sweep could not run, `held` the largest held reasons
+  as `[{reason, bytes}]`; deduped on the episode's start second) — so the
   operator surface sees a full volume, not only a log line. One event per
   episode: the first reading back under the line closes it, and the next
   crossing opens a new one. The episode is held in memory, so a restart
@@ -1424,7 +1432,13 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   per-sweep bound (and with the same deferred count).
 
 The volume's used percentage also rides on every fleet-vitals snapshot as
-`diskUsedPct` (see *Fleet vitals*).
+`diskUsedPct` (see *Fleet vitals*). Two conditions reach the operator's
+**Needs-you** as rows of the snapshot's `inbox` (issue #232), sent on every
+push while they hold: `volume-low` when the workspace volume has less than
+2 GiB free, and `ledger-unwritable` while the ledger refuses passes. The
+ledger-unwritable condition logs at ERROR from its first pass, and a refused
+pass still pushes the vitals and runs the janitor — the one part of a pass
+that frees space — before it is skipped.
 
 ### Spawn back-pressure: `max_concurrent_sessions`
 

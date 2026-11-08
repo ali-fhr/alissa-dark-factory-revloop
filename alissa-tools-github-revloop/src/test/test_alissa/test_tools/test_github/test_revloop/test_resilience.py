@@ -816,14 +816,41 @@ def test_the_ledger_gate_shares_the_firewall_s_escalation_contract(tmp_path, clo
     # Past the log head, still inside the window: suppressed.
     for _ in range(5):
         w._note_ledger_unwritable()
-    before = len([r for r in caplog.records if r.levelno == logging.ERROR])
+    before = len(caplog.records)
     # The pass that crosses the window logs, whatever the modulo says.
     clock.now += POLL_ESCALATE_SECONDS + 1
     w._note_ledger_unwritable()
 
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert before == 0 and len(errors) == 1
-    assert "no longer transient" in errors[0].getMessage()
+    lines = [r for r in caplog.records if "cannot be written" in r.getMessage()]
+    assert len(lines) == POLL_FAILURE_LOG_HEAD + 1
+    assert len(caplog.records) == before + 1
+    assert "no longer transient" in lines[-1].getMessage()
+    assert not any("no longer transient" in r.getMessage() for r in lines[:-1])
+
+
+def test_the_ledger_gate_escalates_on_its_first_pass(tmp_path, clock, caplog):
+    """Issue #232: an unwritable ledger is the volume incident one level
+    worse, so its FIRST line is already ERROR (not a WARNING that escalates
+    after POLL_ESCALATE_SECONDS), and the watcher reports the streak to the
+    vitals' `ledger-unwritable` row until the ledger is writable again."""
+    caplog.set_level(logging.INFO)
+    config = Config(
+        workspace_root=tmp_path,
+        hub_template="{root}/{repo}/main",
+        state_path=tmp_path / "state.db",
+    )
+    w = ReviewWatcher(config, github=_NoRequests(), alissa=_NoSessions(), state=None)
+    assert w._ledger_unwritable_for() is None
+
+    w._note_ledger_unwritable()
+
+    (line,) = [r for r in caplog.records if "cannot be written" in r.getMessage()]
+    assert line.levelno == logging.ERROR
+    assert w._ledger_unwritable_for() == 0.0
+    clock.now += 90
+    assert w._ledger_unwritable_for() == 90.0
+    w._note_ledger_writable()
+    assert w._ledger_unwritable_for() is None
 
 
 def test_streak_is_one_implementation_for_both_users():
