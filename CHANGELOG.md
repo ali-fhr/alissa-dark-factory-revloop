@@ -16,6 +16,19 @@ header).
 
 ## Unreleased
 
+- **Fleet vitals list the review sessions for the lane doctor** (issue #236;
+  origin TASK-1677220016, implementation TASK-711160084). Studio's lane
+  doctor (lane-doctor design §1.4, lane LR-1) needs to know a lane has live
+  work before it calls the lane stalled. Each snapshot now carries
+  `laneSessions`: at most 20 rows of `name`, `taskNumber`, `role`
+  (`"review"`), `live` and `paneChangedAt`, the last one in epoch ms. The
+  rows cover this daemon's own review sessions only, live ones first.
+  `paneChangedAt` is the roster's tmux `lastActivity`, the same stamp the
+  prompt responder's quiet gate reads. `taskNumber` is the origin task the
+  spawn ledger recorded. The block has its own key because `sessions` is
+  already the `{live, managed}` counts. A Studio that does not know the key
+  yet gets the snapshot without it, and the daemon offers it again an hour
+  later.
 - **A second task-less round of a PR no longer collides on its checkout**
   (issue #234; origin TASK-2131779786, implementation TASK-1564326312). Every
   task-less (CR2) round of a PR shares `REVIEW-pr<N>` and reviewers never

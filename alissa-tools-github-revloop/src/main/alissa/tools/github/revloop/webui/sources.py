@@ -499,6 +499,10 @@ class Sources:
                     "busy": status == "busy",
                     "live": live,
                     "age_seconds": age,
+                    # The raw tmux stamp and the ledger's origin task: the
+                    # lane doctor's `laneSessions` rows (issue #236).
+                    "last_activity": last if isinstance(last, int) else None,
+                    "task_number": row.get("task_number") if row else None,
                     "pane_pid": pid,
                     "cpu_percent": usage["cpu_percent"],
                     "rss_bytes": usage["rss_bytes"],

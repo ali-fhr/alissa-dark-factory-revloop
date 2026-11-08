@@ -103,6 +103,22 @@ post until the next boot. The pusher reads it through `probes_reader` (the
 daemon's held block, None before the set has run); the console's pusher has
 no reader and leaves it out. A Studio that refuses it gets the optional-block
 treatment.
+
+The lane doctor's live-work check (issue #236, Studio's lane-doctor design
+§1.4, lane LR-1) adds `laneSessions`: one row per session of this daemon's
+own grammar -- `name`, `taskNumber`, `role`, `live`, `paneChangedAt` -- at
+most LANE_SESSIONS_CAP rows, live first, the most recently changed pane
+first. The design names the block `sessions[]`, but `sessions` is already
+the base contract's `{live, managed}` counts, which Studio validates
+strictly; the list rides under its own key. `paneChangedAt` is the tmux
+roster's `lastActivity` (epoch ms) -- the same stamp the prompt responder's
+quiet gate reads off `alissa tmux ls`, so a working pane moves it and a
+parked one does not -- and `taskNumber` is the origin task the spawn ledger
+recorded for the round (issue #165), null for a round the ledger cannot
+pair. A session the roster reports no activity stamp for is left out: a
+made-up stamp would read as live work. Another lane's session and a doctor
+session (§6.3: `doctor-<task>-<stamp>`) never parse as ours, so neither is
+ever listed. A Studio that refuses it gets the optional-block treatment.
 """
 
 from __future__ import annotations
@@ -163,7 +179,17 @@ VITALS_FAILED = "failed"
 # which Studio's schema may not carry yet. `upgradeFailed` (issue #193, the
 # fleet auto-upgrade report) joins them for the same reason.
 # `probes` (issue #212, the fleet-upgrade-safety boot probes) likewise.
-OPTIONAL_BLOCKS = ("idle", "config", "diskUsedPct", "upgradeFailed", "probes")
+# `laneSessions` (issue #236, the lane doctor's W5 block) likewise.
+LANE_SESSIONS_KEY = "laneSessions"
+OPTIONAL_BLOCKS = (
+    "idle", "config", "diskUsedPct", "upgradeFailed", "probes",
+    LANE_SESSIONS_KEY,
+)
+# The lane doctor's bound on the block (design §1.4: "<= 20 rows"), and the
+# role every revloop session plays in its vocabulary (develop | review |
+# maintain): this daemon only runs review rounds.
+LANE_SESSIONS_CAP = 20
+LANE_ROLE = "review"
 
 # The identity fields (issue #205): the top-level count and the two keys it
 # adds inside `rate`. One group -- a Studio that knows one knows all three --
@@ -357,6 +383,37 @@ def _session_row(row: dict, repos: "tuple[str, ...]") -> dict:
     }
 
 
+def lane_sessions(rows: "list[dict] | None") -> "list[dict] | None":
+    """The lane doctor's `laneSessions` block (issue #236) off the console's
+    session rows, or None when the roster could not be listed.
+
+    Only this daemon's own grammar (`parse_session_name`) is listed: a
+    foreign lane's session is not a review round, and a doctor session is
+    invisible to the doctor by design. A row with no activity stamp is left
+    out rather than given one. Live rows come first and, within each half,
+    the most recently changed pane, so the cap drops the rows W5 can least
+    use."""
+    if rows is None:
+        return None
+    out: list[dict] = []
+    for row in rows:
+        name = row.get("name")
+        if parse_session_name(name) is None:
+            continue
+        changed = _int_or_none(row.get("last_activity"))
+        if changed is None or changed <= 0:
+            continue
+        out.append({
+            "name": str(name),
+            "taskNumber": _int_or_none(row.get("task_number")),
+            "role": LANE_ROLE,
+            "live": bool(row.get("live")),
+            "paneChangedAt": changed * 1000,
+        })
+    out.sort(key=lambda r: (not r["live"], -r["paneChangedAt"]))
+    return out[:LANE_SESSIONS_CAP]
+
+
 def _inbox_row(item: dict) -> dict:
     """One console inbox item (the LIVE half) -> one contract `inbox` entry.
     Every reviewer page is a PR reference, so `isPr` is always true."""
@@ -459,6 +516,9 @@ def build_snapshot(
 
     `seat_inbox` is the seat's own Needs-you rows (`seat_inbox_rows`, issue
     #232), sent AHEAD of the per-PR pages so the list cap never drops them.
+
+    `laneSessions` (issue #236) is `lane_sessions` over the SAME roster read
+    as `sessions`, null exactly when it is.
     """
     stamp = time.time() if now is None else now
     snaps = sources.snapshots(DURATION_POINTS)
@@ -516,6 +576,7 @@ def build_snapshot(
         "kpis": None,
         "inbox": inbox,
         "diskUsedPct": disk_used_pct,
+        LANE_SESSIONS_KEY: lane_sessions(rows),
         "idle": idle,
     }
     if config is not None:
