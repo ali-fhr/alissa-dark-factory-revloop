@@ -75,6 +75,8 @@ HEAD = "a" * 40
 STAMP = 1_000_000
 WALL = STAMP + 1000
 PANE_SESSION = "review-widgets-pr16-r2-ab12cd"
+# The origin task the spawn ledger records for PANE_SESSION's round (#165).
+ORIGIN_TASK = 4242
 
 
 @pytest.fixture
@@ -135,7 +137,8 @@ def _runner(*, roster=TMUX_ROSTER, rate=RATE, tmux_fails=False):
 def _seed(db_path):
     with State(db_path) as st:
         st.record_spawn(repo=REPO, number=16, round_=2, head_sha=HEAD,
-                        session=PANE_SESSION, task_ref="TASK-9")
+                        session=PANE_SESSION, task_ref="TASK-9",
+                        task_number=ORIGIN_TASK)
         st.record_escalation(REPO, 12, "deadbeefcafe")
         st.record_ping(REPO, 16, "stalled:" + PANE_SESSION)
         # Settled: PR 21 is absent from the newest pass and older than the
@@ -253,6 +256,16 @@ def test_console_fixtures_build_the_exact_contract_body(
             "owed": 1, "live": 3, "managed": 3, "queued": 0, "timers": [],
             "drainedAt": None,
         },
+        # The lane doctor's W5 block (issue #236): our own grammar only (the
+        # develop-* session is another lane's), live first, newest pane first;
+        # the gone row has no activity stamp, so it is left out.
+        "laneSessions": [
+            {"name": "review-pr-9-r3", "taskNumber": None, "role": "review",
+             "live": True, "paneChangedAt": (WALL - 50) * 1000},
+            {"name": PANE_SESSION, "taskNumber": ORIGIN_TASK,
+             "role": "review", "live": True,
+             "paneChangedAt": (WALL - 100) * 1000},
+        ],
     }
     # The wire form the strict API validates: every key the contract names,
     # and nothing else.
@@ -260,8 +273,85 @@ def test_console_fixtures_build_the_exact_contract_body(
         "schemaVersion", "seat", "asOf", "heartbeatAt", "pollIntervalS",
         "version", "drift", "pollDurationsMs", "sessions", "sessionList",
         "rate", "ghCallsLastHour", "memory", "queueDepth", "kpis", "inbox",
-        "diskUsedPct", "idle",
+        "diskUsedPct", "idle", "laneSessions",
     }
+
+
+def test_a_live_review_session_with_a_changing_pane_is_reported_with_its_task(
+    tmp_path, frozen_ledger_clock
+):
+    """Issue #236 (lane-doctor LR-1): the doctor's W5 reads "a session for
+    the task is live and its pane changed lately" off `laneSessions`. One
+    pass sees the pane at one stamp; the pane moves; the next pass reports
+    the new stamp, still under the round's origin task."""
+    roster = [{"name": PANE_SESSION, "session": PANE_SESSION,
+               "status": "busy", "live": True, "lastActivity": WALL - 600}]
+
+    def runner(argv, **kw):
+        if argv[:3] == ["alissa", "tmux", "ls"]:
+            return json.dumps(roster)
+        return _runner()(argv, **kw)
+
+    _, sources = make_sources(tmp_path, runner=runner)
+    first = build_snapshot(sources, heartbeat_at=WALL, poll_interval=60,
+                           queue_depth=0, now=WALL)
+    roster[0] = dict(roster[0], lastActivity=WALL - 5)
+    second = build_snapshot(sources, heartbeat_at=WALL, poll_interval=60,
+                            queue_depth=0, now=WALL)
+    assert first["laneSessions"] == [{
+        "name": PANE_SESSION, "taskNumber": ORIGIN_TASK, "role": "review",
+        "live": True, "paneChangedAt": (WALL - 600) * 1000,
+    }]
+    assert second["laneSessions"] == [{
+        "name": PANE_SESSION, "taskNumber": ORIGIN_TASK, "role": "review",
+        "live": True, "paneChangedAt": (WALL - 5) * 1000,
+    }]
+    # The stamp is epoch ms, the unit Studio's W5 window compares in.
+    assert second["laneSessions"][0]["paneChangedAt"] > first[
+        "laneSessions"][0]["paneChangedAt"]
+
+
+def test_lane_sessions_are_capped_at_twenty_rows_live_and_newest_first(
+    tmp_path, frozen_ledger_clock
+):
+    """Issue #236: the block is bounded at LANE_SESSIONS_CAP (design §1.4:
+    "<= 20 rows") whatever the roster holds; the cap drops gone sessions and
+    the stalest panes first, and never lists another lane's or a doctor's
+    session (§6.3)."""
+    assert fleet_vitals.LANE_SESSIONS_CAP == 20
+    roster = [
+        {"name": f"review-widgets-pr{n}-r1-{n:06x}", "status": "busy",
+         "live": True, "lastActivity": WALL - n}
+        for n in range(1, 31)
+    ] + [
+        {"name": "review-widgets-pr99-r1-000099", "status": "gone",
+         "live": False, "lastActivity": WALL},
+        {"name": "develop-acme-widgets-i7-a1", "status": "busy",
+         "live": True, "lastActivity": WALL},
+        {"name": "doctor-4242-20261108", "status": "busy", "live": True,
+         "lastActivity": WALL},
+    ]
+    _, sources = make_sources(tmp_path, runner=_runner(roster=roster))
+    snapshot = build_snapshot(sources, heartbeat_at=WALL, poll_interval=60,
+                              queue_depth=0, now=WALL)
+    rows = snapshot["laneSessions"]
+    assert len(rows) == 20
+    assert [r["name"] for r in rows] == [
+        f"review-widgets-pr{n}-r1-{n:06x}" for n in range(1, 21)
+    ]
+    assert all(r["live"] and r["role"] == "review" for r in rows)
+    # The fleet counts still describe the whole roster.
+    assert snapshot["sessions"] == {"live": 32, "managed": 31}
+
+
+def test_a_studio_that_refuses_lane_sessions_gets_the_snapshot_without_it():
+    """Issue #236: Studio's strict schema may predate the block; a 400
+    naming it is the optional-block treatment, never a dark seat."""
+    assert "laneSessions" in fleet_vitals.OPTIONAL_BLOCKS
+    exc = AlissaError(400, "unrecognized key 'laneSessions'")
+    assert FleetVitalsPusher._refused_blocks(
+        exc, {"laneSessions": [], "sessions": {"live": 0, "managed": 0}}
+    ) == ["laneSessions"]
 
 
 def test_iso_stamps_are_whole_second_utc_with_z():
@@ -281,6 +371,7 @@ def test_an_unlistable_roster_is_null_never_zero_zero(
     )
     assert snapshot["sessions"] is None
     assert snapshot["sessionList"] is None
+    assert snapshot["laneSessions"] is None
     # ...while everything else still reads: one broken source, one null.
     assert snapshot["inbox"]
     assert snapshot["pollDurationsMs"] == [30, 42]
@@ -295,6 +386,7 @@ def test_an_empty_roster_is_zero_zero_and_an_empty_list(
                               queue_depth=0)
     assert snapshot["sessions"] == {"live": 0, "managed": 0}
     assert snapshot["sessionList"] == []
+    assert snapshot["laneSessions"] == []
 
 
 def test_every_optional_read_degrades_to_null_on_its_own(
