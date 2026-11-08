@@ -1324,6 +1324,40 @@ _REVIEWER_RULE = (
     "directory, `git worktree add ../REVIEW-<review task ref> <the PR head>`. "
 )
 
+
+def _task_less_reviewer_rule(folder: Path) -> str:
+    """The reviewer rule of a round spawned with no review task (issue #232).
+
+    Its spawn row records `REVIEW-pr<N>` and no task ref, so a checkout made
+    under the review task the reviewer creates later (`../REVIEW-<review task
+    ref>`, the standing rule and the review skill's step) is one the janitor
+    cannot attribute to the live round. This variant REPLACES that rule in the
+    rendered directive -- one location, never two -- and says so, so the
+    skill's own checkout step does not win over it."""
+    return (
+        "You never push and never delete: a reviewer that needs scratch files "
+        "writes them under its own checkout and leaves them. This round has "
+        f"its own folder, `{folder}`, which the daemon made and holds while "
+        "the round lives: write any scratch files there, and make any "
+        "checkout you need to run code inside it -- `git worktree add "
+        f"{folder}/wt <the PR head>`. This replaces the `../REVIEW-<review "
+        "task ref>` location the review skill names, for this whole round, "
+        "even after you create the review task: a checkout anywhere else is "
+        "not held for you. "
+    )
+
+
+def _with_task_less_reviewer_rule(directive: str, folder: Path) -> str:
+    """Swap `_REVIEWER_RULE` for the task-less variant in a rendered directive
+    (every reviewer template embeds the rule verbatim, so the templates and
+    their pinned digests stay as they are). A template without the rule gets
+    the variant appended, so the round still names its folder."""
+    rule = _task_less_reviewer_rule(folder)
+    if _REVIEWER_RULE in directive:
+        return directive.replace(_REVIEWER_RULE, rule, 1)
+    return directive.rstrip() + " " + rule
+
+
 ROUND_1_DIRECTIVE = (
     "You are a PR REVIEWER, not an implementer. {assignment} "
     "Load the alissa-code-review skill and follow procedures/review-a-pr.md: "
@@ -7306,11 +7340,6 @@ class ReviewWatcher:
             task.ref if task else None,
             pr.number,
         )
-        own_folder = "" if task is not None else (
-            f" Your round's own folder is `{folder}`: write any scratch files "
-            f"there, and make any checkout you need inside it (`git worktree "
-            f"add {folder}/wt <the PR head>`)."
-        )
         if plan and task is None:
             # The ordinary round 1 of a plan PR, not a CR2 gap: a plan has no
             # origin task and no implementer to have made one, so its first
@@ -7331,7 +7360,6 @@ class ReviewWatcher:
                     else " The PR body declares no plan id: take it from the "
                     "`id` field of the plan's `plan.md` frontmatter."
                 )
-                + own_folder
             )
         elif task is None:
             log.warning(
@@ -7344,7 +7372,6 @@ class ReviewWatcher:
                 f"Review the GitHub PR {pr.url} . There is no Alissa review task for "
                 f"it yet — locate the origin task from the PR and create the downstream "
                 f"review task per CR2 before recording your verdict."
-                + own_folder
             )
         else:
             assignment = f"You've been assigned Alissa review task {task.ref}."
@@ -7370,6 +7397,11 @@ class ReviewWatcher:
             checks=checks,
             stability=stability.text if stability is not None else "",
         )
+        if task is None:
+            # One checkout location, not two (issue #232 round 1): the
+            # standing `../REVIEW-<review task ref>` rule is swapped for the
+            # round's own folder, the one its spawn row records.
+            directive = _with_task_less_reviewer_rule(directive, folder)
 
         hub, problem = self._ensure_hub(pr, task_ref=task.ref if task else None)
         if problem is not None:

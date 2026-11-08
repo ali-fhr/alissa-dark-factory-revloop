@@ -27,7 +27,17 @@ from alissa.tools.github.revloop.alissa_client import AlissaError
 from alissa.tools.github.revloop.config import Config
 from alissa.tools.github.revloop.fleet_vitals import FleetVitalsPusher
 from alissa.tools.github.revloop.janitor import Guard, sweep
-from alissa.tools.github.revloop.loop import ReviewWatcher
+from alissa.tools.github.revloop.loop import (
+    DISCOVERY_LIGHT_DIRECTIVE,
+    PLAN_ROUND_1_DIRECTIVE,
+    PLAN_ROUND_K_DIRECTIVE,
+    ROUND_1_DIRECTIVE,
+    ROUND_K_DIRECTIVE,
+    _REVIEWER_RULE,
+    ReviewWatcher,
+    _task_less_reviewer_rule,
+    _with_task_less_reviewer_rule,
+)
 from alissa.tools.github.revloop.proc import CommandError
 from alissa.tools.github.revloop.state import State
 from test_fleet_vitals import WALL, FakeSources, FakeVitalsClient
@@ -879,7 +889,6 @@ def test_real_git_a_checkout_made_inside_main_is_removed_and_unregistered(tmp_pa
 def test_the_reviewer_rule_says_where_the_checkout_goes():
     """c4: the rule names the place beside `main/` -- the name trust seeds --
     and the janitor reaps that name in both places."""
-    from alissa.tools.github.revloop.loop import _REVIEWER_RULE
     from alissa.tools.github.revloop.trust import review_checkout_name
 
     assert "BESIDE `main/`, never inside it" in _REVIEWER_RULE
@@ -1635,7 +1644,14 @@ def test_a_task_less_round_spawns_into_its_own_recorded_folder(spawn_ws, caplog)
     own = hub / "REVIEW-pr7"
     assert decision.session and own.is_dir()
     (enqueued,) = al.enqueued
-    assert str(own) in enqueued["directive"]
+    directive = enqueued["directive"]
+    assert str(own) in directive
+    # One checkout location, not two (round 1 of PR #233): the standing
+    # `../REVIEW-<review task ref>` rule is replaced, not contradicted.
+    assert _task_less_reviewer_rule(own) in directive
+    assert _REVIEWER_RULE not in directive
+    assert "../REVIEW-<review task ref> <the PR head>" not in directive
+    assert f"git worktree add {own}/wt <the PR head>" in directive
     assert enqueued["cwd"] == hub / "main", "the session still starts in main/"
     assert any("no open Alissa review task (CR2)" in r.getMessage()
                and str(own) in r.getMessage() for r in caplog.records)
@@ -1675,7 +1691,34 @@ def test_a_task_round_records_its_review_checkout_and_makes_nothing(spawn_ws):
     row = w.state.find_spawn_by_session(decision.session)
     assert row["folder"] == str(hub / "REVIEW-TASK-500")
     assert not (hub / "REVIEW-TASK-500").exists(), "the reviewer makes its checkout"
-    assert "Your round's own folder" not in al.enqueued[0]["directive"]
+    directive = al.enqueued[0]["directive"]
+    assert _REVIEWER_RULE in directive, "a task round keeps the standing rule"
+    assert "REVIEW-pr7" not in directive
+
+
+@pytest.mark.parametrize("template", [
+    ROUND_1_DIRECTIVE, ROUND_K_DIRECTIVE, PLAN_ROUND_1_DIRECTIVE,
+    PLAN_ROUND_K_DIRECTIVE, DISCOVERY_LIGHT_DIRECTIVE,
+])
+def test_every_reviewer_template_swaps_in_the_task_less_rule(template):
+    """Every reviewer template embeds `_REVIEWER_RULE` verbatim, so the
+    task-less swap lands in each, exactly once, and leaves no second
+    checkout location behind."""
+    assert template.count(_REVIEWER_RULE) == 1
+    own = Path("/ws/widgets/REVIEW-pr7")
+
+    out = _with_task_less_reviewer_rule(template, own)
+
+    assert out.count(_task_less_reviewer_rule(own)) == 1
+    assert "../REVIEW-<review task ref>" not in out.replace(
+        "the `../REVIEW-<review task ref>` location", "")
+    assert "This replaces the `../REVIEW-<review task ref>` location" in out
+
+
+def test_the_task_less_rule_is_appended_when_a_template_lacks_the_rule():
+    own = Path("/ws/widgets/REVIEW-pr7")
+    out = _with_task_less_reviewer_rule("Review it.", own)
+    assert out == "Review it. " + _task_less_reviewer_rule(own)
 
 
 def test_a_dry_run_task_less_spawn_makes_no_folder(spawn_ws):
