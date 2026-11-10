@@ -9062,6 +9062,7 @@ class ReviewWatcher:
             )
             return None
         hubs = janitor_mod.discover_hubs(self.config.workspace_root)
+        finished = self._janitor_finished(now)
         result = janitor_mod.sweep(
             hubs, guard,
             grace_seconds=self.config.janitor_grace_minutes * 60,
@@ -9072,6 +9073,7 @@ class ReviewWatcher:
             ),
             under_pressure=self._volume_pressed if pressed else None,
             sizes=self._janitor_sizes,
+            finished=finished,
         )
         if result.pressure:
             log.info(
@@ -9085,24 +9087,62 @@ class ReviewWatcher:
         if self.config.dry_run:
             log.info(
                 "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
-                "hub(s); %d held by a live round (%s), %d inside the grace, %d "
-                "deferred to the next interval%s",
+                "hub(s) (%d finished review, %d past grace); %d held by a live "
+                "round (%s), %d inside the grace, %d deferred to the next "
+                "interval%s%s",
                 len(result.would_remove),
                 janitor_mod.human(sum(size for _, size in result.would_remove)),
-                result.hubs, len(result.held), janitor_mod.human(result.held_total),
-                result.fresh, result.deferred, janitor_mod.held_summary(result),
+                result.hubs,
+                result.reclaimed_count(janitor_mod.RECLAIM_FINISHED),
+                result.reclaimed_count(janitor_mod.RECLAIM_PAST_GRACE),
+                len(result.held), janitor_mod.human(result.held_total),
+                result.fresh, result.deferred, janitor_mod.hub_summary(result),
+                janitor_mod.held_summary(result),
             )
         else:
             log.info(
-                "janitor: removed %d folder(s), freed %s across %d hub(s); "
-                "%d held by a live round (%s), %d inside the grace, %d failed, %d "
-                "deferred to the next interval%s",
+                "janitor: removed %d folder(s), freed %s across %d hub(s) (%d "
+                "finished review, %d past grace); %d held by a live round (%s), "
+                "%d inside the grace, %d failed, %d deferred to the next "
+                "interval%s%s",
                 len(result.removed), janitor_mod.human(result.freed),
-                result.hubs, len(result.held), janitor_mod.human(result.held_total),
+                result.hubs,
+                result.reclaimed_count(janitor_mod.RECLAIM_FINISHED),
+                result.reclaimed_count(janitor_mod.RECLAIM_PAST_GRACE),
+                len(result.held), janitor_mod.human(result.held_total),
                 result.fresh, len(result.failed), result.deferred,
+                janitor_mod.hub_summary(result),
                 janitor_mod.held_summary(result),
             )
         return result
+
+    def _janitor_finished(self, now: float) -> "janitor_mod.FinishedReviews":
+        """This sweep's finished-review test (studio issue #4761): folders
+        attributed to PRs through the ledger's spawn rows (spawned within a
+        day past the grace -- an older round's folder is past the grace
+        anyway) and the CR2 review-task cache, and each PR's state read once
+        per sweep through the seat's own GitHub client, the poller's, so
+        every read counts against the same hourly budget. A PR that cannot
+        be read is not finished; GitHub throttling stops the reads for the
+        sweep (`FinishedReviews` catches it)."""
+        since = now - self.config.janitor_grace_minutes * 60 - 24 * 3600
+        rows: "list[dict]" = []
+        try:
+            rows = self.state.read_spawns(since=since)
+        except sqlite3.DatabaseError as exc:
+            log.warning("janitor: spawn rows unreadable (%s) — no folder is "
+                        "attributed to a finished review this sweep", exc)
+        rows += self.state.read_review_tasks()
+
+        def pr_state(full_name: str, number: int) -> "bool | None":
+            owner, _, repo = full_name.partition("/")
+            try:
+                return self.github.pull_request(owner, repo, number).is_terminal
+            except CommandError as exc:
+                log.debug("janitor: %s#%d unreadable (%s)", full_name, number, exc)
+                return None
+
+        return janitor_mod.FinishedReviews(rows, pr_state)
 
     def _janitor_guard(self, now: float) -> "janitor_mod.Guard | None":
         """What the janitor must not touch: every PR (and its review task's

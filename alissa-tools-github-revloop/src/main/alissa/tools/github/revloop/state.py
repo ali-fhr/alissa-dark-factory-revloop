@@ -1601,6 +1601,24 @@ class State:
             return None
         return None if row is None else str(row["task_ref"])
 
+    def read_review_tasks(self) -> list[dict]:
+        """Every cached PR -> review-task mapping, as (repo, number,
+        task_ref) rows: what lets the janitor attribute a `REVIEW-<task
+        ref>` checkout to its PR when no spawn row carries the ref -- a
+        round-1-only PR whose reviewer created the task (studio issue
+        #4761). Best-effort like `review_task`: a database error answers []."""
+        try:
+            return self._read_rows(
+                "SELECT repo, number, task_ref FROM review_tasks", None
+            )
+        except sqlite3.DatabaseError as exc:
+            log.warning(
+                "state: review-task cache unreadable (%s: %s) — the janitor "
+                "attributes REVIEW- checkouts by spawn rows only",
+                type(exc).__name__, exc,
+            )
+            return []
+
     def record_review_task(self, repo: str, number: int, task_ref: str) -> bool:
         """Remember which review task a PR resolved to. Best-effort.
 

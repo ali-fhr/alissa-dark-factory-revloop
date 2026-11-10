@@ -508,7 +508,7 @@ def test_the_watcher_dry_run_removes_nothing_and_says_what_it_would(ws, caplog):
                for r in caplog.records)
 
 
-@pytest.mark.parametrize("pct, warns", [(79.9, False), (80.0, True), (97.5, True)])
+@pytest.mark.parametrize("pct, warns", [(69.9, False), (70.0, True), (97.5, True)])
 def test_disk_at_or_above_the_threshold_logs_one_warning(ws, caplog, monkeypatch, pct, warns):
     w, _, _ = ws
     monkeypatch.setattr(janitor_mod, "disk_used_pct", lambda path: pct)
@@ -520,7 +520,7 @@ def test_disk_at_or_above_the_threshold_logs_one_warning(ws, caplog, monkeypatch
     assert len(disk) == (1 if warns else 0)
     if warns:
         assert disk[0].levelno == logging.WARNING
-        assert f"{pct:.1f}% used (warn at 80%)" in disk[0].getMessage()
+        assert f"{pct:.1f}% used (warn at 70%)" in disk[0].getMessage()
 
 
 def test_a_zero_threshold_never_warns(ws, caplog, monkeypatch):
@@ -669,7 +669,7 @@ def test_under_a_refused_template_the_disk_warning_still_fires(ws, caplog, monke
         assert w._run_janitor() is None
 
     disk = [r for r in caplog.records if "workspace volume" in r.getMessage()]
-    assert len(disk) == 1 and "91.0% used (warn at 80%)" in disk[0].getMessage()
+    assert len(disk) == 1 and "91.0% used (warn at 70%)" in disk[0].getMessage()
 
 
 # -- the per-sweep bound (issue #175) ------------------------------------------
@@ -1078,7 +1078,7 @@ def test_one_volume_pressure_event_after_three_sweeps_that_free_nothing(ws, monk
     rows = volume_pings(w)
     assert len(rows) == 1 and rows[0]["repo"] == "" and rows[0]["number"] == 0
     started, used, warn, freed, left = rows[0]["kind"].split(":")[1:6]
-    assert (started, used, warn, freed, left) == (str(t0 + 1200), "97.5", "80", "0", "2")
+    assert (started, used, warn, freed, left) == (str(t0 + 1200), "97.5", "70", "0", "2")
 
     from alissa.tools.github.revloop.loop_events import derive_events
     (event,) = [e for e in derive_events(w.state)
@@ -1867,3 +1867,250 @@ def test_an_unwritable_ledger_still_sweeps_and_pushes_vitals_on_the_first_pass(
     assert line.levelno == logging.ERROR
     assert pushed == [pytest.approx(0.0, abs=5)]
     assert not scratch.exists() and not review.exists(), "the janitor ran"
+
+
+# -- a finished review needs no grace (studio issue #4761) ---------------------
+
+FLEET_GRACE = 180 * 60  # the fleet's ALISSA_REVIEW_JANITOR_GRACE_MINUTES
+
+
+class PrStates:
+    """A fake `pr_state`: answers from a dict (True = merged or closed),
+    counting every read."""
+
+    def __init__(self, states, error=None):
+        self.states = dict(states)
+        self.error = error
+        self.reads: list[tuple[str, int]] = []
+
+    def __call__(self, full_name, number):
+        self.reads.append((full_name, number))
+        if self.error is not None:
+            raise self.error
+        return self.states.get((full_name, number))
+
+
+def spawn_row(number, round_=1, task_ref=None, folder_=None, repo="acme/widgets"):
+    return {"repo": repo, "number": number, "round": round_, "task_ref": task_ref,
+            "folder": None if folder_ is None else str(folder_)}
+
+
+def finished_sweep(hubs, rows, states, guard=None, **kw):
+    finished = janitor_mod.FinishedReviews(rows, states)
+    result = sweep(hubs, guard or Guard(), grace_seconds=FLEET_GRACE, now=NOW,
+                   runner=Runner(), finished=finished, **kw)
+    return result, finished
+
+
+def test_a_merged_prs_folders_go_on_the_next_pass_inside_the_grace(tmp_path):
+    """AC 1: the 2026-11-10 shape -- r1, r2 and r3 folders of a PR merged an
+    hour ago, all inside the fleet's 180-minute grace, no live round: every
+    one is reclaimed on the next pass, counted as a finished review."""
+    hub = make_hub(tmp_path)
+    young = HOUR
+    r1 = folder(hub / "REVIEW-pr4727", age=young)
+    r2 = folder(hub / "REVIEW-TASK-70", age=young)
+    r3 = folder(hub / "main" / "REVIEW-TASK-70-r3", age=young)
+    scratch = folder(hub / "main" / ".review-scratch-pr4727-r2", age=young)
+    rows = [spawn_row(4727, 1, None, hub / "REVIEW-pr4727"),
+            spawn_row(4727, 2, "TASK-70", hub / "REVIEW-TASK-70"),
+            spawn_row(4727, 3, "TASK-70", hub / "REVIEW-TASK-70")]
+    states = PrStates({("acme/widgets", 4727): True})
+
+    result, finished = finished_sweep([hub], rows, states)
+
+    assert not any(p.exists() for p in (r1, r2, r3, scratch))
+    assert result.reclaimed == {"widgets": {janitor_mod.RECLAIM_FINISHED: 4}}
+    assert result.fresh == 0
+    assert states.reads == [("acme/widgets", 4727)], "one read per PR per pass"
+    assert finished.lookups == 1
+
+
+def test_an_open_prs_folder_inside_the_grace_is_kept(tmp_path):
+    """AC 1: the grace keeps protecting an open PR's folders between rounds;
+    an unreadable state (None) is not finished either."""
+    hub = make_hub(tmp_path)
+    open_pr = folder(hub / "REVIEW-TASK-80", age=HOUR)
+    unknown = folder(hub / "REVIEW-pr9", age=HOUR)
+    rows = [spawn_row(8, 2, "TASK-80"), spawn_row(9)]
+    states = PrStates({("acme/widgets", 8): False})
+
+    result, _ = finished_sweep([hub], rows, states)
+
+    assert open_pr.is_dir() and unknown.is_dir()
+    assert result.removed == [] and result.fresh == 2 and result.reclaimed == {}
+
+
+def test_a_merged_pr_with_a_live_round_keeps_its_folder(tmp_path):
+    """'And its round has ended': a held folder is never reclaimed, finished
+    PR or not -- the guard decides first and the PR state is not read."""
+    hub = make_hub(tmp_path)
+    own = folder(hub / "REVIEW-pr7", age=HOUR)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, None, folder=own)
+    states = PrStates({("acme/widgets", 7): True})
+
+    result, _ = finished_sweep([hub], [spawn_row(7, 1, None, own)], states, guard)
+
+    assert own.is_dir() and result.removed == []
+    assert states.reads == []
+
+
+def test_a_folder_the_ledger_cannot_attribute_keeps_the_grace(tmp_path):
+    """No guessing: a folder no row names, a hub whose slug two owners
+    share, and a task ref two PRs carry all stay under the grace."""
+    hub = make_hub(tmp_path)
+    nameless = folder(hub / "REVIEW-TASK-99", age=HOUR)
+    shared_slug = folder(hub / "main" / ".review-scratch-pr5-r1", age=HOUR)
+    shared_task = folder(hub / "REVIEW-TASK-55", age=HOUR)
+    rows = [spawn_row(5, repo="acme/widgets"), spawn_row(5, repo="other/widgets"),
+            spawn_row(6, 2, "TASK-55"), spawn_row(16, 2, "TASK-55")]
+    states = PrStates({("acme/widgets", n): True for n in (5, 6, 16)}
+                      | {("other/widgets", 5): True})
+
+    result, _ = finished_sweep([hub], rows, states)
+
+    assert nameless.is_dir() and shared_slug.is_dir() and shared_task.is_dir()
+    assert result.removed == [] and states.reads == []
+
+
+def test_pr_state_reads_are_capped_and_a_failure_stops_them(tmp_path, caplog):
+    hub = make_hub(tmp_path)
+    paths = [folder(hub / f"REVIEW-pr{n}", age=HOUR) for n in (1, 2, 3)]
+    rows = [spawn_row(n) for n in (1, 2, 3)]
+    states = PrStates({("acme/widgets", n): True for n in (1, 2, 3)})
+
+    result, _ = finished_sweep([hub], rows, states)
+    assert len(result.removed) == 3
+
+    capped = janitor_mod.FinishedReviews(rows, states, max_lookups=1)
+    paths = [folder(hub / f"REVIEW-pr{n}", age=HOUR) for n in (1, 2, 3)]
+    result = sweep([hub], Guard(), grace_seconds=FLEET_GRACE, now=NOW,
+                   runner=Runner(), finished=capped)
+    assert len(result.removed) == 1 and capped.lookups == 1
+    assert sum(p.is_dir() for p in paths) == 2
+
+    failing = PrStates({}, error=RuntimeError("API rate limit exceeded"))
+    with caplog.at_level(logging.WARNING, logger="alissa.tools.github"):
+        result, _ = finished_sweep([hub], rows, failing)
+    assert result.removed == [] and len(failing.reads) == 1, "no read after a failure"
+    assert any("no more PR states are read" in r.getMessage() for r in caplog.records)
+
+
+def test_review_task_cache_rows_attribute_a_round_one_checkout(tmp_path):
+    """A round-1-only PR: its spawn row has no task ref, but the CR2 cache
+    maps the PR to the review task its reviewer created."""
+    hub = make_hub(tmp_path)
+    checkout = folder(hub / "REVIEW-TASK-71", age=HOUR)
+    rows = [spawn_row(7), {"repo": "acme/widgets", "number": 7, "task_ref": "TASK-71"}]
+
+    result, _ = finished_sweep([hub], rows, PrStates({("acme/widgets", 7): True}))
+
+    assert not checkout.exists()
+    assert result.reclaimed_count(janitor_mod.RECLAIM_FINISHED) == 1
+
+
+def test_a_task_less_round_one_holds_exactly_its_own_folder(tmp_path):
+    """AC 2: a live task-less r1 (its spawn row records `REVIEW-pr<N>`, no
+    task ref) holds its own folder -- found by its session's ledger row --
+    and never a sibling's: the sibling round's folder of another, merged PR
+    in the same hub is reclaimed inside the grace."""
+    hub = make_hub(tmp_path, "studio.alissa.app")
+    own = folder(hub / "REVIEW-pr4761", age=HOUR)
+    sibling = folder(hub / "REVIEW-pr4760", age=HOUR)
+    sibling_task = folder(hub / "REVIEW-TASK-1029981026", age=HOUR)
+    repo = "ali-fhr/studio.alissa.app"
+    rows = [spawn_row(4761, 1, None, own, repo=repo),
+            spawn_row(4760, 1, None, sibling, repo=repo),
+            spawn_row(4760, 2, "TASK-1029981026", hub / "REVIEW-TASK-1029981026", repo=repo)]
+    guard = Guard()
+    guard.hold(repo, 4761, None, folder=own)  # the live r1's spawn row
+    states = PrStates({(repo, 4761): True, (repo, 4760): True})
+
+    result, _ = finished_sweep([hub], rows, states, guard)
+
+    assert own.is_dir()
+    assert not sibling.exists() and not sibling_task.exists()
+    assert (repo, 4761) not in states.reads
+
+
+def test_the_default_warn_pct_is_70_below_the_hosting_alert():
+    """AC 3: the pressure grace starts before the hosting provider's 75%
+    notice."""
+    from alissa.tools.github.revloop import config as config_mod
+
+    assert config_mod.DEFAULT_JANITOR_WARN_PCT == 70
+    assert Config(workspace_root=Path("/ws")).janitor_warn_pct == 70
+
+
+def test_the_per_hub_counts_name_finished_past_grace_and_held(tmp_path):
+    """AC 3: the sweep line's per-hub tail -- reclaimed as finished review,
+    reclaimed past the grace, held."""
+    widgets = make_hub(tmp_path, "widgets")
+    gadgets = make_hub(tmp_path, "gadgets")
+    folder(widgets / "REVIEW-pr1", age=HOUR)                   # finished
+    folder(widgets / "REVIEW-pr2", age=FLEET_GRACE + 60)       # past grace
+    held = folder(widgets / "REVIEW-pr3", age=FLEET_GRACE + 60)
+    folder(gadgets / "REVIEW-pr4", age=HOUR)                   # finished
+    rows = [spawn_row(1), spawn_row(4, repo="acme/gadgets")]
+    guard = Guard()
+    guard.hold("acme/widgets", 3, None, folder=held)
+    states = PrStates({("acme/widgets", 1): True, ("acme/gadgets", 4): True})
+
+    result, _ = finished_sweep([widgets, gadgets], rows, states, guard)
+
+    assert janitor_mod.hub_summary(result) == (
+        "; per hub: gadgets 1 finished review, 0 past grace, 0 held; "
+        "widgets 1 finished review, 1 past grace, 1 held"
+    )
+    assert janitor_mod.hub_summary(janitor_mod.SweepResult()) == ""
+
+
+def test_the_watcher_reclaims_a_merged_prs_folder_and_logs_the_counts(ws, caplog):
+    """End to end: a reaped round of a PR GitHub reports merged, its folder an
+    hour old under a 180-minute grace -- reclaimed by the next sweep through
+    the seat's GitHub client, and the INFO line counts it per hub."""
+    from test_loop import FakeGitHub as _FakeGitHub
+
+    w, _, hub = ws
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      hub_template="{root}/{repo}/main",
+                      state_path=w.config.state_db, janitor_grace_minutes=180)
+    w.github = _FakeGitHub(make_pr(state="closed", merged=True), [])
+    session = "review-widgets-pr7-r1-aaaaaa"
+    own = hub / "REVIEW-pr7"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
+                         session=session, task_ref=None, folder=str(own))
+    w.state.record_reap(session)
+    young_checkout(hub, "REVIEW-pr7", hours=1).rename(own)
+    open_left = hub / "REVIEW-TASK-80"
+    open_left.mkdir()
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert result is not None and not own.exists()
+    assert open_left.is_dir(), "a folder no row names keeps the grace"
+    assert w.github.pr_fetches == 1
+    (line,) = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("janitor: removed")]
+    assert "removed 1 folder(s)" in line
+    assert "(1 finished review, 0 past grace)" in line
+    assert "; per hub: widgets 1 finished review, 0 past grace, 0 held" in line
+
+
+def test_the_watcher_keeps_an_open_prs_folder_inside_the_grace(ws):
+    w, _, hub = ws
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      hub_template="{root}/{repo}/main",
+                      state_path=w.config.state_db, janitor_grace_minutes=180)
+    session = "review-widgets-pr7-r1-aaaaaa"
+    own = hub / "REVIEW-pr7"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
+                         session=session, task_ref=None, folder=str(own))
+    w.state.record_reap(session)
+    young_checkout(hub, "REVIEW-pr7", hours=1).rename(own)
+
+    result = w._run_janitor()
+
+    assert own.is_dir() and result is not None and result.removed == []

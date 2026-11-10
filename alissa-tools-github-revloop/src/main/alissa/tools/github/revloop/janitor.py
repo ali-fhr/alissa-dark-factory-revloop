@@ -42,6 +42,11 @@ Four properties everything here is written around:
   and the grace is a day by default. A held folder is kept whatever its age.
   Under disk PRESSURE (issue #177) the grace drops -- to two hours by default
   -- oldest first, only while the volume is still at or above its warn line.
+  A FINISHED review needs no grace at all (studio issue #4761): a folder the
+  ledger attributes to a PR that is merged or closed on GitHub, and that no
+  live round holds, is reclaimed on the next sweep whatever its age
+  (`FinishedReviews`). The grace keeps protecting the folders of open PRs
+  between rounds.
 * **Held per folder, never per hub** (issue #232). A live round holds the
   folders it can be shown to own: its PR's scratch folders, the checkout its
   review task names, `REVIEW-pr<N>` for its PR, and the folder the ledger
@@ -136,6 +141,21 @@ PRESSURE_SWEEPS = 3
 # leaves it unchanged. So an entry is re-walked once it is this old, mtime
 # or not.
 SIZE_CACHE_SECONDS = 60 * 60
+
+# Why a folder was reclaimed (studio issue #4761), counted per hub in
+# `SweepResult.reclaimed` and named on the sweep's INFO line: its PR is
+# merged or closed and no live round holds it (`finished review`), or it is
+# past the grace -- the normal one, or the pressure grace (`past grace`).
+RECLAIM_FINISHED = "finished review"
+RECLAIM_PAST_GRACE = "past grace"
+
+# At most this many PR-state reads per sweep (studio issue #4761). Each is
+# one `GET pulls/<n>` on the seat's own GitHub client, so it counts against
+# the same hourly budget as the poller's reads; a sweep every 10 minutes
+# reads at most 6 x this an hour, and only for folders inside the grace
+# whose PR the ledger names. A folder whose PR was not read this sweep is
+# kept by the grace, as before.
+MAX_PR_LOOKUPS = 30
 
 
 @dataclass
@@ -275,6 +295,111 @@ def round_folder(hub: "Path | str", task_ref: "str | None", number: int) -> Path
     return Path(hub) / name
 
 
+class FinishedReviews:
+    """Whether a folder's review is FINISHED: its PR is merged or closed on
+    GitHub (studio issue #4761). Asked by `sweep` only for a folder inside
+    the grace that no `Guard` holds -- so "its round has ended" is the
+    guard's answer (no live session, no open ledger round, no owed verdict
+    post), and this answers the PR half.
+
+    A folder is attributed to ONE PR, through the ledger only, never by
+    guessing an owner: the spawn row that recorded it (`folder`, by path or,
+    for one made inside `main/`, by name), else what its name says --
+    `.review-scratch-pr<N>-*` and `REVIEW-pr<N>` name PR N of the hub's repo,
+    and `REVIEW-<task ref>[-r<k>]` names the PR whose spawn row (or CR2
+    cache row) carries that review task. The hub's repo is the `owner/name`
+    of the ledger rows in that hub; a slug two owners share, a task ref two
+    PRs share, or a folder no row names is UNATTRIBUTED and stays under the
+    grace.
+
+    `pr_state(full_name, number)` answers True for a merged or closed PR,
+    False for an open one, None when it could not tell; it is asked once per
+    PR per sweep (this object lives one sweep) and at most `max_lookups`
+    times. `RateLimited`-style failures are the caller's to map to None; a
+    raise here is caught and stops further lookups this sweep."""
+
+    def __init__(
+        self,
+        rows: "Iterable[dict]",
+        pr_state: "Callable[[str, int], bool | None]",
+        *,
+        max_lookups: int = MAX_PR_LOOKUPS,
+    ) -> None:
+        self._pr_state = pr_state
+        self._max = max_lookups
+        self._answers: "dict[tuple[str, int], bool | None]" = {}
+        self._lookups = 0
+        self._stopped = False
+        # folder key -> PRs, folder NAME (per slug) -> PRs, (slug, task ref)
+        # -> PRs, slug -> repo full names.
+        self._by_folder: "dict[str, set[tuple[str, int]]]" = {}
+        self._by_name: "dict[tuple[str, str], set[tuple[str, int]]]" = {}
+        self._by_task: "dict[tuple[str, str], set[tuple[str, int]]]" = {}
+        self._repos: "dict[str, set[str]]" = {}
+        for row in rows:
+            repo = str(row.get("repo") or "")
+            if "/" not in repo:
+                continue
+            try:
+                pr = (repo, int(row["number"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            slug = session_repo_slug(repo.rpartition("/")[2])
+            self._repos.setdefault(slug, set()).add(repo)
+            recorded = row.get("folder")
+            if recorded:
+                self._by_folder.setdefault(_folder_key(recorded), set()).add(pr)
+                self._by_name.setdefault(
+                    (slug, os.path.basename(os.fspath(recorded))), set()
+                ).add(pr)
+            ref = (row.get("task_ref") or "").strip()
+            if ref:
+                self._by_task.setdefault((slug, ref), set()).add(pr)
+
+    @property
+    def lookups(self) -> int:
+        """PR-state reads placed this sweep."""
+        return self._lookups
+
+    def pr_of(self, candidate: Candidate) -> "tuple[str, int] | None":
+        """The one PR the ledger attributes `candidate` to, or None."""
+        slug = candidate.hub_slug
+        prs = self._by_folder.get(_folder_key(candidate.path))
+        if not prs:
+            prs = self._by_name.get((slug, candidate.path.name))
+        if not prs and candidate.number is not None:
+            repos = self._repos.get(slug, set())
+            prs = {(repo, candidate.number) for repo in repos}
+        if not prs and candidate.task_ref:
+            ref = _ROUND_SUFFIX_RE.sub("", candidate.task_ref)
+            prs = self._by_task.get((slug, ref))
+        if not prs or len(prs) != 1:
+            return None
+        return next(iter(prs))
+
+    def __call__(self, candidate: Candidate) -> bool:
+        """Whether `candidate`'s PR is known to be merged or closed."""
+        pr = self.pr_of(candidate)
+        if pr is None:
+            return False
+        if pr not in self._answers:
+            if self._stopped or self._lookups >= self._max:
+                return False
+            self._lookups += 1
+            try:
+                answer = self._pr_state(*pr)
+            except Exception as exc:  # noqa: BLE001 -- the sweep must complete
+                log.warning(
+                    "janitor: could not read %s#%d's state (%s: %s) — no more "
+                    "PR states are read this sweep; its folders keep the grace",
+                    pr[0], pr[1], type(exc).__name__, exc,
+                )
+                self._stopped = True
+                answer = None
+            self._answers[pr] = answer
+        return self._answers[pr] is True
+
+
 @dataclass
 class SweepResult:
     """What one sweep did. `removed` and `would_remove` carry (path, bytes);
@@ -306,6 +431,18 @@ class SweepResult:
     # Issue #189: unsized held folders whose walk is kept to resume next
     # sweep (a subset of `held_unsized`).
     held_resuming: int = 0
+    # Studio issue #4761: per hub slug, how many folders were reclaimed (or,
+    # in a dry run, would be) as RECLAIM_FINISHED and as RECLAIM_PAST_GRACE.
+    reclaimed: "dict[str, dict[str, int]]" = field(default_factory=dict)
+    # Per hub slug, how many folders a live round held this sweep.
+    held_by_hub: "dict[str, int]" = field(default_factory=dict)
+
+    def _reclaim(self, slug: str, why: str) -> None:
+        counts = self.reclaimed.setdefault(slug, {})
+        counts[why] = counts.get(why, 0) + 1
+
+    def reclaimed_count(self, why: str) -> int:
+        return sum(counts.get(why, 0) for counts in self.reclaimed.values())
 
     @property
     def freed(self) -> int:
@@ -354,6 +491,23 @@ def held_summary(result: SweepResult) -> str:
         if result.held_resuming:
             tail += f" ({result.held_resuming} walk(s) resume next sweep)"
     return tail
+
+
+def hub_summary(result: SweepResult) -> str:
+    """The sweep line's per-hub tail (studio issue #4761): `; per hub: <hub>
+    N finished review, M past grace, K held` for every hub that reclaimed or
+    held anything, in name order, or '' when none did -- so which rule freed
+    (or kept) what is one log read."""
+    slugs = sorted(set(result.reclaimed) | set(result.held_by_hub))
+    parts = []
+    for slug in slugs:
+        counts = result.reclaimed.get(slug, {})
+        parts.append(
+            f"{slug} {counts.get(RECLAIM_FINISHED, 0)} {RECLAIM_FINISHED}, "
+            f"{counts.get(RECLAIM_PAST_GRACE, 0)} {RECLAIM_PAST_GRACE}, "
+            f"{result.held_by_hub.get(slug, 0)} held"
+        )
+    return ("; per hub: " + "; ".join(parts)) if parts else ""
 
 
 def layout_supported(
@@ -618,6 +772,7 @@ def sweep(
     pressure_grace_seconds: "float | None" = None,
     under_pressure: "Callable[[], bool] | None" = None,
     sizes: "SizeCache | None" = None,
+    finished: "Callable[[Candidate], bool] | None" = None,
 ) -> SweepResult:
     """Remove every candidate under `hubs` older than `grace_seconds` that
     `guard` does not hold, oldest first, then prune each hub's worktree
@@ -653,7 +808,16 @@ def sweep(
     An abandoned walk is kept there too (issue #189): the next sweep sizes
     every other held folder first and then resumes it where it stopped, so
     one large tree neither starves the folders behind it nor restarts from
-    scratch every sweep."""
+    scratch every sweep.
+
+    A finished review needs no grace (studio issue #4761): when `finished`
+    (a `FinishedReviews`) is given, a folder that would otherwise be kept
+    ONLY by a grace -- the normal one, or the pressure one once the volume
+    is back under its line -- and that `guard` does not hold is asked about,
+    and removed when its PR is merged or closed. It goes under the same
+    per-sweep bound. Every removal is counted per hub in `reclaimed` as
+    RECLAIM_FINISHED or RECLAIM_PAST_GRACE, and every held folder in
+    `held_by_hub`."""
     result = SweepResult()
     started = clock()
     bounded = False
@@ -675,20 +839,30 @@ def sweep(
     aged.sort(key=lambda pair: (pair[0], str(pair[1].path)))
     for mtime, candidate in aged:
         age = now - mtime
+        slug = candidate.hub_slug
         if age < shrunk:
-            result.fresh += 1
-            continue
-        why = guard.holds(candidate)
-        if why is not None:
-            log.debug("janitor: keeping %s — %s", candidate.path, why)
-            result.held.append((candidate.path, why))
-            held_queue.append((mtime, candidate, f"{candidate.hub_slug}: {why}"))
-            continue
-        early = age < grace_seconds
-        if early and not dry_run and not (under_pressure and under_pressure()):
-            # Back under the line: the normal grace holds again.
-            result.fresh += 1
-            continue
+            if (finished is None or guard.holds(candidate) is not None
+                    or not finished(candidate)):
+                result.fresh += 1
+                continue
+            early, reason = False, RECLAIM_FINISHED
+        else:
+            why = guard.holds(candidate)
+            if why is not None:
+                log.debug("janitor: keeping %s — %s", candidate.path, why)
+                result.held.append((candidate.path, why))
+                result.held_by_hub[slug] = result.held_by_hub.get(slug, 0) + 1
+                held_queue.append((mtime, candidate, f"{slug}: {why}"))
+                continue
+            early = age < grace_seconds
+            reason = RECLAIM_PAST_GRACE
+            if early and not dry_run and not (under_pressure and under_pressure()):
+                # Back under the line: the normal grace holds again -- unless
+                # the review is finished, which needs none.
+                if finished is None or not finished(candidate):
+                    result.fresh += 1
+                    continue
+                early, reason = False, RECLAIM_FINISHED
         if not bounded:
             taken = len(result.would_remove if dry_run else result.removed)
             bounded = taken >= max_removals or clock() - started >= max_seconds
@@ -703,9 +877,11 @@ def sweep(
             log.info(
                 "[dry-run] janitor would remove %s (%s, %.1f h old%s)",
                 candidate.path, human(size), age / 3600,
-                ", under pressure" if early else "",
+                ", under pressure" if early
+                else ", review finished" if reason == RECLAIM_FINISHED else "",
             )
             result.would_remove.append((candidate.path, size))
+            result._reclaim(slug, reason)
             if early:
                 result.pressure_removed += 1
             continue
@@ -715,8 +891,9 @@ def sweep(
             log.warning("janitor: could not remove %s (%s)", candidate.path, exc)
             result.failed.append((candidate.path, str(exc)))
             continue
-        log.debug("janitor: removed %s (%s)", candidate.path, human(size))
+        log.debug("janitor: removed %s (%s, %s)", candidate.path, human(size), reason)
         result.removed.append((candidate.path, size))
+        result._reclaim(slug, reason)
         if early:
             result.pressure_removed += 1
     _size_held(held_queue, result, sizes, now=now,

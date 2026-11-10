@@ -745,8 +745,10 @@ DEFAULT_JANITOR_GRACE_MINUTES = 24 * 60
 DEFAULT_JANITOR_INTERVAL_MINUTES = 10
 
 # The workspace volume's used percentage at or above which a sweep logs one
-# WARNING. Devloop's threshold; 0 = never warn.
-DEFAULT_JANITOR_WARN_PCT = 80
+# WARNING and the pressure grace applies. 0 = never warn. 70, not devloop's
+# 80 (studio issue #4761): the hosting provider alerts at 75%, so the
+# pressure grace must start BEFORE its notice, not after.
+DEFAULT_JANITOR_WARN_PCT = 70
 
 # The grace UNDER PRESSURE (issue #177): while the volume is at or above
 # `janitor_warn_pct`, a folder older than this many minutes is removable too,

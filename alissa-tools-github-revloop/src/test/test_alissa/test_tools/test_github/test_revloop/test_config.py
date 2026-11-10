@@ -387,7 +387,8 @@ def test_the_janitor_keys_have_their_documented_defaults(tmp_path):
     assert cfg.janitor_enabled is True
     assert cfg.janitor_grace_minutes == 1440
     assert cfg.janitor_interval_minutes == 10
-    assert cfg.janitor_warn_pct == 80
+    # 70, below the hosting alert at 75% (studio issue #4761).
+    assert cfg.janitor_warn_pct == 70
     for key in ("janitor_enabled", "janitor_grace_minutes",
                 "janitor_interval_minutes", "janitor_warn_pct"):
         assert key in CONFIG_KEYS

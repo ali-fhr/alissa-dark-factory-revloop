@@ -185,7 +185,7 @@ else refused by name.
 | `janitor_enabled` | `true` | the **workspace janitor**: at the end of a pass, every `janitor_interval_minutes`, remove each hub's stale `main/.review-scratch-*` and `REVIEW-*` folders that no live session or open round holds, `git worktree prune` the hub's `.source`, and warn on a full volume — see *The workspace janitor*. `--janitor` / `--no-janitor`; environment `ALISSA_REVIEW_JANITOR_ENABLED` |
 | `janitor_grace_minutes` | `1440` | how old (newest mtime of the folder and its direct children) a scratch folder or `REVIEW-` checkout must be before the janitor may remove it. `>= 1`. `--janitor-grace-minutes`; environment `ALISSA_REVIEW_JANITOR_GRACE_MINUTES` |
 | `janitor_interval_minutes` | `10` | how often the janitor sweeps; `0` = every pass. The first sweep runs at the end of the first pass. `--janitor-interval-minutes`; environment `ALISSA_REVIEW_JANITOR_INTERVAL_MINUTES` |
-| `janitor_warn_pct` | `80` | workspace-volume usage at or above which a sweep logs one WARNING, shrinks the grace to `janitor_pressure_grace_minutes` and, once three sweeps in a row free nothing, records one `janitor.volume_pressure` loop event per episode; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
+| `janitor_warn_pct` | `70` | workspace-volume usage at or above which a sweep logs one WARNING, shrinks the grace to `janitor_pressure_grace_minutes` and, once three sweeps in a row free nothing, records one `janitor.volume_pressure` loop event per episode; `0` = never, at most `100`. `--janitor-warn-pct`; environment `ALISSA_REVIEW_JANITOR_WARN_PCT` |
 | `janitor_pressure_grace_minutes` | `120` | the grace **under disk pressure**: while the volume is at or above `janitor_warn_pct`, a folder older than this is removable too, oldest first, until the volume is back under the line. `>= 1`; never longer than `janitor_grace_minutes`. File or environment `ALISSA_REVIEW_JANITOR_PRESSURE_GRACE_MINUTES` (no CLI flag) |
 | `alissa_endpoint` | `https://api.alissa.app` | the Alissa API base the loop-events and fleet-vitals clients post to **and** the feed listing is read from under `bows` (`GET /v1/ping`, `GET /v1/bodies-of-work?includeShared=true`); the token is the CLI's own `ALISSA_API_TOKEN` from the environment |
 
@@ -1392,6 +1392,19 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   else in its hub. A folder no live round names is protected only by the
   grace. If the roster cannot be listed the removal half is skipped that
   interval.
+- **A finished review needs no grace** (studio issue #4761). A folder that
+  nothing holds and that is still inside the grace is removed on the next
+  sweep when its PR is **merged or closed** on GitHub. The janitor finds the
+  PR through the ledger only: the spawn row that recorded the folder, the
+  PR number in a `REVIEW-pr<N>` or `.review-scratch-pr<N>-*` name (with the
+  hub's repo taken from its spawn rows), or the review task in a
+  `REVIEW-<task>[-r<k>]` name (from a spawn row or the CR2 review-task
+  cache). A folder it cannot tie to exactly one PR keeps the grace, and so
+  does the folder of an open PR between rounds. Each PR's state is read once
+  per sweep through the daemon's own GitHub client, so the reads share the
+  poller's hourly budget. A sweep reads at most 30 PR states, and after a
+  failed read (throttling, for example) it reads no more until the next
+  sweep. These removals share the per-sweep bound below.
 - **Under disk pressure the grace shrinks.** When the workspace volume is at
   or above `janitor_warn_pct` as a sweep starts, the grace drops to
   `janitor_pressure_grace_minutes` (default 120 — past the 90-minute
@@ -1409,9 +1422,14 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   own user, dropping the records of the `wt/` worktrees and checkouts just
   removed.
 - **One INFO line per sweep**: `janitor: removed N folder(s), freed X across H
-  hub(s); … held by a live round, … inside the grace, … failed, … deferred
-  to the next interval`. When the
-  workspace volume is at or above `janitor_warn_pct` (default 80; `0` = never)
+  hub(s) (F finished review, P past grace); … held by a live round, … inside
+  the grace, … failed, … deferred to the next interval; per hub: <hub> F
+  finished review, P past grace, K held; …`. `finished review` counts the
+  removals of merged or closed PRs' folders inside the grace. `past grace`
+  counts the rest, including the pressure grace's. The per-hub tail lists
+  each hub that reclaimed or held anything. When the
+  workspace volume is at or above `janitor_warn_pct` (default 70, below the
+  hosting alert at 75%; `0` = never)
   the sweep also logs **one WARNING** with the percentage, and an INFO line
   saying the grace dropped and how many folders went only under it.
 - **Sustained pressure is a loop event.** Once three sweeps in a row at or
