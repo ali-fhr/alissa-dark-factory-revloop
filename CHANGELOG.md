@@ -16,6 +16,19 @@ header).
 
 ## Unreleased
 
+- **The janitor reclaims a finished review's folders without waiting out the
+  grace** (studio issue #4761; origin TASK-350460367, implementation
+  TASK-785320528). On 2026-11-10 ten `REVIEW-*` folders of PRs merged 1–4 h
+  earlier sat inside the fleet's 180-minute grace while the volume crossed the
+  hosting provider's 75% alert. Each sweep now attributes a folder to its PR
+  through the ledger (the spawn row's recorded folder, `REVIEW-pr<N>` and
+  scratch names, or the review task a spawn row or the CR2 cache carries) and
+  removes it at once when no live round holds it and GitHub reports the PR
+  merged or closed. Each PR is read once per sweep, at most 30 reads per
+  sweep, on the seat's own GitHub client. The default `janitor_warn_pct` is
+  now 70, so the pressure grace starts before the 75% alert. The sweep's INFO
+  line counts `finished review` and `past grace` removals and adds a
+  `per hub:` tail with reclaimed and held counts.
 - **Fleet vitals list the review sessions for the lane doctor** (issue #236;
   origin TASK-1677220016, implementation TASK-711160084). Studio's lane
   doctor (lane-doctor design §1.4, lane LR-1) needs to know a lane has live
