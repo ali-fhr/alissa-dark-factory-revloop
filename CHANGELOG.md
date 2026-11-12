@@ -16,6 +16,8 @@ header).
 
 ## Unreleased
 
+## 0.31.43 (2026-11-12)
+
 - **The image builds on loopwork base 0.6.2, whose claude-code knows Claude
   Fable 5.2** (issue #241; origin TASK-1050507154, implementation
   TASK-2011768533). `claude-fable-5-2`, what the `fable` alias now resolves
