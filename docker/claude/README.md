@@ -67,7 +67,7 @@ This Dockerfile is a thin **leaf** on the shared loopwork base image, pinned by
 both an exact tag and a digest:
 
 ```dockerfile
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2@sha256:970dfe6f1179d9c5b1c709c47fbb9211c4adeca2b68c0da5d362726be572106e
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.6.2@sha256:3d5ed0d5a92646767ac432cc1aeb0b8f8dbb3f5ea491053a4a5ac1f9b167c7cc
 ```
 
 The base is **public on GHCR**, so the pull is anonymous — no registry
@@ -129,6 +129,23 @@ same image config, and `tests-image-contract.sh` now asserts the `2.1.280`
 claude-code floor inside the built image so a base regression cannot land
 green.
 
+The bumps from `0.2.3` to `0.6.1` are recorded in the `Dockerfile` header
+comment: `0.2.3` re-snapshots the alissa CLI for the paste lead-in, and
+`0.6.1` brings alissa CLI `0.3.1` (SIGHUP finalize, held to a `0.3.1` floor
+by `tests-image-contract.sh`) plus the `0.3`–`0.6` slim changes, among them a
+pinned headless Chromium. The polyglot toolchains live only in the separate
+`-polyglot` tag, which this image does not adopt.
+
+The bump to `0.6.2` (base PR `ali-fhr/alissa-loopwork#18`) is another patch
+re-snapshot: claude-code goes from `2.1.316` to `2.1.322`. The reason is
+`claude-fable-5-2`, what the `fable` alias now resolves to, which only
+claude-code ≥ `2.1.321` knows. The base build now refuses an older
+claude-code, and `tests-image-contract.sh` raises its floor from `2.1.280` to
+`2.1.321`, which still covers `claude-opus-5-5`. `codex` goes from
+`0.166.0` to `0.167.2`; `pi` (`0.73.1`) and the alissa CLI (`0.3.1`) stay. The leaf
+contract and the image config are unchanged, and so is the reviewer model
+default (moving the fleet to Fable 5.2 is an operator decision).
+
 #### How the pin is written
 
 Never `:latest`, and never a bare tag either. The reference carries **two values
@@ -136,8 +153,8 @@ that do different jobs**, and a bump changes both together:
 
 | half | job |
 | --- | --- |
-| `:0.2.2` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
-| `@sha256:970dfe6f…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.2.2` is substituted into every build with no diff to review. |
+| `:0.6.2` — exact semver | the **readable** half. It is what makes a bump a reviewable one-line change and what tells a reader which base this is. |
+| `@sha256:3d5ed0d5…` — digest | the **enforcing** half. A tag is mutable; without the digest, a re-push of `0.6.2` is substituted into every build with no diff to review. |
 
 The digest matters more here than for an ordinary base image. This one line is now
 the *entire* review surface for claude-code, a `curl … | bash` CLI install and
@@ -145,19 +162,19 @@ the whole apt layer — none of which this repo builds, or sees, any more. A sil
 substitution should be a build failure, not a successful build of something else.
 
 The pinned digest is the **index** digest (what the registry returns as
-`Docker-Content-Digest` for the tag `0.2.2`), not the digest of the amd64 child
-manifest it currently selects (`sha256:7e5369da…`). Pinning the index keeps
+`Docker-Content-Digest` for the tag `0.6.2`), not the digest of the amd64 child
+manifest it currently selects (`sha256:e91ed20a…`). Pinning the index keeps
 platform selection a build-time choice, so when the base gains arm64 this stays an
 ordinary two-value bump instead of a reference that can only ever resolve to
 amd64. Read the current values back with:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2
+docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.6.2
 ```
 
 #### Platform: amd64 only
 
-**The base publishes `linux/amd64` and nothing else.** Its `0.2.2` index contains
+**The base publishes `linux/amd64` and nothing else.** Its `0.6.2` index contains
 exactly one platform manifest plus an attestation manifest — no `arm64`, no
 `arm/v7`. The `python:3.12-slim-bookworm` this image used to build from shipped
 five architectures, so this is a real narrowing and it is worth knowing before you

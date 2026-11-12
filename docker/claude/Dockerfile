@@ -64,7 +64,7 @@
 #     deliberate, reviewable change to this line, and that is the ONLY thing that
 #     advances the shared infrastructure layers;
 #   * the `@sha256:` is the ENFORCING half — a tag is mutable, so without it a
-#     re-push of `0.2.2` is substituted into every build with no diff to review.
+#     re-push of `0.6.2` is substituted into every build with no diff to review.
 #     That matters more here than for an ordinary base: this pin is now the whole
 #     review surface for claude-code, the `curl … | bash` CLI install and the apt
 #     layer, none of which this repo builds any more.
@@ -77,7 +77,7 @@
 # into the reference, so an arm64 base, once published, needs only the ordinary
 # two-value bump. Read the current one back with:
 #
-#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.2.2
+#   docker buildx imagetools inspect ghcr.io/ali-fhr/alissa-loopwork-base:0.6.2
 #
 # The base is linux/amd64-ONLY today; see "Base image" in README.md.
 #
@@ -108,7 +108,18 @@
 # and 0.6.0 adds a pinned headless Chromium (Playwright 1.64.1, ~+135 MB
 # compressed) to slim. Snapshot of this build: claude-code 2.1.316, codex
 # 0.166.0, pi 0.73.1, alissa 0.3.1. Base release: ali-fhr/alissa-loopwork#16.
-FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.6.1@sha256:26af11fe3f1fb8a730076d772fa0f456bd7beefd05c45ec8e26e96421bd00efe
+#
+# 0.6.2 (issue #241) is a patch re-snapshot for Claude Fable 5.2:
+# `claude-fable-5-2`, what the `fable` alias now resolves to, is known to
+# claude-code >= 2.1.321 only, and 0.6.1 froze 2.1.316. The base build now
+# refuses an older claude-code (CLAUDE_CODE_MIN, beside ALISSA_CLI_MIN), and
+# tests-image-contract.sh raises its floor from 2.1.280 to 2.1.321, which
+# still covers the fleet's `claude-opus-5-5`. The image config (ENTRYPOINT/
+# USER/WORKDIR/ENV skeleton) is unchanged, and so is the reviewer model
+# default: moving the fleet to Fable 5.2 is an operator decision. Snapshot of
+# the release build: claude-code 2.1.322, codex 0.167.2, pi 0.73.1, alissa
+# 0.3.1. Base release: ali-fhr/alissa-loopwork#18 (release run 43141957681).
+FROM ghcr.io/ali-fhr/alissa-loopwork-base:0.6.2@sha256:3d5ed0d5a92646767ac432cc1aeb0b8f8dbb3f5ea491053a4a5ac1f9b167c7cc
 
 # Version of the daemon to install from PyPI. This default EQUALS the dist's
 # plain-text `version` file (alissa-tools-github-revloop/src/main/alissa/tools/

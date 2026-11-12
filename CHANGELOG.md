@@ -16,6 +16,14 @@ header).
 
 ## Unreleased
 
+- **The image builds on loopwork base 0.6.2, whose claude-code knows Claude
+  Fable 5.2** (issue #241; origin TASK-1050507154, implementation
+  TASK-2011768533). `claude-fable-5-2`, what the `fable` alias now resolves
+  to, needs claude-code 2.1.321 or newer; base 0.6.1 froze 2.1.316. The
+  `FROM` moves to `alissa-loopwork-base:0.6.2` by index digest, and
+  `tests-image-contract.sh` raises its claude-code floor from 2.1.280 to
+  2.1.321, which still covers the fleet's `claude-opus-5-5`. The image config
+  and the reviewer model default are unchanged.
 - **The janitor reclaims a finished review's folders without waiting out the
   grace** (studio issue #4761; origin TASK-350460367, implementation
   TASK-785320528). On 2026-11-10 ten `REVIEW-*` folders of PRs merged 1–4 h
