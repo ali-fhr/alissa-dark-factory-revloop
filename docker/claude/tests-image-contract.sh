@@ -25,9 +25,11 @@
 #   1. the build itself succeeds
 #   2. `alissa-revloop`, `alissa-revloop-ui`, `claude`, `alissa`, `gh`, `tmux`,
 #      `codex`, `pi` all resolvable on PATH — and `claude --version` is at least
-#      2.1.280, the first claude-code that knows `claude-opus-5-5`, the model
-#      the shared fleet pins (issue #140; base 0.2.2 ships 2.1.283). The
-#      version is printed so the CI log records what each build inherited.
+#      2.1.321, the first claude-code that knows `claude-fable-5-2` (what the
+#      `fable` alias resolves to; issue #241, base 0.6.2). That floor still
+#      covers `claude-opus-5-5`, the model the shared fleet pins (known since
+#      2.1.280, issue #140). The version is printed so the CI log records
+#      what each build inherited.
 #      `alissa --version` is likewise printed and held to a 0.3.1 floor, the
 #      first CLI whose SIGHUP handler finalizes the session and uploads its
 #      transcript when the pane is killed (issue #210; base 0.6.1 ships 0.3.1).
@@ -196,17 +198,19 @@ done
 
 # --- the inherited claude-code is new enough for the fleet's model pin ---
 # The base leaves claude-code unpinned and re-snapshots it per release, so the
-# FROM bump is the only thing that moves it. `claude-opus-5-5` (the id the
-# shared fleet sets in ALISSA_AGENT_MODEL) is known to >= 2.1.280 only; an
-# older CLI accepts the pin at boot and then fails every session with a 400,
-# which nothing in this repo would otherwise notice. Printed as well as
-# asserted so the CI log records the version each build actually inherited.
-CLAUDE_FLOOR=2.1.280
+# FROM bump is the only thing that moves it. `claude-fable-5-2` (what the
+# `fable` alias resolves to) is known to >= 2.1.321 only (issue #241, base
+# 0.6.2); `claude-opus-5-5` (the id the shared fleet sets in
+# ALISSA_AGENT_MODEL) to >= 2.1.280, so the one floor covers both. An older
+# CLI accepts the pin at boot and then fails every session with a 400, which
+# nothing in this repo would otherwise notice. Printed as well as asserted so
+# the CI log records the version each build actually inherited.
+CLAUDE_FLOOR=2.1.321
 cv="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 if [ -n "$cv" ] && [ "$(printf '%s\n' "$CLAUDE_FLOOR" "$cv" | sort -V | head -1)" = "$CLAUDE_FLOOR" ]; then
-  ok "claude --version = $cv (>= $CLAUDE_FLOOR, knows claude-opus-5-5)"
+  ok "claude --version = $cv (>= $CLAUDE_FLOOR, knows claude-fable-5-2 and claude-opus-5-5)"
 else
-  no "claude --version = '${cv:-<none>}' — below the $CLAUDE_FLOOR floor claude-opus-5-5 needs"
+  no "claude --version = '${cv:-<none>}' — below the $CLAUDE_FLOOR floor claude-fable-5-2 needs"
 fi
 
 # --- the inherited alissa CLI closes a killed session cleanly ---
