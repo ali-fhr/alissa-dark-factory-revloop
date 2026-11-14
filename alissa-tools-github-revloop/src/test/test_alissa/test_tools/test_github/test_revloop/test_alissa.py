@@ -277,3 +277,74 @@ def test_a_stamped_dry_run_runs_nothing_not_even_the_probe(monkeypatch, caplog):
 ])
 def test_queue_add_accepts_stamps(help_text, expected):
     assert queue_add_accepts_stamps(help_text) is expected
+
+
+# -- an unreadable origin never blocks the round (issue #243) --
+
+# The CLI's own words when `--task` resolves to a task this identity holds no
+# role on (studio #5072, verbatim from the daemon log).
+TASK_404 = "✗ API 404 (Not Found): Task not found or not accessible.\n"
+
+
+def refusing_stamped_add(monkeypatch, stamped_error):
+    """A stand-in CLI: probe answers with both stamps, a `queue add` carrying
+    `--task` exits 1 with `stamped_error`, anything else succeeds."""
+    recorded = []
+
+    def fake_run(argv, **kwargs):
+        recorded.append(list(argv))
+        if "--help" in argv:
+            return HELP_WITH_STAMPS
+        if argv[:4] == ["alissa", "tmux", "queue", "add"] and "--task" in argv:
+            raise CommandError(argv, 1, stamped_error)
+        return ""
+
+    monkeypatch.setattr(alissa_mod, "run", fake_run)
+    return recorded
+
+
+def test_a_404_on_the_task_stamp_is_retried_once_without_it(monkeypatch):
+    recorded = refusing_stamped_add(monkeypatch, TASK_404)
+    al = Alissa()
+    result = al.enqueue_reviewer(
+        session="s", directive="review it", cwd=Path("/hub/main"), agent="claude",
+        task_ref="TASK-4242", repo="Acme/Widgets",
+    )
+
+    assert result.session == "s"
+    assert result.unstamped_task == "TASK-4242"
+    first, second = enqueues(recorded)
+    assert "--task" in first
+    assert second == [
+        "alissa", "tmux", "queue", "add", "s", "--agent", "claude", "--cwd", "/hub/main",
+        "--repo", "acme/widgets", "review it",
+    ], "the retry drops --task alone and keeps every other stamp"
+    assert ["alissa", "tmux", "queue", "set", "s", "respawn", "off"] in recorded
+
+    # Not cached: the next spawn tries the stamp again.
+    al.enqueue_reviewer(
+        session="t", directive="review it", cwd=Path("/hub/main"), agent="claude",
+        task_ref="TASK-4242", repo="Acme/Widgets",
+    )
+    assert ["--task" in argv for argv in enqueues(recorded)] == [True, False, True, False]
+
+
+@pytest.mark.parametrize("error", [
+    "✗ API 500 (Internal Server Error): boom",
+    "✗ API 404 (Not Found): Session not found.",
+    "timed out after 60s",
+])
+def test_any_other_stamped_failure_still_raises(monkeypatch, error):
+    recorded = refusing_stamped_add(monkeypatch, error)
+    with pytest.raises(CommandError):
+        stamped_enqueue(Alissa())
+    assert len(enqueues(recorded)) == 1, "no retry for anything but the task 404"
+
+
+def test_a_stamped_enqueue_that_lands_drops_nothing(monkeypatch):
+    stamp_calls(monkeypatch, HELP_WITH_STAMPS)
+    result = Alissa().enqueue_reviewer(
+        session="s", directive="d", cwd=Path("/h"), agent="claude",
+        task_ref="TASK-1", repo="a/b",
+    )
+    assert result == alissa_mod.Enqueued("s", None)

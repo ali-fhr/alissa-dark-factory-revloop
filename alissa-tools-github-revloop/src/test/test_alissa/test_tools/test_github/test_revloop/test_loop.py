@@ -87,6 +87,7 @@ from alissa.tools.github.revloop.ghclient import (
 )
 from alissa.tools.github.revloop import ghclient as ghclient_module
 from alissa.tools.github.revloop import loop as loop_module
+from alissa.tools.github.revloop import alissa as alissa_module
 from alissa.tools.github.revloop.loop import (
     ACTIVITY_MARKER,
     DATA_CLOSE,
@@ -531,6 +532,7 @@ class FakeAlissa:
 
     def enqueue_reviewer(self, **kwargs):
         self.enqueued.append(kwargs)
+        return alissa_module.Enqueued(kwargs["session"])
 
     def list_review_sessions(self):
         # The real client filters on the grammar, not a prefix — the fake
@@ -13132,3 +13134,142 @@ def test_a_failing_sweep_never_takes_down_the_pass(config, caplog):
 
     assert "round-verdict sweep failed" in caplog.text
     assert round_verdicts(w) == []
+
+
+# -- an unreadable origin task never blocks a round (issue #243) -------------
+
+TASK_404 = "✗ API 404 (Not Found): Task not found or not accessible.\n"
+HELP_WITH_STAMPS = "  -t, --task <ref>  link\n  --repo <owner/name>  stamp\n"
+
+
+def queue_adds(calls):
+    return [c for c in calls if c[:4] == ["alissa", "tmux", "queue", "add"] and "--help" not in c]
+
+
+def test_a_round_2_whose_stamped_enqueue_404s_is_spawned_unstamped(config, monkeypatch):
+    w, gh, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "--help" in argv:
+            return HELP_WITH_STAMPS
+        if argv[:4] == ["alissa", "tmux", "queue", "add"] and "--task" in argv:
+            raise CommandError(argv, 1, TASK_404)
+        return ""
+
+    monkeypatch.setattr(alissa_module, "run", fake_run)
+    real = alissa_module.Alissa()
+    al.enqueue_reviewer = lambda **kw: (al.enqueued.append(kw), real.enqueue_reviewer(**kw))[1]
+
+    d = w.evaluate(OWNER, REPO, NUMBER)
+
+    assert d.action is Action.SPAWNED and d.round == 2
+    stamped, unstamped = queue_adds(calls)
+    assert "--task" in stamped and "TASK-499" in stamped
+    assert "--task" not in unstamped and "--repo" in unstamped
+    assert w.state.get_spawn(SLUG, NUMBER, 2) is not None, "the round is recorded"
+
+    lines = activity_lines(gh)
+    assert len(lines) == 2
+    assert "round 2 of 3 — spawned" in lines[0]
+    notes = [line for line in lines if "not readable" in line]
+    assert len(notes) == 1
+    assert "TASK-499" in notes[0] and "queued without --task" in notes[0]
+    assert "round 2 of 3" in notes[0]
+    assert operator_comments(gh) == [], "a dropped stamp is no operator page"
+
+
+def test_a_round_whose_stamp_lands_gets_no_unreadable_line(config):
+    w, gh, _ = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    assert w.evaluate(OWNER, REPO, NUMBER).action is Action.SPAWNED
+    assert not [line for line in activity_lines(gh) if "not readable" in line]
+
+
+def failing_enqueue(al, errors):
+    """Every enqueue raises the next error text in `errors` (the last one
+    repeats) -- an evaluation that fails past the round number."""
+    def enqueue(**kwargs):
+        text = errors.pop(0) if len(errors) > 1 else errors[0]
+        raise CommandError(["alissa", "tmux", "queue", "add"], 1, text)
+    al.enqueue_reviewer = enqueue
+
+
+def evaluate_failing_pings(w):
+    return [r["kind"] for r in w.state.read_pings() if r["kind"].startswith("evaluate-failing")]
+
+
+def test_an_identical_failure_on_n_polls_is_escalated_exactly_once(config):
+    assert config.evaluate_failure_escalate_after == 5, "the default"
+    w, gh, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    failing_enqueue(al, ["✗ API 500 (Internal Server Error): boom"])
+
+    for _ in range(4):
+        w.poll_once()
+    assert operator_comments(gh) == [], "below N: logged only"
+
+    w.poll_once()  # poll N
+    (page,) = operator_comments(gh)
+    assert "Review round cannot start" in page
+    assert "5 consecutive polls" in page
+    assert "review round 2" in page
+    assert "API 500 (Internal Server Error): boom" in page
+    assert ACTIVITY_MARKER not in page
+
+    w.poll_once()  # poll N+1
+    w.poll_once()
+    assert len(operator_comments(gh)) == 1, "exactly once per (PR, round, error)"
+    assert len(evaluate_failing_pings(w)) == 1
+
+
+def test_a_changed_error_or_a_success_resets_the_count(config):
+    config = dataclasses.replace(config, evaluate_failure_escalate_after=3)
+    w, gh, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    failing_enqueue(al, ["error A", "error A", "error B", "error B", "error A", "error A"])
+
+    for _ in range(6):
+        w.poll_once()
+    assert operator_comments(gh) == [], "no error repeated 3 times in a row"
+
+    w.poll_once()  # the third "error A" in a row
+    (page,) = operator_comments(gh)
+    assert "error A" in page and "3 consecutive polls" in page
+
+    # A success resets the count: the key is gone after a clean evaluation.
+    w2, gh2, al2 = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    failing_enqueue(al2, ["error C"])
+    w2.poll_once()
+    w2.poll_once()
+    al2.enqueue_reviewer = lambda **kw: alissa_module.Enqueued(kw["session"])
+    w2.poll_once()
+    assert (f"{OWNER}/{REPO}", NUMBER) not in w2._evaluate_failures
+    failing_enqueue(al2, ["error C"])
+    w2.state._db.execute("DELETE FROM spawns")
+    w2.state._db.commit()
+    w2.poll_once()
+    w2.poll_once()
+    assert operator_comments(gh2) == [], "the success restarted the count at zero"
+
+
+def test_a_failed_escalation_post_retries_next_poll(config):
+    config = dataclasses.replace(config, evaluate_failure_escalate_after=1)
+    w, gh, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    failing_enqueue(al, ["boom"])
+    posted = gh.comment
+
+    def refuse(*a, **k):
+        raise CommandError(["gh"], 1, "502")
+
+    gh.comment = refuse
+    w.poll_once()
+    assert evaluate_failing_pings(w) == [], "not recorded before it lands"
+    gh.comment = posted
+    w.poll_once()
+    assert len(operator_comments(gh)) == 1
+    assert len(evaluate_failing_pings(w)) == 1
+
+
+def test_evaluate_failure_escalate_after_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="evaluate_failure_escalate_after"):
+        Config.build(tmp_path, {"evaluate_failure_escalate_after": 0}, environ={})
+    assert Config.build(tmp_path, {}, environ={}).evaluate_failure_escalate_after == 5

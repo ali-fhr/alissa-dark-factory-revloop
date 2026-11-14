@@ -16,6 +16,16 @@ header).
 
 ## Unreleased
 
+- **A later round is no longer blocked by an origin task the reviewer cannot
+  read** (issue #243; origin TASK-29986387, implementation TASK-920232837).
+  When the stamped `alissa tmux queue add` fails on the CLI's `--task`
+  resolve (`404 … Task not found or not accessible`), `enqueue_reviewer`
+  retries once without `--task`, keeping `--repo`, and the round's activity
+  comment gains one line saying so. Any other failure still raises. And an
+  evaluation that fails with the same error on `evaluate_failure_escalate_after`
+  consecutive polls (new config key, default 5) is escalated once per
+  (PR, round, error) with a comment on the PR.
+
 ## 0.31.43 (2026-11-12)
 
 - **The image builds on loopwork base 0.6.2, whose claude-code knows Claude
