@@ -198,6 +198,7 @@ CONFIG_KEYS = (
     "checks_wait_seconds",
     "checks_spawn_wait_seconds",
     "verdict_cooldown_s",
+    "evaluate_failure_escalate_after",
     "review_task_miss_ttl_polls",
     "task_list_self_scope",
     "task_list_bow_id",
@@ -711,6 +712,13 @@ DEFAULT_CHECKS_SPAWN_WAIT_SECONDS = 15 * 60
 # check to decide alone.
 DEFAULT_VERDICT_COOLDOWN_SECONDS = 120
 
+# How many CONSECUTIVE polls a PR's evaluation may fail with the same error
+# text before the loop posts ONE escalation comment on the PR (issue #243). A
+# failing evaluation is logged and retried every poll, so without this a PR
+# whose round can never start says nothing on GitHub at all. A different error
+# or a success resets the count.
+DEFAULT_EVALUATE_FAILURE_ESCALATE_AFTER = 5
+
 # How many polls a PR with NO review task may be taken on trust before the
 # daemon searches the task corpus for one again (issue #87).
 #
@@ -997,6 +1005,10 @@ class Config:
     # DEFAULT_VERDICT_COOLDOWN_SECONDS. 0 is legal and means "no cooldown": the
     # timeline check alone decides whether a same-head round is admitted.
     verdict_cooldown_s: int = DEFAULT_VERDICT_COOLDOWN_SECONDS
+
+    # Consecutive identical evaluation failures before the one PR escalation;
+    # see DEFAULT_EVALUATE_FAILURE_ESCALATE_AFTER. Must be >= 1.
+    evaluate_failure_escalate_after: int = DEFAULT_EVALUATE_FAILURE_ESCALATE_AFTER
 
     # How many polls a PR with no review task is taken on trust before the
     # corpus is searched again; see DEFAULT_REVIEW_TASK_MISS_TTL_POLLS. Floor 1
@@ -1498,6 +1510,14 @@ class Config:
         if cooldown < 0:
             raise ValueError(f"verdict_cooldown_s must be >= 0, got {cooldown}")
 
+        escalate_after = int(raw.get(
+            "evaluate_failure_escalate_after", cls.evaluate_failure_escalate_after
+        ))
+        if escalate_after < 1:
+            raise ValueError(
+                f"evaluate_failure_escalate_after must be >= 1, got {escalate_after}"
+            )
+
         miss_ttl = int(
             raw.get("review_task_miss_ttl_polls", cls.review_task_miss_ttl_polls)
         )
@@ -1646,6 +1666,7 @@ class Config:
             checks_wait_seconds=checks_wait,
             checks_spawn_wait_seconds=spawn_wait,
             verdict_cooldown_s=cooldown,
+            evaluate_failure_escalate_after=escalate_after,
             review_task_miss_ttl_polls=miss_ttl,
             task_list_self_scope=bool(raw.get("task_list_self_scope", False)),
             task_list_bow_id=bow_id,

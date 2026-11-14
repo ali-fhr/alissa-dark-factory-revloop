@@ -11,6 +11,7 @@ Alissa review task.
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import logging
 import re
@@ -2383,6 +2384,40 @@ ACTIVITY_HEADER = (
 # is narrowed per episode -- see stalled_kind.
 ESCALATION_STALLED = "stalled"
 
+# The activity line of a round whose `--task` stamp had to be dropped (issue
+# #243): the reviewer identity cannot read the PR's origin task, so the
+# session was queued without it. Appended beside the round's spawn line.
+UNSTAMPED_TASK_CONTEXT = (
+    "origin task {task} is not readable by the reviewer identity — "
+    "session queued without --task"
+)
+
+# The ping-ledger kind prefix of the repeating-evaluation-failure escalation
+# (issue #243); see evaluate_failure_kind.
+ESCALATION_EVALUATE_FAILING = "evaluate-failing"
+
+EVALUATE_FAILING_COMMENT = (
+    "**Review round cannot start** — the review loop has failed to evaluate "
+    "this PR on {count} consecutive polls with the same error, so {round} "
+    "cannot start. The daemon keeps retrying every poll and logging the "
+    "failure; this comment is posted once per (PR, round, error).\n\n"
+    "```\n{error}\n```\n\n"
+    "Operator options: fix the cause the error names (an inaccessible task, "
+    "a CLI or credential problem) and the next poll proceeds by itself, or "
+    "run the round by hand."
+)
+
+
+def evaluate_failure_kind(round_: "int | None", error: str) -> str:
+    """The ping-ledger kind that dedupes ONE (round, error) escalation on a
+    PR. The error text is hashed into the key -- it is free text, possibly
+    long -- so a DIFFERENT error on the same round escalates again, and the
+    same error on a later round is a new page. A round the evaluation never
+    reached is `r?`."""
+    digest = hashlib.sha256(error.encode("utf-8")).hexdigest()[:16]
+    shown = "?" if round_ is None else str(round_)
+    return f"{ESCALATION_EVALUATE_FAILING}:r{shown}:{digest}"
+
 
 def deferral_activity_kind(session: str) -> str:
     """The ping-ledger kind that dedupes ONE deferral episode's activity line.
@@ -3230,6 +3265,15 @@ class ReviewWatcher:
         # hold a place forever.
         self._waiting: dict[tuple[str, int], Waiting] = {}
         self._wait_seq = 0
+        # (repo full name, PR number) -> (the error text of its last failed
+        # evaluation, how many consecutive polls failed with exactly it)
+        # (issue #243). In-memory: a restart re-counts from zero, which only
+        # delays the one escalation; a success or a different error resets it.
+        self._evaluate_failures: dict[tuple[str, int], tuple[str, int]] = {}
+        # (repo full name, PR number) -> the round number the PR's evaluation
+        # reached this poll, so a failure past that point can name the round
+        # that cannot start. Cleared at the top of every evaluate().
+        self._evaluating_round: dict[tuple[str, int], int] = {}
         # The discovery and integration-check skips' file reads (issues #171,
         # #181), keyed by (repo, PR, head): the head's changed paths. A
         # skipped PR keeps its review request, so it is re-decided every poll,
@@ -3593,6 +3637,7 @@ class ReviewWatcher:
     # -- per-PR decision ---------------------------------------------------
 
     def evaluate(self, owner: str, repo: str, number: int) -> Decision:
+        self._evaluating_round.pop((f"{owner}/{repo}", number), None)
         pr = self.github.pull_request(owner, repo, number)
 
         # CR1: draft PRs are never reviewed. The search already filters these;
@@ -3758,6 +3803,7 @@ class ReviewWatcher:
             return Decision(Action.ESCALATED, f"{completed} rounds, no approve", completed)
 
         round_ = completed + 1
+        self._evaluating_round[(f"{owner}/{repo}", number)] = round_
 
         age = self.state.spawn_age(pr.full_name, number, round_)
         if age is not None and age < STALE_ROUND_SECONDS:
@@ -7448,7 +7494,7 @@ class ReviewWatcher:
                     pr.slug, round_, folder, exc,
                 )
 
-        self.alissa.enqueue_reviewer(
+        enqueued = self.alissa.enqueue_reviewer(
             session=name,
             directive=directive,
             cwd=hub,
@@ -7508,6 +7554,13 @@ class ReviewWatcher:
             "re-enqueued — previous session presumed dead" if reenqueued else "spawned"
         )
         self._append_activity(pr, self._activity_line(name, round_, context, cap))
+        if enqueued is not None and enqueued.unstamped_task:
+            # The round went out without its `--task` stamp (issue #243). Not
+            # cached: the next round tries the stamp again.
+            self._append_activity(pr, self._activity_line(
+                name, round_,
+                UNSTAMPED_TASK_CONTEXT.format(task=enqueued.unstamped_task), cap,
+            ))
 
         return Decision(
             Action.SPAWNED,
@@ -8635,6 +8688,55 @@ class ReviewWatcher:
             return
         self.state.record_ping(pr.full_name, pr.number, stalled_kind(session))
 
+    def _note_evaluate_failure(
+        self, owner: str, repo: str, number: int, slug: str, error: str
+    ) -> None:
+        """Count one failed evaluation and escalate a repeating one ONCE
+        (issue #243).
+
+        The per-PR handler logs a failed evaluation and retries next poll;
+        when the failure is permanent (a round whose enqueue can never land)
+        that log line is all anyone sees, while the PR sits with a review
+        requested and a stale verdict. After `evaluate_failure_escalate_after`
+        consecutive polls with the SAME error text, one comment on the PR
+        names the error and the round that cannot start. Deduped in the ping
+        ledger per (PR, round, error) and recorded only AFTER the comment
+        posts, like the stalled ping: it is the operator's only signal, so a
+        transient comment failure retries next poll. A rate limit propagates,
+        like every other call in the per-PR handler.
+        """
+        key = (f"{owner}/{repo}", number)
+        last, count = self._evaluate_failures.get(key, ("", 0))
+        count = count + 1 if last == error else 1
+        self._evaluate_failures[key] = (error, count)
+        if count < self.config.evaluate_failure_escalate_after:
+            return
+
+        round_ = self._evaluating_round.get(key)
+        kind = evaluate_failure_kind(round_, error)
+        if self.state.pinged(key[0], number, kind):
+            return
+        shown = "the next review round" if round_ is None else f"review round {round_}"
+        body = EVALUATE_FAILING_COMMENT.format(count=count, round=shown, error=error)
+        log.error(
+            "EVALUATE-FAILING %s: %d consecutive polls failed with the same error; "
+            "%s cannot start — escalating to operator (once per round and error)",
+            slug, count, shown,
+        )
+        if self.config.dry_run:
+            log.info("[dry-run] would comment on %s:\n%s", slug, body)
+            return
+        try:
+            self.github.comment(owner, repo, number, body)
+        except CommandError as exc:
+            log.error(
+                "could not post the evaluate-failing comment on %s: %s — not "
+                "recording it; the escalation retries next poll",
+                slug, exc,
+            )
+            return
+        self.state.record_ping(key[0], number, kind)
+
     def _escalate(
         self,
         pr: PullRequest,
@@ -8818,6 +8920,14 @@ class ReviewWatcher:
         self._waiting = {
             key: wait for key, wait in self._waiting.items() if key in live_keys
         }
+        # ...and the failure counts of issue #243, for the same reason: a PR
+        # that left the search is not failing any more.
+        self._evaluate_failures = {
+            key: seen for key, seen in self._evaluate_failures.items() if key in live_keys
+        }
+        self._evaluating_round = {
+            key: r for key, r in self._evaluating_round.items() if key in live_keys
+        }
 
         results = []
         for owner, repo, number in self._gate_order(requests):
@@ -8830,9 +8940,12 @@ class ReviewWatcher:
                 raise
             except CommandError as exc:
                 log.error("%s: %s", slug, exc)
+                self._note_evaluate_failure(owner, repo, number, slug, str(exc))
                 # Owed (issue #157): an evaluation that failed is unknown,
                 # never settled.
                 decision = Decision(Action.SKIPPED, str(exc), owed=True)
+            else:
+                self._evaluate_failures.pop((f"{owner}/{repo}", number), None)
 
             level = logging.INFO if decision.action != Action.SKIPPED else logging.DEBUG
             log.log(level, "%s → %s (%s)", slug, decision.action.value, decision.reason)

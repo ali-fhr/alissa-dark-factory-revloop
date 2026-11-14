@@ -230,6 +230,31 @@ def _advertises(helptext: str, flag: str) -> bool:
 QUEUE_ADD_TASK_FLAG = "--task"
 QUEUE_ADD_REPO_FLAG = "--repo"
 
+# The CLI resolves `--task` up front with a task read, and a reviewer identity
+# that holds no role on the origin (an operator-session PR, issue #243) gets
+# `✗ API 404 (Not Found): Task not found or not accessible.` for it -- exit 1
+# before anything is queued. Matched on the 404 AND the task wording, so an
+# unrelated 404 (an unknown agent profile, a missing session) still raises.
+_TASK_UNREADABLE_RE = re.compile(
+    r"\b404\b.*\btask not found or not accessible\b", re.IGNORECASE | re.DOTALL
+)
+
+
+def task_stamp_unreadable(exc: CommandError) -> bool:
+    """Whether a failed stamped `queue add` failed on the `--task` resolve:
+    the origin task is not found or not readable by this identity."""
+    return bool(_TASK_UNREADABLE_RE.search(exc.stderr or ""))
+
+
+@dataclass(frozen=True)
+class Enqueued:
+    """What `enqueue_reviewer` queued. `unstamped_task` is the origin ref the
+    call had to DROP because this identity cannot read it (issue #243) --
+    None when the round went out with every stamp it was given."""
+
+    session: str
+    unstamped_task: "str | None" = None
+
 
 def queue_add_accepts_stamps(helptext: str) -> bool:
     """Whether `alissa tmux queue add --help` lists BOTH `--task` and `--repo`.
@@ -1527,7 +1552,7 @@ class Alissa:
         task_ref: str | None,
         repo: str | None = None,
         dry_run: bool = False,
-    ) -> None:
+    ) -> Enqueued:
         """Enqueue one reviewer session.
 
         `task_ref` is the ORIGIN task (`TASK-<n>`) the round serves -- not the
@@ -1536,6 +1561,13 @@ class Alissa:
         `--task` / `--repo` only when the installed CLI accepts both (see
         `accepts_spawn_stamps`); an older CLI gets neither, so the enqueue
         never fails for want of a stamp.
+
+        Nor for a stamp it cannot honour (issue #243): when the stamped call
+        fails because the CLI's `--task` resolve answers 404 -- the origin is
+        not found or not accessible to this identity -- the enqueue is retried
+        ONCE without `--task` (every other stamp kept) and the returned
+        `Enqueued` names the dropped ref. Never cached: access can be granted
+        later, so every spawn tries the stamp again. Any other failure raises.
         """
         argv = [
             "alissa",
@@ -1558,12 +1590,25 @@ class Alissa:
             # Runs nothing, the probe included: the line shows the stamps a
             # stamp-aware CLI would receive.
             log.info("[dry-run] would enqueue: %s", " ".join(argv + stamps) + " <directive>")
-            return
+            return Enqueued(session)
 
+        unstamped_task = None
         if stamps and self.accepts_spawn_stamps():
-            argv += stamps
-        argv.append(directive)
-        run(argv, timeout=60)
+            try:
+                run(argv + stamps + [directive], timeout=60)
+            except CommandError as exc:
+                if not task_ref or not task_stamp_unreadable(exc):
+                    raise
+                log.warning(
+                    "%s: origin task %s is not readable by this identity (%s) — "
+                    "queuing the session without %s",
+                    session, task_ref, exc, QUEUE_ADD_TASK_FLAG,
+                )
+                kept = [QUEUE_ADD_REPO_FLAG, repo.lower()] if repo else []
+                run(argv + kept + [directive], timeout=60)
+                unstamped_task = task_ref
+        else:
+            run(argv + [directive], timeout=60)
 
         # Reviewers are one-shot per round (CR3): once the session finishes and is
         # reaped, it must never be respawned. Make that explicit so a self-kill or
@@ -1574,6 +1619,7 @@ class Alissa:
                 timeout=30, check=False)
         except CommandError:  # pragma: no cover - defence in depth
             log.warning("could not set respawn off for %s", session)
+        return Enqueued(session, unstamped_task)
 
     def list_review_sessions(self) -> list[ManagedSession]:
         """The live reviewer-grammar managed sessions, from `alissa tmux ls`.
