@@ -16,6 +16,8 @@ header).
 
 ## Unreleased
 
+## 0.31.44 (2026-11-14)
+
 - **A later round is no longer blocked by an origin task the reviewer cannot
   read** (issue #243; origin TASK-29986387, implementation TASK-920232837).
   When the stamped `alissa tmux queue add` fails on the CLI's `--task`
