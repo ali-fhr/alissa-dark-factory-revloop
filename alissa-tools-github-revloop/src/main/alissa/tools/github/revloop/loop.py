@@ -2408,6 +2408,27 @@ EVALUATE_FAILING_COMMENT = (
 )
 
 
+# A daemon reviewer session name, `review-<repo>-pr<n>-r<k>-<hex>`, with its
+# per-spawn nonce as the last group (the shape session_name() mints and
+# alissa._DAEMON_SESSION_RE parses).
+_SESSION_NONCE_RE = re.compile(
+    r"(review-[a-z0-9-]+?-pr\d+-r\d+)-[0-9a-f]{4,16}(?![0-9A-Za-z_])"
+)
+
+
+def normalize_evaluate_error(error: str) -> str:
+    """The evaluation error text with every reviewer session name's per-spawn
+    nonce replaced by `<nonce>` (issue #245).
+
+    session_name() mints a fresh `secrets.token_hex(3)` suffix on every spawn
+    attempt, so a permanent enqueue failure whose stderr echoes the session
+    name would differ on every poll: the repeat count would never pass 1 and
+    the evaluate-failing page would never fire. The repeat comparison and the
+    ping-ledger hash both read this form; the comment still shows the raw
+    text of the latest failure."""
+    return _SESSION_NONCE_RE.sub(r"\1-<nonce>", error)
+
+
 def evaluate_failure_kind(round_: "int | None", error: str) -> str:
     """The ping-ledger kind that dedupes ONE (round, error) escalation on a
     PR. The error text is hashed into the key -- it is free text, possibly
@@ -8698,7 +8719,8 @@ class ReviewWatcher:
         when the failure is permanent (a round whose enqueue can never land)
         that log line is all anyone sees, while the PR sits with a review
         requested and a stale verdict. After `evaluate_failure_escalate_after`
-        consecutive polls with the SAME error text, one comment on the PR
+        consecutive polls with the SAME error text (session nonce normalized
+        out, issue #245), one comment on the PR
         names the error and the round that cannot start. Deduped in the ping
         ledger per (PR, round, error) and recorded only AFTER the comment
         posts, like the stalled ping: it is the operator's only signal, so a
@@ -8706,14 +8728,17 @@ class ReviewWatcher:
         like every other call in the per-PR handler.
         """
         key = (f"{owner}/{repo}", number)
+        # Compared and hashed with the per-spawn session nonce normalized out
+        # (issue #245): the name changes every poll, the failure does not.
+        same = normalize_evaluate_error(error)
         last, count = self._evaluate_failures.get(key, ("", 0))
-        count = count + 1 if last == error else 1
-        self._evaluate_failures[key] = (error, count)
+        count = count + 1 if last == same else 1
+        self._evaluate_failures[key] = (same, count)
         if count < self.config.evaluate_failure_escalate_after:
             return
 
         round_ = self._evaluating_round.get(key)
-        kind = evaluate_failure_kind(round_, error)
+        kind = evaluate_failure_kind(round_, same)
         if self.state.pinged(key[0], number, kind):
             return
         shown = "the next review round" if round_ is None else f"review round {round_}"

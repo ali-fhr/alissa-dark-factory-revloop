@@ -25,6 +25,13 @@ header).
   evaluation that fails with the same error on `evaluate_failure_escalate_after`
   consecutive polls (new config key, default 5) is escalated once per
   (PR, round, error) with a comment on the PR.
+- **A repeating evaluation failure that echoes the reviewer session name
+  still escalates** (issue #245, a review finding on PR #244; origin
+  TASK-876035066, implementation TASK-186251343). `session_name()` mints a
+  fresh nonce per spawn attempt, so the error text changed every poll and the
+  repeat count never passed 1. The `-r<k>-<hex>` nonce of a daemon reviewer
+  session name is now normalized out before the count and the ping-ledger
+  hash; the comment still shows the latest raw error.
 
 ## 0.31.43 (2026-11-12)
 
