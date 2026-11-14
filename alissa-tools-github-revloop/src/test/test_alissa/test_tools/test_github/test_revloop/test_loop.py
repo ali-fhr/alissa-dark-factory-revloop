@@ -13269,6 +13269,52 @@ def test_a_failed_escalation_post_retries_next_poll(config):
     assert len(evaluate_failing_pings(w)) == 1
 
 
+def test_a_failure_echoing_the_fresh_session_name_still_escalates_once(config):
+    """Issue #245: session_name() mints a fresh nonce on every spawn attempt,
+    so an error that echoes the session name differs on every poll. The
+    nonce is normalized out before the repeat count and the ledger hash."""
+    config = dataclasses.replace(config, evaluate_failure_escalate_after=3)
+    w, gh, al = watcher(config, make_pr(sha="def456"), [review("CHANGES_REQUESTED")])
+    sessions = []
+
+    def enqueue(**kwargs):
+        sessions.append(kwargs["session"])
+        raise CommandError(
+            ["alissa", "tmux", "queue", "add"], 1,
+            f"✗ session {kwargs['session']!r} rejected: queue is closed",
+        )
+
+    al.enqueue_reviewer = enqueue
+    w.poll_once()
+    w.poll_once()
+    assert operator_comments(gh) == [], "below N: logged only"
+    w.poll_once()  # poll N
+    assert len(set(sessions)) == len(sessions) >= 3, "a fresh name every poll"
+    (page,) = operator_comments(gh)
+    assert "3 consecutive polls" in page
+    assert sessions[-1] in page, "the comment shows the latest raw error"
+    w.poll_once()
+    w.poll_once()
+    assert len(operator_comments(gh)) == 1, "exactly once per (PR, round, error)"
+    assert len(evaluate_failing_pings(w)) == 1
+
+
+def test_normalize_evaluate_error_strips_only_the_session_nonce():
+    pr = make_pr()
+    a, b = loop_module.session_name(pr, 2), loop_module.session_name(pr, 2)
+    assert a != b
+    norm = loop_module.normalize_evaluate_error
+    assert norm(f"no session {a} here") == norm(f"no session {b} here")
+    assert norm(f"no session {a} here").endswith("-r2-<nonce> here")
+    # A different round or PR is still a different error.
+    assert norm(a) != norm(loop_module.session_name(pr, 3))
+    assert norm(a) != norm(loop_module.session_name(dataclasses.replace(pr, number=NUMBER + 1), 2))
+    # Text without a daemon session name is unchanged, hex elsewhere included.
+    for text in ("✗ API 500: boom", "sha deadbeef1234", "review-pr-12-r2", "pr-12-r2-abc123"):
+        assert norm(text) == text
+    assert loop_module.evaluate_failure_kind(2, norm(a)) == loop_module.evaluate_failure_kind(2, norm(b))
+
+
 def test_evaluate_failure_escalate_after_must_be_positive(tmp_path):
     with pytest.raises(ValueError, match="evaluate_failure_escalate_after"):
         Config.build(tmp_path, {"evaluate_failure_escalate_after": 0}, environ={})
