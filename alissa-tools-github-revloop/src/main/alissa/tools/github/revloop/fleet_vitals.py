@@ -195,12 +195,19 @@ LANE_ROLE = "review"
 # adds inside `rate`. One group -- a Studio that knows one knows all three --
 # keyed in the refusal bookkeeping by the top-level name. A 400 names a nested
 # key either by its path (`rate.used`) or quoted (`'login'`, an unrecognized-
-# key list); a bare word is not enough, since `used` is plain English.
+# key list); a bare word is not enough, since `used` is plain English. The
+# quoted form counts only when the detail also names `rate` (issue #247):
+# `'login'` alone may be some other object's key, and every zod shape carries
+# the path (`rate: Unrecognized key(s)…`, `"path":["rate"]`, a `rate` field
+# error). A Studio that predates the group also refuses the top-level
+# `ghCallsLastHour` in the same 400, so the stricter match loses nothing.
 IDENTITY_KEY = "ghCallsLastHour"
 RATE_IDENTITY_FIELDS = ("used", "login")
 _IDENTITY_REFUSED = re.compile(
-    r"\bghCallsLastHour\b|\brate\.(?:used|login)\b|['\"`](?:used|login)['\"`]"
+    r"\bghCallsLastHour\b|\brate\.(?:used|login)\b"
 )
+_RATE_KEY_QUOTED = re.compile(r"['\"`](?:used|login)['\"`]")
+_RATE_CONTEXT = re.compile(r"\brate\b")
 
 # How long a snapshot leaves an optional block out after Studio refused it as
 # an unknown key, before it offers the block again. An hour: one extra POST
@@ -649,6 +656,15 @@ def config_block(
     return block
 
 
+def _identity_refused(detail: str) -> bool:
+    """Whether a 400's detail refuses the identity fields: the top-level name
+    or a `rate.` path anywhere, or a quoted `'used'`/`'login'` beside a
+    `rate` context (issue #247)."""
+    if _IDENTITY_REFUSED.search(detail):
+        return True
+    return bool(_RATE_KEY_QUOTED.search(detail) and _RATE_CONTEXT.search(detail))
+
+
 def without(snapshot: "Mapping", keys: "Sequence[str]") -> dict:
     """`snapshot` minus the optional blocks `keys` names. IDENTITY_KEY takes
     its two `rate` fields with it."""
@@ -914,7 +930,7 @@ class FleetVitalsPusher:
             key for key in OPTIONAL_BLOCKS
             if key in snapshot and re.search(rf"\b{key}\b", detail)
         ]
-        if IDENTITY_KEY in snapshot and _IDENTITY_REFUSED.search(detail):
+        if IDENTITY_KEY in snapshot and _identity_refused(detail):
             refused.append(IDENTITY_KEY)
         return refused
 
