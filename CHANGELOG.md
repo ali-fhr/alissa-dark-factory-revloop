@@ -16,6 +16,11 @@ header).
 
 ## Unreleased
 
+- **A 400 that quotes `'used'` or `'login'` drops the vitals identity fields
+  only when it also names `rate`** (issue #247, a harvest note on PR #206;
+  origin TASK-937452889, implementation TASK-815122640). Another object's
+  `'login'` key no longer costs the identity fields for an hour; `rate.used`
+  and `ghCallsLastHour` still match on their own.
 - **A later round is no longer blocked by an origin task the reviewer cannot
   read** (issue #243; origin TASK-29986387, implementation TASK-920232837).
   When the stamped `alissa tmux queue add` fails on the CLI's `--task`

@@ -980,7 +980,10 @@ class _RefusingIdentity(FakeVitalsClient):
 @pytest.mark.parametrize("detail", [
     {"error": "Unrecognized key(s) in object: 'ghCallsLastHour'"},
     {"error": "invalid_body", "message": "unknown key: rate.used"},
-    "Unrecognized key(s) in object: 'used', 'login'",
+    "rate: Unrecognized key(s) in object: 'used', 'login'",
+    {"error": "invalid_body", "issues": [{
+        "code": "unrecognized_keys", "keys": ["login"], "path": ["rate"],
+        "message": "Unrecognized key(s) in object: 'login'"}]},
 ])
 def test_a_400_naming_a_new_field_drops_all_three_and_retries_once(
     tmp_path, caplog, detail
@@ -1004,6 +1007,24 @@ def test_a_400_naming_a_new_field_drops_all_three_and_retries_once(
     clock.now += fleet_vitals.BLOCK_REPROBE_S
     pusher.push_once(heartbeat_at=WALL)
     assert client.calls[-2:] == ["refused", "vitals"]
+
+
+@pytest.mark.parametrize("detail", [
+    # issue #247: a quoted key with no `rate` context is some other object's.
+    "Unrecognized key(s) in object: 'login'",
+    "config: Unrecognized key(s) in object: 'used'",
+    {"error": "invalid_body", "issues": [{
+        "code": "unrecognized_keys", "keys": ["login"], "path": ["owner"],
+        "message": "Unrecognized key(s) in object: 'login'"}]},
+])
+def test_a_quoted_key_without_a_rate_context_is_not_a_refusal_of_the_fields(
+    tmp_path, detail
+):
+    client = FakeVitalsClient(fail_with=AlissaError(400, detail))
+    pusher = FleetVitalsPusher(_config(tmp_path), _RatedSources(), client,
+                               github=_IdentityGh())
+    assert pusher.push_once(heartbeat_at=WALL) == VITALS_FAILED
+    assert client.calls == ["vitals"]
 
 
 def test_a_400_that_merely_says_used_is_not_a_refusal_of_the_fields(tmp_path):
