@@ -9351,7 +9351,7 @@ class ReviewWatcher:
                       "no queued round is held this sweep")
         for name in sorted(queued or ()):
             row = self.state.find_spawn_by_session(name)
-            if row is not None and not self.state.is_reaped(name):
+            if row is not None and not self.state.is_reaped(str(row["session"])):
                 guard.hold(
                     str(row["repo"]), int(row["number"]), row["task_ref"],
                     folder=row["folder"],

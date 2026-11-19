@@ -2290,12 +2290,29 @@ def test_a_held_folder_inside_the_grace_is_held_not_fresh(tmp_path):
 # -- a queued round holds its folder (issue #251) ------------------------------
 
 
+def live_queue(session, *, dispatched=False, items=1):
+    """One queue as `alissa tmux queue ls --json` lists it (keys read live
+    on the seat): `session` on the queue, its items the waiting prompts."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "agent": "claude", "claudeSessionId": None, "cwd": "/w", "repo": None,
+        "respawn": False, "respawnHistory": [], "session": session,
+        "items": [
+            {"id": f"q{i}", "text": "prompt", "attempts": 1 if dispatched else 0,
+             "createdAt": now_ms, "lastDispatchedAt": now_ms if dispatched else None}
+            for i in range(items)
+        ],
+    }
+
+
 def queued_round_ws(ws, *, dispatched=False, prefixed=True):
     """PR 7's round 2, queued past SPAWN_HOLD_SECONDS and not in the live
     roster yet; its reused `REVIEW-pr7` (holding round 1's `wt-r1`) is
     20 minutes old and the PR is merged -- the shape the review of #250
     named. The queue lists the session (as `ali-<name>` unless
-    `prefixed=False`), undispatched unless `dispatched`."""
+    `prefixed=False`) in the live `queue ls --json` shape -- `session` on
+    the queue, prompt items without one -- undispatched unless
+    `dispatched`."""
     w, alissa, own, _ = ended_round_ws(ws)
     (own / "wt-r1").mkdir()
     session = "review-widgets-pr7-r2-bbbbbb"
@@ -2306,10 +2323,8 @@ def queued_round_ws(ws, *, dispatched=False, prefixed=True):
         (int(time.time() - janitor_mod.SPAWN_HOLD_SECONDS - 5 * 60),),
     )
     w.state._db.commit()
-    item = {"session": f"ali-{session}" if prefixed else session}
-    if dispatched:
-        item["lastDispatchedAt"] = int(time.time() * 1000)
-    alissa.queues = [{"name": "default", "items": [item]}]
+    alissa.queues = [live_queue(f"ali-{session}" if prefixed else session,
+                                dispatched=dispatched)]
     return w, alissa, own, session
 
 
@@ -2339,10 +2354,10 @@ def test_a_dispatched_queue_item_no_longer_holds(ws):
 
 
 def test_a_queued_round_stops_holding_once_it_leaves_the_queue(ws):
-    w, alissa, own, _ = queued_round_ws(ws)
+    w, alissa, own, session = queued_round_ws(ws)
     assert w._run_janitor() is not None and own.is_dir()
 
-    alissa.queues = [{"name": "default", "items": []}]
+    alissa.queues = [live_queue(f"ali-{session}", items=0)]
     w._janitor_last -= 10 * 60
     result = w._run_janitor()
 
@@ -2366,23 +2381,32 @@ def test_an_unreadable_queue_holds_nothing_extra_and_still_sweeps(ws, caplog):
 def test_a_queued_session_with_no_spawn_row_holds_nothing(ws):
     """Another lane's queued session (no ledger row) is not ours to hold."""
     w, alissa, own, _ = ended_round_ws(ws)
-    alissa.queues = [{"items": [{"session": "ali-develop-acme-widgets-i7-a1"}]}]
+    alissa.queues = [live_queue("ali-develop-acme-widgets-i7-a1")]
 
     result = w._run_janitor()
 
     assert not own.exists() and result is not None and result.held == []
 
 
-def test_queued_sessions_reads_only_undispatched_items():
+def test_queued_sessions_reads_the_queue_session_with_an_undispatched_item():
+    """The live shape: the name is the QUEUE's `session`; a queue counts
+    while any of its items is undispatched."""
+    mixed = live_queue("ali-review-d", dispatched=True)
+    mixed["items"].append(live_queue("x")["items"][0])
     queues = [
-        {"name": "default", "items": [
-            {"session": "ali-review-a"}, {"session": "b", "lastDispatchedAt": 9},
-            "junk", {"session": ""}, {"session": 7},
-        ]},
-        {"name": "other", "items": [{"session": "c"}]},
+        live_queue("ali-review-a"),
+        live_queue("ali-review-b", dispatched=True),
+        live_queue("ali-review-e", items=0),
+        mixed,
+        live_queue("c"),
+        {**live_queue("ali-x"), "session": ""},
+        {**live_queue("ali-y"), "session": 7},
+        {"items": [{"session": "ali-item-only", "id": "q", "text": "t"}]},
+        {**live_queue("ali-z"), "items": ["junk"]},
         "junk",
     ]
-    assert janitor_mod.queued_sessions(queues) == {"ali-review-a", "review-a", "c"}
+    assert janitor_mod.queued_sessions(queues) == {
+        "ali-review-a", "review-a", "ali-review-d", "review-d", "c"}
     assert janitor_mod.queued_sessions([]) == set()
     assert janitor_mod.queued_sessions(None) is None
     assert janitor_mod.queued_sessions({"items": []}) is None

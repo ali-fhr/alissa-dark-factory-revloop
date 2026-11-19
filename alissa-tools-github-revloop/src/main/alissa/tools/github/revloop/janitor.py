@@ -177,27 +177,33 @@ SPAWN_HOLD_SECONDS = 10 * 60
 
 def queued_sessions(queues: object) -> "set[str] | None":
     """The session names still WAITING in the alissa tmux queue (`alissa tmux
-    queue ls --json`, every queue), each both as listed and without the
-    managed `ali-` prefix, so a spawn row's name matches either spelling.
-    A dispatched item stays listed with its `lastDispatchedAt` -- its session
-    is in the live roster then, or has ended -- so it is not waiting and
-    holds nothing here (issue #251). None when the listing could not be read
-    (not a list): unknown, not empty -- the same reading as
-    `parking.queued_items`."""
+    queue ls --json`), each both as listed and without the managed `ali-`
+    prefix, so a spawn row's name matches either spelling.
+
+    The listing is one queue object per session: `session` sits on the
+    QUEUE, and its `items` are that session's prompts (`id`, `text`,
+    `createdAt`, `attempts`, `lastDispatchedAt`, ...) with no `session` key
+    of their own -- the shape observed live on the seat (review of PR #252).
+    A session is waiting while ANY of its items has no `lastDispatchedAt`; a
+    dispatched item stays listed, and its session is in the live roster
+    then, or has ended, so it holds nothing here (issue #251). None when the
+    listing could not be read (not a list): unknown, not empty -- the same
+    reading as `parking.queued_items`."""
     if not isinstance(queues, list):
         return None
     names: "set[str]" = set()
     for queue in queues:
         if not isinstance(queue, Mapping):
             continue
-        for item in queue.get("items") or ():
-            if not isinstance(item, Mapping) or item.get("lastDispatchedAt"):
-                continue
-            name = item.get("session")
-            if isinstance(name, str) and name:
-                names.add(name)
-                if name.startswith(MANAGED_PREFIX):
-                    names.add(name[len(MANAGED_PREFIX):])
+        name = queue.get("session")
+        if not isinstance(name, str) or not name:
+            continue
+        if not any(isinstance(item, Mapping) and not item.get("lastDispatchedAt")
+                   for item in queue.get("items") or ()):
+            continue
+        names.add(name)
+        if name.startswith(MANAGED_PREFIX):
+            names.add(name[len(MANAGED_PREFIX):])
     return names
 
 
