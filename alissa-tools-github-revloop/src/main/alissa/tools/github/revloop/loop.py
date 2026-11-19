@@ -9227,7 +9227,7 @@ class ReviewWatcher:
                 "[dry-run] janitor: would remove %d folder(s) (%s) across %d "
                 "hub(s) (%d finished review, %d past grace); %d held by a live "
                 "round (%s), %d inside the grace, %d deferred to the next "
-                "interval%s%s",
+                "interval%s%s%s",
                 len(result.would_remove),
                 janitor_mod.human(sum(size for _, size in result.would_remove)),
                 result.hubs,
@@ -9235,14 +9235,14 @@ class ReviewWatcher:
                 result.reclaimed_count(janitor_mod.RECLAIM_PAST_GRACE),
                 len(result.held), janitor_mod.human(result.held_total),
                 result.fresh, result.deferred, janitor_mod.hub_summary(result),
-                janitor_mod.held_summary(result),
+                janitor_mod.held_summary(result), finished.read_summary(),
             )
         else:
             log.info(
                 "janitor: removed %d folder(s), freed %s across %d hub(s) (%d "
                 "finished review, %d past grace); %d held by a live round (%s), "
                 "%d inside the grace, %d failed, %d deferred to the next "
-                "interval%s%s",
+                "interval%s%s%s",
                 len(result.removed), janitor_mod.human(result.freed),
                 result.hubs,
                 result.reclaimed_count(janitor_mod.RECLAIM_FINISHED),
@@ -9250,7 +9250,7 @@ class ReviewWatcher:
                 len(result.held), janitor_mod.human(result.held_total),
                 result.fresh, len(result.failed), result.deferred,
                 janitor_mod.hub_summary(result),
-                janitor_mod.held_summary(result),
+                janitor_mod.held_summary(result), finished.read_summary(),
             )
         return result
 
@@ -9262,7 +9262,9 @@ class ReviewWatcher:
         per sweep through the seat's own GitHub client, the poller's, so
         every read counts against the same hourly budget. A PR that cannot
         be read is not finished; GitHub throttling stops the reads for the
-        sweep (`FinishedReviews` catches it)."""
+        sweep (`FinishedReviews` catches it). Each unreadable PR is one
+        DEBUG line; the sweep's INFO line counts the reads and the
+        unreadable ones (issue #249)."""
         since = now - self.config.janitor_grace_minutes * 60 - 24 * 3600
         rows: "list[dict]" = []
         try:
@@ -9288,10 +9290,15 @@ class ReviewWatcher:
         round, or None when the roster cannot be listed -- a sweep that
         cannot see the live sessions holds nothing, so it must not run.
 
-        Open rounds are the ledger's own definition (`in_flight_repos`): a
-        spawn younger than the stale-round window whose session was not
-        reaped, and a verdict post still owed. The roster is the pass's
-        post-reap listing when the sweep produced one.
+        A round holds while it is really open (issue #249): its session is in
+        the live roster, a verdict post is still owed for it, or it was
+        spawned less than janitor_mod.SPAWN_HOLD_SECONDS ago (and not
+        reaped), so its session may not be listed yet. A row whose session
+        is absent from the roster and that owes no post holds nothing, with
+        or without a `reaps` row -- the live list is the authority. This is
+        narrower than the ledger's `in_flight_repos` (STALE_ROUND_SECONDS),
+        which keeps its meaning for round accounting. The roster is the
+        pass's post-reap listing when the sweep produced one.
 
         Every hold is per folder (issue #232): a round holds its PR's
         scratch folders, its review task's checkout, its PR's `REVIEW-pr<N>`
@@ -9320,7 +9327,14 @@ class ReviewWatcher:
                 # the only evidence, and a name without a repo holds its PR
                 # number -- its scratch and its `REVIEW-pr<N>` -- in every hub.
                 guard.hold(ref.repo, ref.number)
-        for spawn_row in self.state.read_spawns(since=now - STALE_ROUND_SECONDS):
+        # A spawn row with no live session holds only inside the short spawn
+        # window (issue #249): past it, the roster above and the owed posts
+        # below are the whole hold, with or without a `reaps` row -- only the
+        # reap sweep's own kill writes one, so a session that ended any other
+        # way would otherwise hold its folders for STALE_ROUND_SECONDS.
+        for spawn_row in self.state.read_spawns(
+            since=now - janitor_mod.SPAWN_HOLD_SECONDS
+        ):
             if not self.state.is_reaped(str(spawn_row["session"])):
                 guard.hold(
                     str(spawn_row["repo"]), int(spawn_row["number"]),

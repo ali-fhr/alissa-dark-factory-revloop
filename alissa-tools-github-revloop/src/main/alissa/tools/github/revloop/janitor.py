@@ -46,7 +46,9 @@ Four properties everything here is written around:
   ledger attributes to a PR that is merged or closed on GitHub, and that no
   live round holds, is reclaimed on the next sweep whatever its age
   (`FinishedReviews`). The grace keeps protecting the folders of open PRs
-  between rounds.
+  between rounds. A round's hold ends with its round (issue #249): a spawn
+  row holds only while its session is in the live roster, a verdict post is
+  still owed for it, or it is younger than SPAWN_HOLD_SECONDS.
 * **Held per folder, never per hub** (issue #232). A live round holds the
   folders it can be shown to own: its PR's scratch folders, the checkout its
   review task names, `REVIEW-pr<N>` for its PR, and the folder the ledger
@@ -156,6 +158,17 @@ RECLAIM_PAST_GRACE = "past grace"
 # whose PR the ledger names. A folder whose PR was not read this sweep is
 # kept by the grace, as before.
 MAX_PR_LOOKUPS = 30
+
+# How long a spawn row holds its round's folders with no session listed
+# (issue #249): the window in which an enqueued round's session may not be
+# in the live roster yet. Past it, a row holds only while its session is in
+# the roster or a verdict post is still owed for it -- the live list is the
+# authority, so a round whose session ended by itself (or was killed on any
+# path other than the reap sweep's, which alone writes a `reaps` row) stops
+# holding. Until issue #249 every unreaped row held for STALE_ROUND_SECONDS
+# (90 min), longer than the fleet's 60-minute grace, so the finished-review
+# reclaim never fired. STALE_ROUND_SECONDS keeps its meaning everywhere else.
+SPAWN_HOLD_SECONDS = 10 * 60
 
 
 @dataclass
@@ -329,6 +342,7 @@ class FinishedReviews:
         self._max = max_lookups
         self._answers: "dict[tuple[str, int], bool | None]" = {}
         self._lookups = 0
+        self._unreadable = 0
         self._stopped = False
         # folder key -> PRs, folder NAME (per slug) -> PRs, (slug, task ref)
         # -> PRs, slug -> repo full names.
@@ -360,6 +374,19 @@ class FinishedReviews:
     def lookups(self) -> int:
         """PR-state reads placed this sweep."""
         return self._lookups
+
+    @property
+    def unreadable(self) -> int:
+        """PR-state reads placed this sweep that could not tell (issue #249):
+        `pr_state` answered None, or raised."""
+        return self._unreadable
+
+    def read_summary(self) -> str:
+        """The sweep line's PR-state tail (issue #249): `; N PR state(s)
+        read, M unreadable`. Always present, so a sweep that read nothing
+        says so too."""
+        return (f"; {self._lookups - self._unreadable} PR state(s) read, "
+                f"{self._unreadable} unreadable")
 
     def pr_of(self, candidate: Candidate) -> "tuple[str, int] | None":
         """The one PR the ledger attributes `candidate` to, or None."""
@@ -396,6 +423,8 @@ class FinishedReviews:
                 )
                 self._stopped = True
                 answer = None
+            if answer is None:
+                self._unreadable += 1
             self._answers[pr] = answer
         return self._answers[pr] is True
 
@@ -817,7 +846,9 @@ def sweep(
     and removed when its PR is merged or closed. It goes under the same
     per-sweep bound. Every removal is counted per hub in `reclaimed` as
     RECLAIM_FINISHED or RECLAIM_PAST_GRACE, and every held folder in
-    `held_by_hub`."""
+    `held_by_hub` -- inside the grace or past it (issue #249: a held folder
+    inside the grace used to be counted in `fresh`, which hid a hold that
+    outlived its round)."""
     result = SweepResult()
     started = clock()
     bounded = False
@@ -840,20 +871,21 @@ def sweep(
     for mtime, candidate in aged:
         age = now - mtime
         slug = candidate.hub_slug
+        # The guard decides first, inside the grace or past it (issue #249):
+        # a held folder is reported as held, never folded into `fresh`.
+        why = guard.holds(candidate)
+        if why is not None:
+            log.debug("janitor: keeping %s — %s", candidate.path, why)
+            result.held.append((candidate.path, why))
+            result.held_by_hub[slug] = result.held_by_hub.get(slug, 0) + 1
+            held_queue.append((mtime, candidate, f"{slug}: {why}"))
+            continue
         if age < shrunk:
-            if (finished is None or guard.holds(candidate) is not None
-                    or not finished(candidate)):
+            if finished is None or not finished(candidate):
                 result.fresh += 1
                 continue
             early, reason = False, RECLAIM_FINISHED
         else:
-            why = guard.holds(candidate)
-            if why is not None:
-                log.debug("janitor: keeping %s — %s", candidate.path, why)
-                result.held.append((candidate.path, why))
-                result.held_by_hub[slug] = result.held_by_hub.get(slug, 0) + 1
-                held_queue.append((mtime, candidate, f"{slug}: {why}"))
-                continue
             early = age < grace_seconds
             reason = RECLAIM_PAST_GRACE
             if early and not dry_run and not (under_pressure and under_pressure()):

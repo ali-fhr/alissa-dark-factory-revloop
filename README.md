@@ -1381,8 +1381,16 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
   nothing **holds** it. A PR is held by a live reviewer session (the roster;
   the session's spawn row names its repo, PR and review task, and a
   skill-shaped `review-pr-<n>` with no row holds PR `<n>` in every hub) or by
-  an open ledger round (an unreaped spawn younger than the 90-minute
-  stale-round window, or a verdict post still owed). Holds are **per folder,
+  an open ledger round (a verdict post still owed, or an unreaped spawn
+  younger than the 10-minute spawn window, while its session may not be
+  listed yet). **A round holds only while it is really open** (issue #249):
+  past the spawn window, a spawn row whose session is absent from the live
+  roster and that owes no verdict post holds nothing, with or without a
+  `reaps` row — the live list is the authority, and only the reap sweep's own
+  kill writes a `reaps` row, so a session that ended by itself used to hold
+  its folders for the whole 90-minute stale-round window, past a 60-minute
+  grace, and the finished-review rule below never fired. The stale-round
+  window keeps its meaning for round accounting. Holds are **per folder,
   never per hub** (issue #232): a held PR keeps every one of its scratch
   folders, its review task's `REVIEW-<task>` checkout (in either place, a
   `-r<k>` suffix allowed), its own `REVIEW-pr<N>` folder, and the folder its
@@ -1425,10 +1433,16 @@ The janitor (`janitor.py`, on by default) runs at the end of a pass, every
 - **One INFO line per sweep**: `janitor: removed N folder(s), freed X across H
   hub(s) (F finished review, P past grace); … held by a live round, … inside
   the grace, … failed, … deferred to the next interval; per hub: <hub> F
-  finished review, P past grace, K held; …`. `finished review` counts the
+  finished review, P past grace, K held; …; R PR state(s) read, U
+  unreadable`. `finished review` counts the
   removals of merged or closed PRs' folders inside the grace. `past grace`
-  counts the rest, including the pressure grace's. The per-hub tail lists
-  each hub that reclaimed or held anything. When the
+  counts the rest, including the pressure grace's. `held` counts every
+  folder a round holds, inside the grace or past it (issue #249 — a held
+  folder inside the grace used to be counted as `inside the grace`, which
+  hid a hold that outlived its round). The per-hub tail lists
+  each hub that reclaimed or held anything. The last tail counts this
+  sweep's PR-state reads and those that could not be read (each one is a
+  DEBUG line naming the PR). When the
   workspace volume is at or above `janitor_warn_pct` (default 70, below the
   hosting alert at 75%; `0` = never)
   the sweep also logs **one WARNING** with the percentage, and an INFO line
