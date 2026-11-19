@@ -2285,3 +2285,128 @@ def test_a_held_folder_inside_the_grace_is_held_not_fresh(tmp_path):
     assert result.held == [(own, "PR #7 has a live session or open round")]
     assert result.held_by_hub == {"widgets": 1}
     assert result.held_total > 0
+
+
+# -- a queued round holds its folder (issue #251) ------------------------------
+
+
+def live_queue(session, *, dispatched=False, items=1):
+    """One queue as `alissa tmux queue ls --json` lists it (keys read live
+    on the seat): `session` on the queue, its items the waiting prompts."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "agent": "claude", "claudeSessionId": None, "cwd": "/w", "repo": None,
+        "respawn": False, "respawnHistory": [], "session": session,
+        "items": [
+            {"id": f"q{i}", "text": "prompt", "attempts": 1 if dispatched else 0,
+             "createdAt": now_ms, "lastDispatchedAt": now_ms if dispatched else None}
+            for i in range(items)
+        ],
+    }
+
+
+def queued_round_ws(ws, *, dispatched=False, prefixed=True):
+    """PR 7's round 2, queued past SPAWN_HOLD_SECONDS and not in the live
+    roster yet; its reused `REVIEW-pr7` (holding round 1's `wt-r1`) is
+    20 minutes old and the PR is merged -- the shape the review of #250
+    named. The queue lists the session (as `ali-<name>` unless
+    `prefixed=False`) in the live `queue ls --json` shape -- `session` on
+    the queue, prompt items without one -- undispatched unless
+    `dispatched`."""
+    w, alissa, own, _ = ended_round_ws(ws)
+    (own / "wt-r1").mkdir()
+    session = "review-widgets-pr7-r2-bbbbbb"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=2, head_sha="t",
+                         session=session, task_ref=None, folder=str(own))
+    w.state._db.execute(
+        "UPDATE spawns SET spawned_at = ?",
+        (int(time.time() - janitor_mod.SPAWN_HOLD_SECONDS - 5 * 60),),
+    )
+    w.state._db.commit()
+    alissa.queues = [live_queue(f"ali-{session}" if prefixed else session,
+                                dispatched=dispatched)]
+    return w, alissa, own, session
+
+
+@pytest.mark.parametrize("prefixed", [True, False])
+def test_a_round_waiting_in_the_queue_holds_its_reused_folder(ws, prefixed):
+    """Past the spawn window, absent from the roster, no owed post -- but
+    still queued: held, and its PR state is not read."""
+    w, _, own, _ = queued_round_ws(ws, prefixed=prefixed)
+
+    result = w._run_janitor()
+
+    assert own.is_dir() and (own / "wt-r1").is_dir()
+    assert result is not None
+    assert result.held == [(own, "PR #7 has a live session or open round")]
+    assert w.github.pr_fetches == 0
+
+
+def test_a_dispatched_queue_item_no_longer_holds(ws):
+    """A dispatched item stays listed; its session is then in the roster or
+    gone, so the queue entry itself holds nothing."""
+    w, _, own, _ = queued_round_ws(ws, dispatched=True)
+
+    result = w._run_janitor()
+
+    assert not own.exists() and result is not None and result.held == []
+    assert result.reclaimed_count(janitor_mod.RECLAIM_FINISHED) == 1
+
+
+def test_a_queued_round_stops_holding_once_it_leaves_the_queue(ws):
+    w, alissa, own, session = queued_round_ws(ws)
+    assert w._run_janitor() is not None and own.is_dir()
+
+    alissa.queues = [live_queue(f"ali-{session}", items=0)]
+    w._janitor_last -= 10 * 60
+    result = w._run_janitor()
+
+    assert not own.exists() and result is not None and result.held == []
+
+
+def test_an_unreadable_queue_holds_nothing_extra_and_still_sweeps(ws, caplog):
+    """`list_queues` None (the CLI did not answer): the sweep runs as before
+    issue #251 -- the guard holds no queued round, said at DEBUG."""
+    w, alissa, own, _ = queued_round_ws(ws)
+    alissa.queues = None
+
+    with caplog.at_level(logging.DEBUG, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert result is not None and not own.exists()
+    assert any("tmux queue could not be listed" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_queued_session_with_no_spawn_row_holds_nothing(ws):
+    """Another lane's queued session (no ledger row) is not ours to hold."""
+    w, alissa, own, _ = ended_round_ws(ws)
+    alissa.queues = [live_queue("ali-develop-acme-widgets-i7-a1")]
+
+    result = w._run_janitor()
+
+    assert not own.exists() and result is not None and result.held == []
+
+
+def test_queued_sessions_reads_the_queue_session_with_an_undispatched_item():
+    """The live shape: the name is the QUEUE's `session`; a queue counts
+    while any of its items is undispatched."""
+    mixed = live_queue("ali-review-d", dispatched=True)
+    mixed["items"].append(live_queue("x")["items"][0])
+    queues = [
+        live_queue("ali-review-a"),
+        live_queue("ali-review-b", dispatched=True),
+        live_queue("ali-review-e", items=0),
+        mixed,
+        live_queue("c"),
+        {**live_queue("ali-x"), "session": ""},
+        {**live_queue("ali-y"), "session": 7},
+        {"items": [{"session": "ali-item-only", "id": "q", "text": "t"}]},
+        {**live_queue("ali-z"), "items": ["junk"]},
+        "junk",
+    ]
+    assert janitor_mod.queued_sessions(queues) == {
+        "ali-review-a", "review-a", "ali-review-d", "review-d", "c"}
+    assert janitor_mod.queued_sessions([]) == set()
+    assert janitor_mod.queued_sessions(None) is None
+    assert janitor_mod.queued_sessions({"items": []}) is None

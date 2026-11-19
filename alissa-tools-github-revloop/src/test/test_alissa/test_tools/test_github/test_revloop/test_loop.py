@@ -390,6 +390,9 @@ class FakeAlissa:
         self.content_errors = None
         self.verdict_count = verdict_count  # envelopes on the task = rounds done
         self.enqueued: list[dict] = []
+        # `alissa tmux queue ls --json`, as `list_queues` answers it (issue
+        # #251: the janitor guard holds a round still waiting there).
+        self.queues: object = []
         self.added: list[tuple] = []
         self.killed: list[str] = []
         # The pane `alissa tmux tail` answers per session (issue #136), and
@@ -440,6 +443,9 @@ class FakeAlissa:
         # The BOW this client would scope its list to -- None, like a real
         # client built from a config that names none (issue #100).
         self.task_list_bow_id: "str | None" = None
+
+    def list_queues(self):
+        return self.queues
 
     def list_tasks(self, *, narrow_status=True):
         self.list_calls += 1

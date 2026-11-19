@@ -1658,7 +1658,9 @@ class Alissa:
     def list_queues(self) -> object:
         """`alissa tmux queue ls --json`, parsed, or None when the CLI does
         not answer (`parking.queued_items` reads None as unknown, never
-        empty). Read by the self-upgrade idle check only (issue #193)."""
+        empty). Read by the self-upgrade idle check (issue #193) and the
+        janitor guard's queued-round hold (issue #251, `janitor.
+        queued_sessions`)."""
         try:
             return run_json(["alissa", "tmux", "queue", "ls", "--json"], timeout=60)
         except (CommandError, OSError, ValueError) as exc:
