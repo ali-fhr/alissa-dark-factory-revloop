@@ -751,6 +751,9 @@ class _Al:
     def list_review_sessions(self):
         return []
 
+    def list_queues(self):
+        return []
+
     def worker_running(self):
         return True
 

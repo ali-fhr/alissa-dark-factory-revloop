@@ -48,7 +48,9 @@ Four properties everything here is written around:
   (`FinishedReviews`). The grace keeps protecting the folders of open PRs
   between rounds. A round's hold ends with its round (issue #249): a spawn
   row holds only while its session is in the live roster, a verdict post is
-  still owed for it, or it is younger than SPAWN_HOLD_SECONDS.
+  still owed for it, it is younger than SPAWN_HOLD_SECONDS, or its session
+  still waits in `alissa tmux queue` for a worker slot (issue #251,
+  `queued_sessions`).
 * **Held per folder, never per hub** (issue #232). A live round holds the
   folders it can be shown to own: its PR's scratch folders, the checkout its
   review task names, `REVIEW-pr<N>` for its PR, and the folder the ledger
@@ -77,11 +79,12 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .alissa import session_repo_slug
+from .alissa import MANAGED_PREFIX, session_repo_slug
 from .proc import CommandError, run
 from .trust import REVIEW_CHECKOUT_PREFIX, review_checkout_name
 
@@ -162,13 +165,40 @@ MAX_PR_LOOKUPS = 30
 # How long a spawn row holds its round's folders with no session listed
 # (issue #249): the window in which an enqueued round's session may not be
 # in the live roster yet. Past it, a row holds only while its session is in
-# the roster or a verdict post is still owed for it -- the live list is the
+# the roster, still waits in the queue (issue #251, `queued_sessions`), or a
+# verdict post is still owed for it -- the live list is the
 # authority, so a round whose session ended by itself (or was killed on any
 # path other than the reap sweep's, which alone writes a `reaps` row) stops
 # holding. Until issue #249 every unreaped row held for STALE_ROUND_SECONDS
 # (90 min), longer than the fleet's 60-minute grace, so the finished-review
 # reclaim never fired. STALE_ROUND_SECONDS keeps its meaning everywhere else.
 SPAWN_HOLD_SECONDS = 10 * 60
+
+
+def queued_sessions(queues: object) -> "set[str] | None":
+    """The session names still WAITING in the alissa tmux queue (`alissa tmux
+    queue ls --json`, every queue), each both as listed and without the
+    managed `ali-` prefix, so a spawn row's name matches either spelling.
+    A dispatched item stays listed with its `lastDispatchedAt` -- its session
+    is in the live roster then, or has ended -- so it is not waiting and
+    holds nothing here (issue #251). None when the listing could not be read
+    (not a list): unknown, not empty -- the same reading as
+    `parking.queued_items`."""
+    if not isinstance(queues, list):
+        return None
+    names: "set[str]" = set()
+    for queue in queues:
+        if not isinstance(queue, Mapping):
+            continue
+        for item in queue.get("items") or ():
+            if not isinstance(item, Mapping) or item.get("lastDispatchedAt"):
+                continue
+            name = item.get("session")
+            if isinstance(name, str) and name:
+                names.add(name)
+                if name.startswith(MANAGED_PREFIX):
+                    names.add(name[len(MANAGED_PREFIX):])
+    return names
 
 
 @dataclass

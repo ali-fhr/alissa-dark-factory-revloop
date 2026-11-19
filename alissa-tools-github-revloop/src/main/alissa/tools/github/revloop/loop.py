@@ -9291,11 +9291,16 @@ class ReviewWatcher:
         cannot see the live sessions holds nothing, so it must not run.
 
         A round holds while it is really open (issue #249): its session is in
-        the live roster, a verdict post is still owed for it, or it was
-        spawned less than janitor_mod.SPAWN_HOLD_SECONDS ago (and not
-        reaped), so its session may not be listed yet. A row whose session
-        is absent from the roster and that owes no post holds nothing, with
-        or without a `reaps` row -- the live list is the authority. This is
+        the live roster, a verdict post is still owed for it, it was spawned
+        less than janitor_mod.SPAWN_HOLD_SECONDS ago (and not reaped), so its
+        session may not be listed yet, or its session is still waiting in
+        `alissa tmux queue` for a worker slot (issue #251) -- a queue wait can
+        outlast the spawn window, and from round 2 on the round's reused
+        `REVIEW-pr<N>` / `REVIEW-<task>` folder is already old. A row whose
+        session is absent from the roster and the queue and that owes no post
+        holds nothing, with or without a `reaps` row -- the live list is the
+        authority. An unreadable queue listing holds nothing extra (DEBUG):
+        the sweep runs as it did before issue #251, the grace still standing. This is
         narrower than the ledger's `in_flight_repos` (STALE_ROUND_SECONDS),
         which keeps its meaning for round accounting. The roster is the
         pass's post-reap listing when the sweep produced one.
@@ -9339,6 +9344,17 @@ class ReviewWatcher:
                 guard.hold(
                     str(spawn_row["repo"]), int(spawn_row["number"]),
                     spawn_row["task_ref"], folder=spawn_row["folder"],
+                )
+        queued = janitor_mod.queued_sessions(self.alissa.list_queues())
+        if queued is None:
+            log.debug("janitor: the alissa tmux queue could not be listed — "
+                      "no queued round is held this sweep")
+        for name in sorted(queued or ()):
+            row = self.state.find_spawn_by_session(name)
+            if row is not None and not self.state.is_reaped(name):
+                guard.hold(
+                    str(row["repo"]), int(row["number"]), row["task_ref"],
+                    folder=row["folder"],
                 )
         for post in self.state.read_verdict_posts():
             if post["posted_at"] is None and post["abandoned_at"] is None:

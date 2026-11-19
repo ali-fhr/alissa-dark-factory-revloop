@@ -16,6 +16,14 @@ header).
 
 ## Unreleased
 
+- **A round still waiting in `alissa tmux queue` holds its janitor folder**
+  (issue #251, a finding on the review of #250; origin TASK-287894903,
+  implementation TASK-2068387803). Past the 10-minute spawn window the
+  janitor's guard also holds every spawn row whose session is an
+  undispatched item in `alissa tmux queue ls --json`
+  (`janitor.queued_sessions`), so a queued round 2+ keeps its reused
+  `REVIEW-pr<N>` / `REVIEW-<task>` folder. An unreadable queue listing holds
+  nothing extra and the sweep runs as before.
 - **A round whose session is gone and that owes no verdict post no longer
   holds its folder** (issue #249; origin TASK-253960196, implementation
   TASK-9299698). The janitor's guard holds a spawn row only while its session
