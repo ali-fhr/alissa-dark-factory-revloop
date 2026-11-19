@@ -2114,3 +2114,174 @@ def test_the_watcher_keeps_an_open_prs_folder_inside_the_grace(ws):
     result = w._run_janitor()
 
     assert own.is_dir() and result is not None and result.removed == []
+
+
+# -- an ended round stops holding (issue #249) ---------------------------------
+
+
+def ended_round_ws(ws, *, merged=True, spawned_ago=30 * 60):
+    """The 2026-11-19 seat shape: a 60-minute grace, one round of PR 7 spawned
+    `spawned_ago` seconds ago with no `reaps` row, its recorded `REVIEW-pr7`
+    folder 20 minutes old -- inside the grace."""
+    from test_loop import FakeGitHub as _FakeGitHub
+
+    w, alissa, hub = ws
+    w.config = Config(workspace_root=w.config.workspace_root,
+                      hub_template="{root}/{repo}/main",
+                      state_path=w.config.state_db, janitor_grace_minutes=60)
+    w.github = _FakeGitHub(
+        make_pr(state="closed", merged=True) if merged else make_pr(), []
+    )
+    session = "review-widgets-pr7-r1-aaaaaa"
+    own = hub / "REVIEW-pr7"
+    w.state.record_spawn(repo="acme/widgets", number=7, round_=1, head_sha="s",
+                         session=session, task_ref=None, folder=str(own))
+    w.state._db.execute("UPDATE spawns SET spawned_at = ?",
+                        (int(time.time() - spawned_ago),))
+    w.state._db.commit()
+    young_checkout(hub, "REVIEW-pr7", hours=1 / 3).rename(own)
+    return w, alissa, own, session
+
+
+def test_a_gone_session_with_no_reap_row_no_longer_holds_a_merged_prs_folder(ws, caplog):
+    """AC 1: no `reaps` row (the session ended by itself), not in the roster,
+    no owed post, PR merged -- reclaimed as a finished review on the next
+    sweep, the 60-minute grace unexpired."""
+    w, _, own, session = ended_round_ws(ws)
+    assert not w.state.is_reaped(session)
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert result is not None and not own.exists()
+    assert result.reclaimed_count(janitor_mod.RECLAIM_FINISHED) == 1
+    assert result.held == []
+    (line,) = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("janitor: removed")]
+    assert "(1 finished review, 0 past grace)" in line
+
+
+def test_a_listed_session_still_holds_and_is_counted_as_held(ws, caplog):
+    """AC 2/3: the same round with its session in the roster -- held, and
+    counted (and named) as held on the sweep line, not as inside the grace."""
+    w, alissa, own, session = ended_round_ws(ws)
+    alissa.sessions = [ManagedSession(name=session, status="busy")]
+
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert own.is_dir()
+    assert result is not None and result.fresh == 0
+    assert result.held == [(own, "PR #7 has a live session or open round")]
+    assert result.held_by_hub == {"widgets": 1}
+    assert w.github.pr_fetches == 0, "a held folder's PR is not read"
+    (line,) = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("janitor: removed")]
+    assert "1 held by a live round" in line and "0 inside the grace" in line
+    assert "widgets: PR #7 has a live session or open round" in line
+    assert "; per hub: widgets 0 finished review, 0 past grace, 1 held" in line
+
+
+def test_an_owed_verdict_post_still_holds_an_ended_round(ws):
+    """AC 2: no session, but a verdict post is still owed -- held."""
+    w, _, own, _ = ended_round_ws(ws)
+    w.state.note_verdict_post_owed("acme/widgets", 7, 1, "s")
+
+    result = w._run_janitor()
+
+    assert own.is_dir()
+    assert result is not None and [p for p, _ in result.held] == [own]
+
+
+def test_a_spawn_inside_the_spawn_window_holds_with_no_session_listed(ws):
+    """AC 2: enqueued a minute ago, no session listed yet -- held; the same
+    row past SPAWN_HOLD_SECONDS holds nothing."""
+    assert janitor_mod.SPAWN_HOLD_SECONDS < 60 * 60, "minutes, not 90"
+    w, _, own, _ = ended_round_ws(ws, spawned_ago=60)
+
+    result = w._run_janitor()
+
+    assert own.is_dir()
+    assert result is not None and [p for p, _ in result.held] == [own]
+
+    w.state._db.execute("UPDATE spawns SET spawned_at = ?",
+                        (int(time.time() - janitor_mod.SPAWN_HOLD_SECONDS - 60),))
+    w.state._db.commit()
+    w._janitor_last -= 10 * 60
+    result = w._run_janitor()
+
+    assert not own.exists() and result is not None and result.held == []
+
+
+def test_an_open_prs_folder_with_an_ended_round_keeps_the_grace(ws):
+    """AC 2: the grace still protects folders between rounds."""
+    w, _, own, _ = ended_round_ws(ws, merged=False)
+
+    result = w._run_janitor()
+
+    assert own.is_dir()
+    assert result is not None and result.held == [] and result.fresh == 1
+    assert w.github.pr_fetches == 1
+
+
+def test_the_sweep_line_counts_pr_states_read_and_unreadable(ws, caplog):
+    """AC 3: one count on the INFO line -- how many PR states were read and
+    how many could not be; the per-PR line stays at DEBUG."""
+    w, _, own, _ = ended_round_ws(ws)
+
+    def unreadable(owner, repo, number):
+        raise CommandError(["gh", "api"], 1, "HTTP 502")
+
+    w.github.pull_request = unreadable
+    with caplog.at_level(logging.DEBUG, logger="alissa.tools.github"):
+        result = w._run_janitor()
+
+    assert own.is_dir() and result is not None and result.fresh == 1
+    (line,) = [r for r in caplog.records
+               if r.getMessage().startswith("janitor: removed")]
+    assert line.levelno == logging.INFO
+    assert line.getMessage().endswith("; 0 PR state(s) read, 1 unreadable")
+    assert any(r.levelno == logging.DEBUG and "acme/widgets#7 unreadable"
+               in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    w.github = FakeGitHub(make_pr(state="closed", merged=True), [])
+    w._janitor_last -= 10 * 60
+    with caplog.at_level(logging.INFO, logger="alissa.tools.github"):
+        w._run_janitor()
+    (line,) = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("janitor: removed")]
+    assert line.endswith("; 1 PR state(s) read, 0 unreadable")
+
+
+def test_finished_reviews_counts_unreadable_answers_and_raises(tmp_path):
+    hub = make_hub(tmp_path)
+    for n in (1, 2, 3):
+        folder(hub / f"REVIEW-pr{n}", age=HOUR)
+    rows = [spawn_row(n) for n in (1, 2, 3)]
+    states = PrStates({("acme/widgets", 1): True, ("acme/widgets", 3): False})
+
+    _, finished = finished_sweep([hub], rows, states)
+
+    assert finished.lookups == 3 and finished.unreadable == 1
+    assert finished.read_summary() == "; 2 PR state(s) read, 1 unreadable"
+
+    failing = PrStates({}, error=RuntimeError("API rate limit exceeded"))
+    _, finished = finished_sweep([hub], rows, failing)
+    assert finished.lookups == 1 and finished.unreadable == 1
+
+
+def test_a_held_folder_inside_the_grace_is_held_not_fresh(tmp_path):
+    """AC 3, at the sweep: a guard-held young folder lands in `held` and
+    `held_by_hub` with its reason, and is sized like any held folder."""
+    hub = make_hub(tmp_path)
+    own = folder(hub / "REVIEW-pr7", age=HOUR)
+    guard = Guard()
+    guard.hold("acme/widgets", 7, None, folder=own)
+
+    result = sweep([hub], guard, grace_seconds=GRACE, now=NOW, runner=Runner())
+
+    assert own.is_dir() and result.fresh == 0
+    assert result.held == [(own, "PR #7 has a live session or open round")]
+    assert result.held_by_hub == {"widgets": 1}
+    assert result.held_total > 0

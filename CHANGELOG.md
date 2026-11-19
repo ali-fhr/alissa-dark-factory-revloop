@@ -16,6 +16,15 @@ header).
 
 ## Unreleased
 
+- **A round whose session is gone and that owes no verdict post no longer
+  holds its folder** (issue #249; origin TASK-253960196, implementation
+  TASK-9299698). The janitor's guard holds a spawn row only while its session
+  is in the live roster, a verdict post is owed, or it is younger than the
+  10-minute spawn window (`janitor.SPAWN_HOLD_SECONDS`), with or without a
+  `reaps` row, so a merged PR's folder is reclaimed as `finished review`
+  inside the grace. A guard-held folder inside the grace is now counted as
+  held on the sweep line, and the line ends with how many PR states were read
+  and how many were unreadable.
 - **A 400 that quotes `'used'` or `'login'` drops the vitals identity fields
   only when it also names `rate`** (issue #247, a harvest note on PR #206;
   origin TASK-937452889, implementation TASK-815122640). Another object's
